@@ -1,0 +1,6 @@
+comment = 'pg_zoekt:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_zoekt'
+relocatable = false
+superuser = true
+trusted = false
