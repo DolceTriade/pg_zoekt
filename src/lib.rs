@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 
 mod am;
+mod trgm;
 pub use am::pg_zoekt_handler;
 
 ::pgrx::pg_module_magic!(name, version);

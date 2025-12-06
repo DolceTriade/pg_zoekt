@@ -141,7 +141,10 @@ mod implementation {
         not_implemented::<()>()
     }
 
-    unsafe extern "C-unwind" fn amoptions(_reloptions: pg_sys::Datum, _validate: bool) -> *mut pg_sys::bytea {
+    unsafe extern "C-unwind" fn amoptions(
+        _reloptions: pg_sys::Datum,
+        _validate: bool,
+    ) -> *mut pg_sys::bytea {
         not_implemented()
     }
 
@@ -149,8 +152,9 @@ mod implementation {
 
     fn build_index_am_routine() -> PgBox<pg_sys::IndexAmRoutine, pgrx::AllocatedByRust> {
         // alloc_node zeroes the struct and sets the NodeTag
-        let mut routine =
-            unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
+        let mut routine = unsafe {
+            PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine)
+        };
 
         // Capabilities: keep everything minimal/false until implemented.
         routine.amstrategies = 0;
@@ -288,5 +292,4 @@ mod tests {
         assert!(false);
         Ok(())
     }
-
 }
