@@ -93,6 +93,5 @@ mod test {
         let s = "a";
         let trgms = Extractor::extract(s).collect::<Vec<&str>>();
         assert_eq!(trgms, Vec::<&str>::new());
-
     }
 }
