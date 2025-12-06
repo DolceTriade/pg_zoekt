@@ -5,23 +5,6 @@ pub use am::pg_zoekt_handler;
 
 ::pgrx::pg_module_magic!(name, version);
 
-#[pg_extern]
-fn hello_pg_zoekt() -> &'static str {
-    "Hello, pg_zoekt"
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
-
-    #[pg_test]
-    fn test_hello_pg_zoekt() {
-        assert_eq!("Hello, pg_zoekt", crate::hello_pg_zoekt());
-    }
-
-}
-
 /// This module is required by `cargo pgrx test` invocations.
 /// It must be visible at the root of your extension crate.
 #[cfg(test)]

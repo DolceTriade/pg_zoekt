@@ -18,12 +18,65 @@ mod implementation {
 
     // --- Required callbacks -------------------------------------------------
 
-    unsafe extern "C-unwind" fn ambuild(
-        _heap_relation: pg_sys::Relation,
-        _index_relation: pg_sys::Relation,
-        _index_info: *mut pg_sys::IndexInfo,
+    #[derive(Debug, Default)]
+    struct BuildCallbackState {
+        key_count: usize,
+        seen: u64,
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    unsafe extern "C-unwind" fn log_index_value_callback(
+        _index: pg_sys::Relation,
+        _tid: pg_sys::ItemPointer,
+        values: *mut pg_sys::Datum,
+        isnull: *mut bool,
+        _tuple_is_alive: bool,
+        state: *mut std::ffi::c_void,
+    ) {
+        let state = &mut *(state as *mut BuildCallbackState);
+
+        if state.key_count == 0 {
+            return;
+        }
+
+        let values = std::slice::from_raw_parts(values, state.key_count);
+        let isnull = std::slice::from_raw_parts(isnull, state.key_count);
+
+        if !isnull[0] {
+            if let Some(text) = String::from_datum(values[0], false) {
+                info!("pg_zoekt ambuild text: {}", text);
+            }
+        }
+
+        state.seen += 1;
+    }
+
+    #[pg_guard]
+    pub extern "C-unwind" fn ambuild(
+        heap_relation: pg_sys::Relation,
+        index_relation: pg_sys::Relation,
+        index_info: *mut pg_sys::IndexInfo,
     ) -> *mut pg_sys::IndexBuildResult {
-        not_implemented()
+        let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
+        let mut callback_state = BuildCallbackState {
+            key_count,
+            ..Default::default()
+        };
+
+        unsafe {
+            pg_sys::IndexBuildHeapScan(
+                heap_relation,
+                index_relation,
+                index_info,
+                Some(log_index_value_callback),
+                &mut callback_state,
+            );
+        }
+
+        let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
+        result.heap_tuples = callback_state.seen as f64;
+        result.index_tuples = callback_state.seen as f64;
+        result.into_pg()
     }
 
     unsafe extern "C-unwind" fn ambuildempty(_index_relation: pg_sys::Relation) {
@@ -168,3 +221,72 @@ mod implementation {
 
 #[cfg(feature = "pg18")]
 pub use implementation::pg_zoekt_handler;
+
+// Install a default operator class for text so users can say USING pg_zoekt without specifying one.
+extension_sql!(
+    r#"
+DO $$
+DECLARE
+    have_family int;
+    have_class int;
+BEGIN
+    -- Does the operator family already exist in this schema?
+    SELECT count(*)
+    INTO have_family
+    FROM pg_catalog.pg_opfamily f
+    WHERE f.opfname = 'pg_zoekt_text_ops'
+      AND f.opfmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'pg_zoekt')
+      AND f.opfnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname='@extschema@');
+
+    IF have_family = 0 THEN
+        CREATE OPERATOR FAMILY pg_zoekt_text_ops USING pg_zoekt;
+    END IF;
+
+    -- Is the default operator class already present?
+    SELECT count(*)
+    INTO have_class
+    FROM pg_catalog.pg_opclass c
+    WHERE c.opcname = 'pg_zoekt_text_ops'
+      AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'pg_zoekt')
+      AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname='@extschema@');
+
+    IF have_class = 0 THEN
+        CREATE OPERATOR CLASS pg_zoekt_text_ops DEFAULT
+        FOR TYPE text USING pg_zoekt AS
+            STORAGE text;
+    END IF;
+END;
+$$;
+"#,
+    name = "pg_zoekt_default_text_opclass",
+    requires = [pg_zoekt_handler]
+);
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    pub fn test_build() -> spi::Result<()> {
+        let sql = "
+            -- 1. Create table
+            CREATE TABLE documents (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
+
+            -- 2. Insert dummy data
+            INSERT INTO documents (text) VALUES
+            ('The quick brown fox jumps over the lazy dog.'),
+            ('PostgreSQL is a powerful, open-source object-relational database system.'),
+            ('pg_zoekt is a new access method for full-text search.'),
+            ('Zoekt is a fast, robust code search engine.');
+
+            -- 3. Create the index
+            CREATE INDEX idx_documents_text_zoekt ON documents
+            USING pg_zoekt (text);
+        ";
+        Spi::run(sql)?;
+        assert!(false);
+        Ok(())
+    }
+
+}
