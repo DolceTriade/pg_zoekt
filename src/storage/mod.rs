@@ -12,6 +12,7 @@ pub const WAL_BUCKET_MAGIC: u32 = u32::from_ne_bytes(*b"bZKT");
 pub struct RootBlockList {
     pub magic: u32,
     pub version: u16,
+    pub wal_block: u32,
     pub num_segments: u32,
     // Blocks...
 }

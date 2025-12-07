@@ -7,7 +7,16 @@ pub struct BlockBuffer {
     wal: Option<GenericWAL>,
 }
 
-const SPECIAL_SIZE: usize = 4096;
+const SPECIAL_SIZE: usize = align_down(
+    (pg_sys::BLCKSZ as usize)
+        - std::mem::size_of::<pg_sys::PageHeaderData>()
+        - std::mem::size_of::<usize>(),
+    std::mem::size_of::<usize>(),
+);
+
+const fn align_down(val: usize, align: usize) -> usize {
+    val & !(align - 1)
+}
 
 impl BlockBuffer {
     pub fn acquire(rel: pg_sys::Relation, num: u32) -> Self {
