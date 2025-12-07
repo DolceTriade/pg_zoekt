@@ -1,6 +1,6 @@
+use pgrx::PgBox;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use pgrx::PgBox;
 
 const AM_NAME: &str = "pg_zoekt";
 
@@ -289,7 +289,6 @@ mod tests {
             USING pg_zoekt (text);
         ";
         Spi::run(sql)?;
-        assert!(false);
         Ok(())
     }
 }
