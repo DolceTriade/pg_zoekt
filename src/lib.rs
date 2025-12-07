@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 
 mod am;
+mod build;
 mod storage;
 mod trgm;
 pub use am::pg_zoekt_handler;

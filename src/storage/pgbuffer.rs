@@ -79,7 +79,12 @@ impl BlockBuffer {
 impl Drop for BlockBuffer {
     fn drop(&mut self) {
         // Ensure generic WAL finishes before we release the buffer.
-        _ = self.wal.take();
+        if self.wal.is_some() {
+            _ = self.wal.take();
+            unsafe {
+                pg_sys::MarkBufferDirty(self.buffer);
+            }
+        }
         unsafe {
             pg_sys::UnlockReleaseBuffer(self.buffer);
         }

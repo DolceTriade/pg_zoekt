@@ -35,7 +35,8 @@ impl TryFrom<&str> for CompactTrgm {
                     chr.is_ascii()
                         .then(|| trgm | (chr.to_ascii_lowercase() as u32) << (idx * 8))
                         .unwrap_or_else(|| {
-                            let hashed = crc32fast::hash(chr.to_lowercase().to_string().as_bytes()) & 0xff;
+                            let hashed =
+                                crc32fast::hash(chr.to_lowercase().to_string().as_bytes()) & 0xff;
                             trgm | hashed << (idx * 8)
                         }),
                     !chr.is_ascii() || lossy,
