@@ -14,14 +14,20 @@ compile_error!("pg_zoekt currently targets Postgres 18; enable the `pg18` featur
 
 #[cfg(feature = "pg18")]
 mod implementation {
+    use std::{ffi::CString, str::FromStr};
+
+    use crate::storage::pgbuffer::BlockBuffer;
+
     use super::*;
 
     // --- Required callbacks -------------------------------------------------
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct BuildCallbackState {
         key_count: usize,
         seen: u64,
+        len: usize,
+        buff: BlockBuffer,
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -44,7 +50,11 @@ mod implementation {
 
         if !isnull[0] {
             if let Some(text) = String::from_datum(values[0], false) {
+                let ctext = CString::from_str(&text).unwrap();
                 info!("pg_zoekt ambuild text: {}", text);
+                let ptr = unsafe { state.buff.as_ptr().add(state.len) };
+                unsafe { std::ptr::copy(ctext.as_ptr(), ptr, ctext.count_bytes()) }
+                state.len += ctext.count_bytes();
             }
         }
 
@@ -60,9 +70,11 @@ mod implementation {
         let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
         let mut callback_state = BuildCallbackState {
             key_count,
-            ..Default::default()
+            seen: 0,
+            len: 0,
+            buff: BlockBuffer::allocate(index_relation),
         };
-
+        info!("Starting scan");
         unsafe {
             pg_sys::IndexBuildHeapScan(
                 heap_relation,
@@ -289,6 +301,7 @@ mod tests {
             USING pg_zoekt (text);
         ";
         Spi::run(sql)?;
+        assert!(false);
         Ok(())
     }
 }

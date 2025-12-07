@@ -1,17 +1,13 @@
 use pgrx::prelude::*;
 
-enum Mode {
-    RO,
-    RW,
-}
+#[derive(Debug)]
 pub struct BlockBuffer {
-    mode: Mode,
     buffer: pg_sys::Buffer,
     page: pg_sys::Page,
     wal: Option<GenericWAL>,
 }
 
-const SPECIAL_SIZE: usize = pg_sys::BLCKSZ as usize - std::mem::size_of::<pg_sys::PageHeaderData>();
+const SPECIAL_SIZE: usize = 4096;
 
 impl BlockBuffer {
     pub fn acquire(rel: pg_sys::Relation, num: u32) -> Self {
@@ -21,7 +17,6 @@ impl BlockBuffer {
         }
         let page = unsafe { pg_sys::BufferGetPage(buffer) };
         Self {
-            mode: Mode::RO,
             buffer,
             page,
             wal: None,
@@ -36,7 +31,6 @@ impl BlockBuffer {
         let wal = GenericWAL::new(rel);
         let page = wal.track(buffer, false);
         Self {
-            mode: Mode::RW,
             buffer,
             page,
             wal: Some(wal),
@@ -55,7 +49,6 @@ impl BlockBuffer {
             page
         };
         Self {
-            mode: Mode::RW,
             buffer,
             page,
             wal: Some(wal),
@@ -77,16 +70,23 @@ impl BlockBuffer {
 
         Ok(unsafe { &*(struct_ptr as *const T) })
     }
+
+    pub unsafe fn as_ptr(&self) -> *mut i8 {
+        unsafe { pg_sys::PageGetSpecialPointer(self.page) }
+    }
 }
 
 impl Drop for BlockBuffer {
     fn drop(&mut self) {
+        // Ensure generic WAL finishes before we release the buffer.
+        _ = self.wal.take();
         unsafe {
             pg_sys::UnlockReleaseBuffer(self.buffer);
         }
     }
 }
 
+#[derive(Debug)]
 struct GenericWAL {
     state: Option<*mut pg_sys::GenericXLogState>,
 }
@@ -121,5 +121,44 @@ impl Drop for GenericWAL {
             }
             _ = self.state.take();
         }
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use std::ffi::CString;
+
+    use super::*;
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    pub fn test_sanity() -> spi::Result<()> {
+        let sql = "
+            -- 1. Create table
+            CREATE TABLE documents (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
+        ";
+        Spi::run(sql)?;
+
+        let table = "public.documents";
+        let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
+        let mut blkno = 0;
+        {
+            let buff = BlockBuffer::allocate(relation.as_ptr());
+            blkno = unsafe { pg_sys::BufferGetBlockNumber(buff.buffer) };
+            let s = CString::new("hello").expect("string made");
+            unsafe {
+                std::ptr::copy(s.as_ptr(), buff.as_ptr(), s.count_bytes());
+            }
+        }
+
+        {
+            let buff = BlockBuffer::acquire(relation.as_ptr(), blkno);
+            let h = unsafe { CString::from_raw(buff.as_ptr()) };
+            info!("CString {h:?}");
+            _ = h.into_raw();
+        }
+
+        Ok(())
     }
 }
