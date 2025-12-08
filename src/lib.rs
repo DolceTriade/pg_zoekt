@@ -1,4 +1,3 @@
-use pgrx::prelude::*;
 
 mod am;
 mod build;

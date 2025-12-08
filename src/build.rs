@@ -1,14 +1,12 @@
-use std::{ffi::CString, str::FromStr};
 
 use pgrx::prelude::*;
 
 use crate::storage::pgbuffer::BlockBuffer;
 
 #[derive(Debug)]
-struct BuildCallbackState<'a> {
+struct BuildCallbackState {
     key_count: usize,
     seen: u64,
-    root: &'a mut crate::storage::RootBlockList,
     collector: crate::trgm::Collector,
 }
 
@@ -20,7 +18,7 @@ unsafe extern "C-unwind" fn log_index_value_callback(
     isnull: *mut bool,
     tuple_is_alive: bool,
     state: *mut std::ffi::c_void,
-) {
+) { unsafe {
     let state = &mut *(state as *mut BuildCallbackState);
 
     if state.key_count == 0 {
@@ -44,18 +42,20 @@ unsafe extern "C-unwind" fn log_index_value_callback(
 
     let values = std::slice::from_raw_parts(values, state.key_count);
     let isnull = std::slice::from_raw_parts(isnull, state.key_count);
-    
 
     if !isnull[0] {
         if let Some(text) = String::from_datum(values[0], false) {
-            info!("pg_zoekt ambuild text: {} {} {:?}", text, tuple_is_alive, &ctid);
+            info!(
+                "pg_zoekt ambuild text: {} {} {:?}",
+                text, tuple_is_alive, &ctid
+            );
             crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
                 _ = state.collector.add(ctid, trgm, pos as u32);
             });
         }
         state.seen += 1;
     }
-}
+}}
 
 #[pg_guard]
 pub extern "C-unwind" fn ambuild(
@@ -64,7 +64,7 @@ pub extern "C-unwind" fn ambuild(
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
     let mut root_buffer = BlockBuffer::allocate(index_relation);
-    let mut rbl = root_buffer
+    let rbl = root_buffer
         .as_struct_mut::<crate::storage::RootBlockList>(0)
         .expect("Root should always be in bounds");
     rbl.magic = crate::storage::ROOT_MAGIC;
@@ -84,7 +84,6 @@ pub extern "C-unwind" fn ambuild(
     let mut callback_state = BuildCallbackState {
         key_count,
         seen: 0,
-        root: &mut rbl,
         collector: crate::trgm::Collector::new(),
     };
     info!("Starting scan");
@@ -105,8 +104,17 @@ pub extern "C-unwind" fn ambuild(
             error!("failed to write segment: {e:?}");
         }
     };
-    info!("Wrote segment: {segment:?}");
 
+    info!("Wrote segment: {segment:?}");
+    rbl.num_segments = 1;
+
+    let segments = root_buffer
+        .as_struct_with_elems_mut::<crate::storage::Segments>(
+            std::mem::size_of::<crate::storage::RootBlockList>(),
+            1,
+        )
+        .expect("get segment list");
+    segments.entries[0] = segment;
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = callback_state.seen as f64;
     result.index_tuples = callback_state.seen as f64;

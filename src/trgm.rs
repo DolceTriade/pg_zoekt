@@ -1,12 +1,11 @@
 /// Trigram stuff
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     str::CharIndices,
 };
 
 use anyhow::Context;
 
-#[derive(Debug)]
 pub struct CompactTrgm(pub u32);
 
 impl CompactTrgm {
@@ -24,6 +23,24 @@ impl CompactTrgm {
 
     pub fn trgm(&self) -> u32 {
         self.0 & 0xffffff
+    }
+
+    pub fn txt(&self) -> String {
+        let t = [
+            (self.0 & 0xff) as u8,
+            (self.0 >> 8 & 0xff) as u8,
+            (self.0 >> 16 & 0xff) as u8,
+        ];
+        String::from_utf8_lossy(&t).to_string()
+    }
+}
+
+impl std::fmt::Debug for CompactTrgm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CompactTrgm")
+            .field(&self.txt())
+            .field(&self.flags())
+            .finish()
     }
 }
 

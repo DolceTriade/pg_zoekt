@@ -216,14 +216,18 @@ mod tests {
             -- 1. Create table
             CREATE TABLE documents (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
 
-            -- 2. Insert dummy data
+            -- 2. Insert varied text to exercise trigram boundaries
             INSERT INTO documents (text) VALUES
-            ('The quick brown fox jumps over the lazy dog.'),
+            ('The quick brown fox jumps over the lazy dog. Shared trigram: xyz.'),
             ('PostgreSQL is a powerful, open-source object-relational database system.'),
             ('pg_zoekt is a new access method for full-text search.'),
-            ('Zoekt is a fast, robust code search engine.');
-
-            DELETE FROM documents WHERE id = 1;
+            ('Zoekt is a fast, robust code search engine. xyz in code search.'),
+            ('Edge-case!! punctuation,,, and    extra   spaces. xyz sprinkled.'),
+            ('abc xyz'),
+            ('abababababababababababababababab xyz'), -- repetitive trigram run
+            ('Mixing_numbers_12345_and-hyphens-and/slashes xyz'),
+            ('Longer paragraph with several sentences. It mixes case, repeats words words words, and ends abruptly. xyz near end'),
+            ('xyzxyaxzyxyxyzxyzxyzxyzxyz  xyz xyzyxzxyz xyz  xyzxyxzxyzxyzxyxzxyz');
 
             -- 3. Create the index
             CREATE INDEX idx_documents_text_zoekt ON documents

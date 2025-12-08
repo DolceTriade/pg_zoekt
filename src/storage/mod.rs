@@ -1,6 +1,6 @@
-/// Storing stuff
-use zerocopy::{FromBytes, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 use pgrx::prelude::*;
+/// Storing stuff
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub mod encode;
 pub mod pgbuffer;
@@ -49,12 +49,9 @@ impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
         if value.is_null() {
             anyhow::bail!("ItemPointer is null!");
         }
-        let blk = unsafe { 
-            ((*value).ip_blkid.bi_hi as u32) << 16 | (*value).ip_blkid.bi_lo as u32
-        };
-        let off = unsafe {
-            (*value).ip_posid
-        };
+        let blk =
+            unsafe { ((*value).ip_blkid.bi_hi as u32) << 16 | (*value).ip_blkid.bi_lo as u32 };
+        let off = unsafe { (*value).ip_posid };
         Ok(Self {
             block_number: blk,
             offset: off,
@@ -67,6 +64,12 @@ impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
 pub struct Segment {
     pub block: u32,
     pub size: u64,
+}
+
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C, packed)]
+pub struct Segments {
+    pub entries: [Segment],
 }
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout)]
@@ -132,7 +135,7 @@ pub struct WALEntry {
     pub num_positions: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 
 pub struct CompressedBlockHeader {

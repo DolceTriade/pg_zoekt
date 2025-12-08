@@ -83,8 +83,7 @@ impl BlockBuffer {
         // SAFETY: We validated that the requested range fits within the page's
         // special area. `try_ref_from_bytes` will check alignment and validity.
         let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
-        let bytes: &'a [u8] =
-            unsafe { std::slice::from_raw_parts(start.add(offset), struct_size) };
+        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), struct_size) };
 
         T::try_ref_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
     }
@@ -155,11 +154,14 @@ impl BlockBuffer {
         T: KnownLayout<PointerMetadata = usize> + ?Sized,
     {
         let meta = T::PointerMetadata::from_elem_count(elems);
-        T::size_for_metadata(meta)
-            .ok_or_else(|| anyhow::anyhow!("Requested size would overflow"))
+        T::size_for_metadata(meta).ok_or_else(|| anyhow::anyhow!("Requested size would overflow"))
     }
 
-    pub unsafe fn as_ptr(&mut self) -> *mut i8 {
+    pub unsafe fn as_ptr_mut(&mut self) -> *mut i8 {
+        unsafe { pg_sys::PageGetSpecialPointer(self.page) }
+    }
+
+    pub unsafe fn as_ptr(&self) -> *const i8 {
         unsafe { pg_sys::PageGetSpecialPointer(self.page) }
     }
 }
@@ -175,6 +177,24 @@ impl Drop for BlockBuffer {
         }
         unsafe {
             pg_sys::UnlockReleaseBuffer(self.buffer);
+        }
+    }
+}
+
+impl AsRef<[u8]> for BlockBuffer {
+    fn as_ref(&self) -> &[u8] {
+        unsafe {
+            let p = self.as_ptr();
+            std::slice::from_raw_parts(p as *const u8, SPECIAL_SIZE)
+        }
+    }
+}
+
+impl AsMut<[u8]> for BlockBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            let p = self.as_ptr_mut();
+            std::slice::from_raw_parts_mut(p as *mut u8, SPECIAL_SIZE)
         }
     }
 }
@@ -241,13 +261,13 @@ mod tests {
             blkno = buff.block_number();
             let s = CString::new("hello").expect("string made");
             unsafe {
-                std::ptr::copy(s.as_ptr(), buff.as_ptr(), s.count_bytes());
+                std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
             }
         }
 
         {
             let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno);
-            let h = unsafe { CString::from_raw(buff.as_ptr()) };
+            let h = unsafe { CString::from_raw(buff.as_ptr_mut()) };
             info!("CString {h:?}");
             _ = h.into_raw();
         }
