@@ -158,7 +158,6 @@ impl Occurance {
         self.0 &= 0xffffff;
         self.0 |= (flags as u32) << 24;
     }
-
 }
 
 #[derive(Debug)]
@@ -187,14 +186,14 @@ impl Collector {
         }
         let mut o = Occurance(position);
         o.set_flags(ct.flags());
-        self
-            .trgms
+        self.trgms
             .entry(ct.trgm())
             .or_insert(BTreeMap::new())
             .entry(ctid)
             .or_insert(Vec::new())
             .push(o);
-        self.size_estimate += std::mem::size_of_val(&ct) + std::mem::size_of_val(&o) + std::mem::size_of_val(&ctid);
+        self.size_estimate +=
+            std::mem::size_of_val(&ct) + std::mem::size_of_val(&o) + std::mem::size_of_val(&ctid);
         Ok(())
     }
 

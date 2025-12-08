@@ -1,6 +1,6 @@
 /// Storing stuff
-
-use zerocopy::{TryFromBytes, FromBytes, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
+use pgrx::prelude::*;
 
 pub mod encode;
 pub mod pgbuffer;
@@ -22,11 +22,44 @@ pub struct RootBlockList {
     // Segments...
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Clone,
+    Copy,
+    PartialOrd,
+    Ord,
+    TryFromBytes,
+    IntoBytes,
+    KnownLayout,
+    Unaligned,
+)]
 #[repr(C, packed)]
 pub struct ItemPointer {
     pub block_number: pgrx::pg_sys::BlockNumber,
     pub offset: pgrx::pg_sys::OffsetNumber,
+}
+
+impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
+    type Error = anyhow::Error;
+
+    fn try_from(value: pg_sys::ItemPointer) -> anyhow::Result<Self> {
+        if value.is_null() {
+            anyhow::bail!("ItemPointer is null!");
+        }
+        let blk = unsafe { 
+            ((*value).ip_blkid.bi_hi as u32) << 16 | (*value).ip_blkid.bi_lo as u32
+        };
+        let off = unsafe {
+            (*value).ip_posid
+        };
+        Ok(Self {
+            block_number: blk,
+            offset: off,
+        })
+    }
 }
 
 #[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned)]
@@ -83,7 +116,6 @@ pub struct WALBucket {
     pub magic: u16,
     pub free: u16,
     pub next_block: u32,
-
 }
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout)]

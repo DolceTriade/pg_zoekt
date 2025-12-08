@@ -9,12 +9,13 @@ struct BuildCallbackState<'a> {
     key_count: usize,
     seen: u64,
     root: &'a mut crate::storage::RootBlockList,
+    collector: crate::trgm::Collector,
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 unsafe extern "C-unwind" fn log_index_value_callback(
     _index: pg_sys::Relation,
-    _tid: pg_sys::ItemPointer,
+    tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
     tuple_is_alive: bool,
@@ -26,17 +27,30 @@ unsafe extern "C-unwind" fn log_index_value_callback(
         return;
     }
 
+    if tid.is_null() {
+        return;
+    }
+
+    let ctid: crate::storage::ItemPointer = match tid.try_into() {
+        Ok(ctid) => ctid,
+        Err(e) => {
+            error!("failed to parse tid: {e:#?}");
+        }
+    };
+
     let values = std::slice::from_raw_parts(values, state.key_count);
     let isnull = std::slice::from_raw_parts(isnull, state.key_count);
+    
 
     if !isnull[0] {
         if let Some(text) = String::from_datum(values[0], false) {
             info!("pg_zoekt ambuild text: {} {}", text, tuple_is_alive);
-
+            crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
+                _ = state.collector.add(ctid, trgm, pos as u32);
+            });
         }
         state.seen += 1;
     }
-
 }
 
 #[pg_guard]
@@ -67,6 +81,7 @@ pub extern "C-unwind" fn ambuild(
         key_count,
         seen: 0,
         root: &mut rbl,
+        collector: crate::trgm::Collector::new(),
     };
     info!("Starting scan");
     unsafe {
@@ -78,6 +93,15 @@ pub extern "C-unwind" fn ambuild(
             &mut callback_state,
         );
     }
+
+    let e = crate::storage::encode::Encoder::new(&callback_state.collector);
+    let segment = match e.encode(index_relation) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to write segment: {e:#?}");
+        }
+    };
+    info!("Wrote segment: {segment:#?}");
 
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = callback_state.seen as f64;

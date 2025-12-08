@@ -1,4 +1,5 @@
 use pgrx::prelude::*;
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 #[derive(Debug)]
 pub struct BlockBuffer {
@@ -72,28 +73,89 @@ impl BlockBuffer {
         unsafe { &*(self.page as *const pg_sys::PageHeaderData) }
     }
 
-    pub fn as_struct<T>(&self, offset: usize) -> anyhow::Result<&'static T> {
-        if offset + std::mem::size_of::<T>() + std::mem::size_of::<pg_sys::PageHeaderData>()
-            > pg_sys::BLCKSZ as usize
-        {
-            anyhow::bail!("Invalid offset. Out of bounds access");
-        }
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) };
-        let struct_ptr = unsafe { start.add(offset) };
+    pub fn as_struct<'a, T>(&'a self, offset: usize) -> anyhow::Result<&'a T>
+    where
+        T: TryFromBytes + KnownLayout + Immutable,
+    {
+        let struct_size = std::mem::size_of::<T>();
+        self.validate_bounds(offset, struct_size)?;
 
-        Ok(unsafe { &*(struct_ptr as *const T) })
+        // SAFETY: We validated that the requested range fits within the page's
+        // special area. `try_ref_from_bytes` will check alignment and validity.
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
+        let bytes: &'a [u8] =
+            unsafe { std::slice::from_raw_parts(start.add(offset), struct_size) };
+
+        T::try_ref_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
     }
 
-        pub fn as_struct_mut<T>(&mut self, offset: usize) -> anyhow::Result<&'static mut T> {
-        if offset + std::mem::size_of::<T>() + std::mem::size_of::<pg_sys::PageHeaderData>()
-            > pg_sys::BLCKSZ as usize
-        {
+    pub fn as_struct_mut<'a, T>(&'a mut self, offset: usize) -> anyhow::Result<&'a mut T>
+    where
+        T: TryFromBytes + IntoBytes + KnownLayout,
+    {
+        let struct_size = std::mem::size_of::<T>();
+        self.validate_bounds(offset, struct_size)?;
+
+        // SAFETY: We validated that the requested range fits within the page's
+        // special area. `try_mut_from_bytes` will check alignment and validity.
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *mut u8 };
+        let bytes: &'a mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(start.add(offset), struct_size) };
+
+        T::try_mut_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    pub fn as_struct_with_elems<'a, T>(
+        &'a self,
+        offset: usize,
+        elems: usize,
+        elems_size: usize,
+    ) -> anyhow::Result<&'a T>
+    where
+        T: TryFromBytes + KnownLayout<PointerMetadata = usize> + Immutable + ?Sized,
+    {
+        self.validate_offset(offset)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
+        let bytes: &'a [u8] =
+            unsafe { std::slice::from_raw_parts(start.add(offset), elems * elems_size) };
+        T::try_ref_from_bytes_with_elems(bytes, elems)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    pub fn as_struct_with_elems_mut<'a, T>(
+        &'a mut self,
+        offset: usize,
+        elems: usize,
+        elems_size: usize,
+    ) -> anyhow::Result<&'a mut T>
+    where
+        T: TryFromBytes + IntoBytes + KnownLayout<PointerMetadata = usize> + ?Sized,
+    {
+        self.validate_offset(offset)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *mut u8 };
+        let bytes: &'a mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(start.add(offset), elems * elems_size) };
+        T::try_mut_from_bytes_with_elems(bytes, elems)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    fn validate_bounds(&self, offset: usize, size: usize) -> anyhow::Result<()> {
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("Offset overflow"))?;
+
+        if end > SPECIAL_SIZE {
             anyhow::bail!("Invalid offset. Out of bounds access");
         }
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) };
-        let struct_ptr = unsafe { start.add(offset) };
 
-        Ok(unsafe { &mut *(struct_ptr as *mut T ) })
+        Ok(())
+    }
+
+    fn validate_offset(&self, offset: usize) -> anyhow::Result<()> {
+        if offset > SPECIAL_SIZE {
+            anyhow::bail!("Invalid offset. Out of bounds access");
+        }
+        Ok(())
     }
 
     pub unsafe fn as_ptr(&mut self) -> *mut i8 {

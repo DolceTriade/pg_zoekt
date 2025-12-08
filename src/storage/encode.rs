@@ -17,22 +17,22 @@ impl<'a> Encoder<'a> {
         let mut meta1: Option<BlockBuffer> = None;
         let mut remaining_trgms = trgms.len();
         let mut iter = trgms.iter();
+        info!("Encoding {remaining_trgms}");
         while remaining_trgms > 0 {
             let mut leaf = BlockBuffer::allocate(rel);
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
-            let leaf_ptr = unsafe { leaf.as_ptr() as *mut u8 };
-            let sl = unsafe { std::slice::from_raw_parts_mut(leaf_ptr, BH_SIZE) };
-            let bh = super::BlockHeader::try_mut_from_bytes(sl).context("does this work")?;
+            let bh = leaf
+                .as_struct_mut::<super::BlockHeader>(0)
+                .context("does this work")?;
             bh.magic = super::BLOCK_MAGIC;
             bh.level = 0;
             const ENTRY_SIZE: usize = std::mem::size_of::<super::IndexEntry>();
             let num_entries =
                 ((super::pgbuffer::SPECIAL_SIZE - BH_SIZE) / ENTRY_SIZE).min(remaining_trgms);
             bh.num_entries = num_entries as u32;
-            let entries_ptr = unsafe { leaf_ptr.add(BH_SIZE) };
-            let sl =
-                unsafe { std::slice::from_raw_parts_mut(entries_ptr, ENTRY_SIZE * num_entries) };
-            let entries = super::IndexList::try_mut_from_bytes_with_elems(sl, num_entries)
+            info!("Num entries is {num_entries}");
+            let entries = leaf
+                .as_struct_with_elems_mut::<super::IndexList>(BH_SIZE, num_entries, ENTRY_SIZE)
                 .context("could not parse entries")?;
             for i in 0..num_entries {
                 let Some((key, val)) = iter.next() else {
@@ -45,7 +45,6 @@ impl<'a> Encoder<'a> {
                 idx.frequency = val.len() as u32;
             }
             remaining_trgms -= num_entries;
-            
 
             // Start with leaf node.
             // Write until full.
