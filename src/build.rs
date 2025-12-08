@@ -31,6 +31,10 @@ unsafe extern "C-unwind" fn log_index_value_callback(
         return;
     }
 
+    if !tuple_is_alive {
+        return;
+    }
+
     let ctid: crate::storage::ItemPointer = match tid.try_into() {
         Ok(ctid) => ctid,
         Err(e) => {
@@ -44,7 +48,7 @@ unsafe extern "C-unwind" fn log_index_value_callback(
 
     if !isnull[0] {
         if let Some(text) = String::from_datum(values[0], false) {
-            info!("pg_zoekt ambuild text: {} {}", text, tuple_is_alive);
+            info!("pg_zoekt ambuild text: {} {} {:?}", text, tuple_is_alive, &ctid);
             crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
                 _ = state.collector.add(ctid, trgm, pos as u32);
             });
@@ -98,10 +102,10 @@ pub extern "C-unwind" fn ambuild(
     let segment = match e.encode(index_relation) {
         Ok(s) => s,
         Err(e) => {
-            error!("failed to write segment: {e:#?}");
+            error!("failed to write segment: {e:?}");
         }
     };
-    info!("Wrote segment: {segment:#?}");
+    info!("Wrote segment: {segment:?}");
 
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = callback_state.seen as f64;

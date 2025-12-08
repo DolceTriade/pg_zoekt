@@ -1,5 +1,5 @@
 use pgrx::prelude::*;
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 
 #[derive(Debug)]
 pub struct BlockBuffer {
@@ -109,15 +109,14 @@ impl BlockBuffer {
         &'a self,
         offset: usize,
         elems: usize,
-        elems_size: usize,
     ) -> anyhow::Result<&'a T>
     where
         T: TryFromBytes + KnownLayout<PointerMetadata = usize> + Immutable + ?Sized,
     {
-        self.validate_offset(offset)?;
+        let required = self.required_size::<T>(elems)?;
+        self.validate_bounds(offset, required)?;
         let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
-        let bytes: &'a [u8] =
-            unsafe { std::slice::from_raw_parts(start.add(offset), elems * elems_size) };
+        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), required) };
         T::try_ref_from_bytes_with_elems(bytes, elems)
             .map_err(|e| anyhow::Error::msg(e.to_string()))
     }
@@ -126,15 +125,15 @@ impl BlockBuffer {
         &'a mut self,
         offset: usize,
         elems: usize,
-        elems_size: usize,
     ) -> anyhow::Result<&'a mut T>
     where
         T: TryFromBytes + IntoBytes + KnownLayout<PointerMetadata = usize> + ?Sized,
     {
-        self.validate_offset(offset)?;
+        let required = self.required_size::<T>(elems)?;
+        self.validate_bounds(offset, required)?;
         let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *mut u8 };
         let bytes: &'a mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(start.add(offset), elems * elems_size) };
+            unsafe { std::slice::from_raw_parts_mut(start.add(offset), required) };
         T::try_mut_from_bytes_with_elems(bytes, elems)
             .map_err(|e| anyhow::Error::msg(e.to_string()))
     }
@@ -151,11 +150,13 @@ impl BlockBuffer {
         Ok(())
     }
 
-    fn validate_offset(&self, offset: usize) -> anyhow::Result<()> {
-        if offset > SPECIAL_SIZE {
-            anyhow::bail!("Invalid offset. Out of bounds access");
-        }
-        Ok(())
+    fn required_size<T>(&self, elems: usize) -> anyhow::Result<usize>
+    where
+        T: KnownLayout<PointerMetadata = usize> + ?Sized,
+    {
+        let meta = T::PointerMetadata::from_elem_count(elems);
+        T::size_for_metadata(meta)
+            .ok_or_else(|| anyhow::anyhow!("Requested size would overflow"))
     }
 
     pub unsafe fn as_ptr(&mut self) -> *mut i8 {

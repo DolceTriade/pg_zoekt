@@ -32,7 +32,7 @@ impl<'a> Encoder<'a> {
             bh.num_entries = num_entries as u32;
             info!("Num entries is {num_entries}");
             let entries = leaf
-                .as_struct_with_elems_mut::<super::IndexList>(BH_SIZE, num_entries, ENTRY_SIZE)
+                .as_struct_with_elems_mut::<super::IndexList>(BH_SIZE, num_entries)
                 .context("could not parse entries")?;
             for i in 0..num_entries {
                 let Some((key, val)) = iter.next() else {
@@ -58,5 +58,42 @@ impl<'a> Encoder<'a> {
             // Start writing compressed blocks of 128 entries
         }
         Ok(super::Segment { block: 0, size: 0 })
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompressedBatchBuilder {
+    blks: Vec<u32>,
+    offs: Vec<u16>,
+
+    counts: Vec<u16>,
+
+    positions: Vec<u32>,
+
+    flags: Vec<u8>,
+
+}
+
+impl CompressedBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, doc: super::ItemPointer, occs: &[crate::trgm::Occurance]) {
+        self.blks.push(doc.block_number);
+        self.offs.push(doc.offset);
+        self.counts.push(occs.len() as u16);
+        self.positions.reserve(occs.len());
+        self.flags.reserve(occs.len());
+        for occ in occs {
+            self.positions.push(occ.position());
+            self.flags.push(occ.flags());
+        }
+    }
+
+    pub fn compress(&self) -> Vec<u8> {
+        let out = Vec::new();
+        
+        out
     }
 }

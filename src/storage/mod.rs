@@ -131,3 +131,20 @@ pub struct WALEntry {
     pub ctid: ItemPointer,
     pub num_positions: u32,
 }
+
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C, packed)]
+
+pub struct CompressedBlockHeader {
+    // Max of 128 docs per batch
+    num_docs: u8,
+    // hopefully good enough, we'll see.
+    docs_blk_len: u16,
+    docs_off_len: u16,
+
+    counts_len: u16,
+
+    pos_len: u16,
+
+    flags_len: u16,
+}

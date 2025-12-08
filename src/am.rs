@@ -223,11 +223,14 @@ mod tests {
             ('pg_zoekt is a new access method for full-text search.'),
             ('Zoekt is a fast, robust code search engine.');
 
+            DELETE FROM documents WHERE id = 1;
+
             -- 3. Create the index
             CREATE INDEX idx_documents_text_zoekt ON documents
             USING pg_zoekt (text);
         ";
         Spi::run(sql)?;
+        assert!(false);
         Ok(())
     }
 }
