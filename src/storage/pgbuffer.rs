@@ -64,23 +64,39 @@ impl BlockBuffer {
         }
     }
 
-    pub fn page_header(self) -> &'static pg_sys::PageHeaderData {
+    pub fn block_number(&self) -> u32 {
+        unsafe { pg_sys::BufferGetBlockNumber(self.buffer) }
+    }
+
+    pub fn page_header(&self) -> &'static pg_sys::PageHeaderData {
         unsafe { &*(self.page as *const pg_sys::PageHeaderData) }
     }
 
-    pub fn as_struct<T>(self, offset: usize) -> anyhow::Result<&'static T> {
+    pub fn as_struct<T>(&self, offset: usize) -> anyhow::Result<&'static T> {
         if offset + std::mem::size_of::<T>() + std::mem::size_of::<pg_sys::PageHeaderData>()
             > pg_sys::BLCKSZ as usize
         {
             anyhow::bail!("Invalid offset. Out of bounds access");
         }
-
-        let struct_ptr = unsafe { self.page.add(offset) };
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) };
+        let struct_ptr = unsafe { start.add(offset) };
 
         Ok(unsafe { &*(struct_ptr as *const T) })
     }
 
-    pub unsafe fn as_ptr(&self) -> *mut i8 {
+        pub fn as_struct_mut<T>(&mut self, offset: usize) -> anyhow::Result<&'static mut T> {
+        if offset + std::mem::size_of::<T>() + std::mem::size_of::<pg_sys::PageHeaderData>()
+            > pg_sys::BLCKSZ as usize
+        {
+            anyhow::bail!("Invalid offset. Out of bounds access");
+        }
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) };
+        let struct_ptr = unsafe { start.add(offset) };
+
+        Ok(unsafe { &mut *(struct_ptr as *mut T ) })
+    }
+
+    pub unsafe fn as_ptr(&mut self) -> *mut i8 {
         unsafe { pg_sys::PageGetSpecialPointer(self.page) }
     }
 }
@@ -158,8 +174,8 @@ mod tests {
         let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
         let mut blkno = 0;
         {
-            let buff = BlockBuffer::allocate(relation.as_ptr());
-            blkno = unsafe { pg_sys::BufferGetBlockNumber(buff.buffer) };
+            let mut buff = BlockBuffer::allocate(relation.as_ptr());
+            blkno = buff.block_number();
             let s = CString::new("hello").expect("string made");
             unsafe {
                 std::ptr::copy(s.as_ptr(), buff.as_ptr(), s.count_bytes());
@@ -167,7 +183,7 @@ mod tests {
         }
 
         {
-            let buff = BlockBuffer::acquire(relation.as_ptr(), blkno);
+            let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno);
             let h = unsafe { CString::from_raw(buff.as_ptr()) };
             info!("CString {h:?}");
             _ = h.into_raw();

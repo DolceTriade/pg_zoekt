@@ -1,5 +1,10 @@
 /// Trigram stuff
-use std::str::CharIndices;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::CharIndices,
+};
+
+use anyhow::Context;
 
 #[derive(Debug)]
 pub struct CompactTrgm(pub u32);
@@ -11,6 +16,10 @@ impl CompactTrgm {
 
     pub fn case_bits(&self) -> u8 {
         (self.0 >> 24 & 0b111) as u8
+    }
+
+    pub fn flags(&self) -> u8 {
+        (self.0 >> 24) as u8
     }
 
     pub fn trgm(&self) -> u32 {
@@ -99,7 +108,7 @@ impl<'a> Extractor<'a> {
 }
 
 impl<'a> Iterator for Extractor<'a> {
-    type Item = &'a str;
+    type Item = (&'a str, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.have_window {
@@ -121,7 +130,76 @@ impl<'a> Iterator for Extractor<'a> {
             self.have_window = false;
         }
 
-        Some(&self.txt[start..end])
+        Some((&self.txt[start..end], start))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Occurance(pub u32);
+
+impl Occurance {
+    pub fn position(&self) -> u32 {
+        self.0 & 0xffffff
+    }
+
+    pub fn is_lossy(&self) -> bool {
+        self.0 & 1_u32 << 31 != 0
+    }
+
+    pub fn case_bits(&self) -> u8 {
+        (self.0 >> 24 & 0b111) as u8
+    }
+
+    pub fn flags(&self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    pub fn set_flags(&mut self, flags: u8) {
+        self.0 &= 0xffffff;
+        self.0 |= (flags as u32) << 24;
+    }
+
+}
+
+#[derive(Debug)]
+pub struct Collector {
+    trgms: BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>>,
+    size_estimate: usize,
+}
+
+impl Collector {
+    pub fn new() -> Self {
+        Self {
+            trgms: BTreeMap::new(),
+            size_estimate: 0,
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        ctid: crate::storage::ItemPointer,
+        trgm: &str,
+        position: u32,
+    ) -> anyhow::Result<()> {
+        let ct = CompactTrgm::try_from(trgm).context("failed to parse trgm")?;
+        if position >> 24 > 0 {
+            anyhow::bail!("Position too large to be indexed: {position}");
+        }
+        let mut o = Occurance(position);
+        o.set_flags(ct.flags());
+        self
+            .trgms
+            .entry(ct.trgm())
+            .or_insert(BTreeMap::new())
+            .entry(ctid)
+            .or_insert(Vec::new())
+            .push(o);
+        self.size_estimate += std::mem::size_of_val(&ct) + std::mem::size_of_val(&o) + std::mem::size_of_val(&ctid);
+        Ok(())
+    }
+
+    pub fn trgms(&self) -> &BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>> {
+        &self.trgms
     }
 }
 
@@ -132,19 +210,19 @@ mod test {
     #[test]
     pub fn test_extract() {
         let s = "abcdefgh";
-        let trgms = Extractor::extract(s).collect::<Vec<&str>>();
+        let trgms = Extractor::extract(s).map(|t| t.0).collect::<Vec<&str>>();
         assert_eq!(trgms, vec!["abc", "bcd", "cde", "def", "efg", "fgh"]);
 
         let s = "aβγδ";
-        let trgms = Extractor::extract(s).collect::<Vec<&str>>();
+        let trgms = Extractor::extract(s).map(|t| t.0).collect::<Vec<&str>>();
         assert_eq!(trgms, vec!["aβγ", "βγδ"]);
 
         let s = "";
-        let trgms = Extractor::extract(s).collect::<Vec<&str>>();
+        let trgms = Extractor::extract(s).map(|t| t.0).collect::<Vec<&str>>();
         assert_eq!(trgms, Vec::<&str>::new());
 
         let s = "a";
-        let trgms = Extractor::extract(s).collect::<Vec<&str>>();
+        let trgms = Extractor::extract(s).map(|t| t.0).collect::<Vec<&str>>();
         assert_eq!(trgms, Vec::<&str>::new());
     }
 

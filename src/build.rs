@@ -5,11 +5,10 @@ use pgrx::prelude::*;
 use crate::storage::pgbuffer::BlockBuffer;
 
 #[derive(Debug)]
-struct BuildCallbackState {
+struct BuildCallbackState<'a> {
     key_count: usize,
     seen: u64,
-    len: usize,
-    buff: BlockBuffer,
+    root: &'a mut crate::storage::RootBlockList,
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -18,7 +17,7 @@ unsafe extern "C-unwind" fn log_index_value_callback(
     _tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
-    _tuple_is_alive: bool,
+    tuple_is_alive: bool,
     state: *mut std::ffi::c_void,
 ) {
     let state = &mut *(state as *mut BuildCallbackState);
@@ -32,17 +31,12 @@ unsafe extern "C-unwind" fn log_index_value_callback(
 
     if !isnull[0] {
         if let Some(text) = String::from_datum(values[0], false) {
-            let ctext = CString::from_str(&text).unwrap();
-            // leak...
-            info!("pg_zoekt ambuild text: {}", text);
-            let ptr = unsafe { state.buff.as_ptr().add(state.len) };
-            unsafe { std::ptr::copy(ctext.as_ptr(), ptr, ctext.count_bytes()) }
-            state.len += ctext.count_bytes();
-            _ = ctext.into_raw();
+            info!("pg_zoekt ambuild text: {} {}", text, tuple_is_alive);
+
         }
+        state.seen += 1;
     }
 
-    state.seen += 1;
 }
 
 #[pg_guard]
@@ -51,12 +45,28 @@ pub extern "C-unwind" fn ambuild(
     index_relation: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    let mut root_buffer = BlockBuffer::allocate(index_relation);
+    let mut rbl = root_buffer
+        .as_struct_mut::<crate::storage::RootBlockList>(0)
+        .expect("Root should always be in bounds");
+    rbl.magic = crate::storage::ROOT_MAGIC;
+    rbl.num_segments = 0;
+    rbl.version = crate::storage::VERSION;
+
+    {
+        let mut wal_buffer = BlockBuffer::allocate(index_relation);
+        rbl.wal_block = wal_buffer.block_number();
+
+        let wal = wal_buffer
+            .as_struct_mut::<crate::storage::WALBuckets>(0)
+            .expect("WAL should always be in bounds");
+        wal.magic = crate::storage::WAL_MAGIC;
+    }
     let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
     let mut callback_state = BuildCallbackState {
         key_count,
         seen: 0,
-        len: 0,
-        buff: BlockBuffer::allocate(index_relation),
+        root: &mut rbl,
     };
     info!("Starting scan");
     unsafe {
