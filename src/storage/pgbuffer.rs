@@ -7,7 +7,7 @@ pub struct BlockBuffer {
     wal: Option<GenericWAL>,
 }
 
-const SPECIAL_SIZE: usize = align_down(
+pub const SPECIAL_SIZE: usize = align_down(
     (pg_sys::BLCKSZ as usize)
         - std::mem::size_of::<pg_sys::PageHeaderData>()
         - std::mem::size_of::<usize>(),
