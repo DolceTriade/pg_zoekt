@@ -62,10 +62,10 @@ impl<'a> Encoder<'a> {
                     occ_count += occs.len();
                 }
                 let buf = b.compress();
+                let loc = p.ensure_space_or_allocate_location(buf.len());
                 p.write(&buf).expect("Write to succeed");
-                let loc = p.location().expect("have a location");
                 idx.block = loc.block_number;
-                idx.offset = loc.offset - (buf.len() as u16);
+                idx.offset = loc.offset as u16;
                 byte_count += buf.len();
             }
             remaining_trgms -= num_entries;
@@ -117,23 +117,32 @@ impl CompressedBatchBuilder {
     }
 
     pub fn compress(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
         let num_docs = self.blks.len();
-        let blks_len = self.encode_section(&mut out, |enc| {
-            let delta: Vec<u32> = self.blks.iter().copied().deltas().collect();
-            enc.append(&delta);
+        let header_size = std::mem::size_of::<super::CompressedBlockHeader>();
+        let estimated_ints = self.positions.len()
+            + self.blks.len() * 3
+            + self.counts.len()
+            + self.offs.len();
+        let mut out = Vec::with_capacity(header_size + (estimated_ints * 5) + self.flags.len());
+        let mut encoder = StreamVByteEncoder::new();
+        let mut scratch = Vec::with_capacity(
+            self.positions
+                .len()
+                .max(self.blks.len())
+                .max(self.counts.len())
+                .max(self.offs.len()),
+        );
+        let blks_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
+            tmp.extend(self.blks.iter().copied().deltas());
         });
-        let offs_len = self.encode_section(&mut out, |enc| {
-            let tmp: Vec<u32> = self.offs.iter().map(|v| *v as u32).collect();
-            enc.append(tmp.as_slice());
+        let offs_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
+            tmp.extend(self.offs.iter().map(|v| *v as u32));
         });
-        let counts_len = self.encode_section(&mut out, |enc| {
-            let tmp: Vec<u32> = self.counts.iter().map(|v| *v as u32).collect();
-            enc.append(tmp.as_slice());
+        let counts_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
+            tmp.extend(self.counts.iter().map(|v| *v as u32));
         });
-        let positions_len = self.encode_section(&mut out, |enc| {
-            let delta: Vec<u32> = self.positions.iter().copied().deltas().collect();
-            enc.append(&delta);
+        let positions_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
+            tmp.extend(self.positions.iter().copied().deltas());
         });
         let flags_len = {
             let mut b = bitfield_rle::encode(&self.flags);
@@ -149,33 +158,41 @@ impl CompressedBatchBuilder {
             pos_len: positions_len as u16,
             flags_len: flags_len as u16,
         };
-        let mut c = std::io::Cursor::new(Vec::new());
-        hdr.write_to_io(&mut c).expect("not fail");
-        c.write(&out).expect("not fail");
-        c.into_inner()
+        let mut buf = Vec::with_capacity(header_size + out.len());
+        hdr.write_to_io(&mut buf).expect("not fail");
+        buf.extend_from_slice(&out);
+        buf
     }
 
-    fn encode_section<F>(&self, out: &mut Vec<u8>, fill: F) -> usize
+    fn encode_section<F>(
+        &self,
+        out: &mut Vec<u8>,
+        encoder: &mut StreamVByteEncoder,
+        scratch: &mut Vec<u32>,
+        fill: F,
+    ) -> usize
     where
-        F: FnOnce(&mut VByteEncoder),
+        F: FnOnce(&mut Vec<u32>),
     {
-        let mut enc = VByteEncoder::new();
-        fill(&mut enc);
-        let mut b = enc.into_inner();
-        let len = b.len();
-        out.append(&mut b);
+        scratch.clear();
+        fill(scratch);
+        encoder.clear();
+        encoder.append(scratch.as_slice());
+        let len = encoder.len();
+        encoder.append_into(out);
         len
     }
 }
 
-pub struct VByteEncoder {
+pub struct StreamVByteEncoder {
     buffer: Vec<u8>,
 }
 
-impl VByteEncoder {
+impl StreamVByteEncoder {
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(1024),
+            // 128 u32s + control bytes.
+            buffer: Vec::with_capacity(512),
         }
     }
 
@@ -215,6 +232,14 @@ impl VByteEncoder {
         self.buffer
     }
 
+    pub fn append_into(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.buffer);
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Reset for reuse (avoids dropping the allocation)
     pub fn clear(&mut self) {
         self.buffer.clear();
@@ -247,6 +272,16 @@ impl PageWriter {
             None => None,
         }
     }
+
+    pub fn ensure_space_or_allocate_location(&mut self, size: usize) -> super::ItemPointer {
+        if self.buff.is_some() && self.pos + size < self.size {
+            return self.location().expect("guaranteed to have a location");
+        }
+        _ = self.buff.take();
+        _ = self.buff.replace(BlockBuffer::allocate(self.rel));
+        self.pos = 0;
+        self.location().expect("guaranteed to have a location")
+    }
 }
 
 impl Write for PageWriter {
@@ -258,8 +293,10 @@ impl Write for PageWriter {
             ));
         }
         if self.buff.is_none() || self.pos + buf.len() >= self.size {
-            _ = self.buff.replace(BlockBuffer::allocate(self.rel));
-            self.pos = 0;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "need to re-allocate",
+            ));
         }
         if let Some(b) = self.buff.as_mut() {
             unsafe {
@@ -274,6 +311,7 @@ impl Write for PageWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         // drop to force flush
         _ = self.buff.take();
+        self.pos = 0;
         Ok(())
     }
 }
