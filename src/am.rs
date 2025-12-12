@@ -87,6 +87,7 @@ mod implementation {
         routine.ambeginscan = Some(crate::query::ambeginscan);
         routine.amrescan = Some(crate::query::amrescan);
         routine.amgettuple = Some(crate::query::amgettuple);
+        routine.amgetbitmap = Some(crate::query::amgetbitmap);
         routine.amendscan = Some(crate::query::amendscan);
 
         // Optional callbacks left unimplemented for now
@@ -132,6 +133,7 @@ mod tests {
     #[pg_test]
     pub fn test_build() -> spi::Result<()> {
         let sql = "
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
             -- 1. Create table
             CREATE TABLE documents (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
 
@@ -149,8 +151,8 @@ mod tests {
             ('xyzxyaxzyxyxyzxyzxyzxyzxyz  xyz xyzyxzxyz xyz  xyzxyxzxyzxyzxyxzxyz');
 
             -- 3. Create the index
-            CREATE INDEX idx_documents_text_zoekt ON documents
-            USING pg_zoekt (text);
+            CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text);
+            -- CREATE INDEX idx_documents_text_trgm ON documents USING GIN (text gin_trgm_ops);
         ";
         let explain_plan = Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
             client.update(sql, None, &[])?;
@@ -158,14 +160,14 @@ mod tests {
             // Force the planner to consider our index and grab the text-format EXPLAIN output.
             client.update("SET enable_seqscan = OFF", None, &[])?;
             client
-                .select("SELECT text FROM documents WHERE text LIKE 'xyz%';", None, &[])?
+                .select("EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, VERBOSE) SELECT text FROM documents WHERE text LIKE 'xyz%';", None, &[])?
                 .into_iter()
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()
         })?;
 
         explain_plan.iter().for_each(|s| info!("{}", s));
-        assert!(!explain_plan.is_empty());
+        // Intentional failure to force pgrx to print captured output during tests.
         assert!(false);
         Ok(())
     }

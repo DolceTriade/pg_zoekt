@@ -1,8 +1,5 @@
 /// Trigram stuff
-use std::{
-    collections::BTreeMap,
-    str::CharIndices,
-};
+use std::{collections::BTreeMap, str::CharIndices};
 
 use anyhow::Context;
 

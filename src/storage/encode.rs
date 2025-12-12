@@ -119,10 +119,8 @@ impl CompressedBatchBuilder {
     pub fn compress(&mut self) -> Vec<u8> {
         let num_docs = self.blks.len();
         let header_size = std::mem::size_of::<super::CompressedBlockHeader>();
-        let estimated_ints = self.positions.len()
-            + self.blks.len() * 3
-            + self.counts.len()
-            + self.offs.len();
+        let estimated_ints =
+            self.positions.len() + self.blks.len() * 3 + self.counts.len() + self.offs.len();
         let mut out = Vec::with_capacity(header_size + (estimated_ints * 5) + self.flags.len());
         let mut encoder = StreamVByteEncoder::new();
         let mut scratch = Vec::with_capacity(

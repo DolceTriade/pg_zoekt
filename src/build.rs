@@ -1,4 +1,3 @@
-
 use pgrx::prelude::*;
 
 use crate::storage::pgbuffer::BlockBuffer;
@@ -18,44 +17,46 @@ unsafe extern "C-unwind" fn log_index_value_callback(
     isnull: *mut bool,
     tuple_is_alive: bool,
     state: *mut std::ffi::c_void,
-) { unsafe {
-    let state = &mut *(state as *mut BuildCallbackState);
+) {
+    unsafe {
+        let state = &mut *(state as *mut BuildCallbackState);
 
-    if state.key_count == 0 {
-        return;
-    }
-
-    if tid.is_null() {
-        return;
-    }
-
-    if !tuple_is_alive {
-        return;
-    }
-
-    let ctid: crate::storage::ItemPointer = match tid.try_into() {
-        Ok(ctid) => ctid,
-        Err(e) => {
-            error!("failed to parse tid: {e:#?}");
+        if state.key_count == 0 {
+            return;
         }
-    };
 
-    let values = std::slice::from_raw_parts(values, state.key_count);
-    let isnull = std::slice::from_raw_parts(isnull, state.key_count);
-
-    if !isnull[0] {
-        if let Some(text) = String::from_datum(values[0], false) {
-            info!(
-                "pg_zoekt ambuild text: {} {} {:?}",
-                text, tuple_is_alive, &ctid
-            );
-            crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
-                _ = state.collector.add(ctid, trgm, pos as u32);
-            });
+        if tid.is_null() {
+            return;
         }
-        state.seen += 1;
+
+        if !tuple_is_alive {
+            return;
+        }
+
+        let ctid: crate::storage::ItemPointer = match tid.try_into() {
+            Ok(ctid) => ctid,
+            Err(e) => {
+                error!("failed to parse tid: {e:#?}");
+            }
+        };
+
+        let values = std::slice::from_raw_parts(values, state.key_count);
+        let isnull = std::slice::from_raw_parts(isnull, state.key_count);
+
+        if !isnull[0] {
+            if let Some(text) = String::from_datum(values[0], false) {
+                info!(
+                    "pg_zoekt ambuild text: {} {} {:?}",
+                    text, tuple_is_alive, &ctid
+                );
+                crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
+                    _ = state.collector.add(ctid, trgm, pos as u32);
+                });
+            }
+            state.seen += 1;
+        }
     }
-}}
+}
 
 #[pg_guard]
 pub extern "C-unwind" fn ambuild(

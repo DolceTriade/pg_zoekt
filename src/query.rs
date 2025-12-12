@@ -1,23 +1,24 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::ffi::CStr;
-use std::collections::HashMap;
 
 use anyhow::Context;
 use pgrx::datum::{DatumWithOid, FromDatum};
 use pgrx::prelude::*;
-use zerocopy::TryFromBytes;
+
+type PostingCursor = crate::storage::decode::PostingCursor;
 
 #[derive(Debug, Default)]
 struct ScanState {
     matches: Vec<pg_sys::ItemPointerData>,
     cursor: usize,
+    lossy: bool,
 }
 
 impl ScanState {
     fn reset(&mut self) {
         self.matches.clear();
         self.cursor = 0;
+        self.lossy = true;
     }
 
     fn push_match(&mut self, item: crate::storage::ItemPointer) {
@@ -71,14 +72,16 @@ fn scan_keys_to_pattern(keys: pg_sys::ScanKey, nkeys: i32) -> Option<String> {
     }
 }
 
-fn extract_trigrams(pattern: &str) -> HashSet<u32> {
-    let mut trgms = HashSet::new();
-    for (trgm, _) in crate::trgm::Extractor::extract(pattern) {
-        if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
-            trgms.insert(ct.trgm());
-        }
-    }
-    trgms
+#[derive(Debug, Clone)]
+struct PatternTrgm {
+    trigram: u32,
+    pos: u32,
+    flags: u8,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentPattern {
+    trigrams: Vec<PatternTrgm>,
 }
 
 unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
@@ -126,121 +129,6 @@ unsafe fn find_entry_for_trigram(
     Ok(pos.map(|idx| slice[idx]))
 }
 
-#[derive(Debug, Clone)]
-struct PatternTrgm {
-    trigram: u32,
-    pos: u32,
-    flags: u8,
-}
-
-#[derive(Debug, Clone)]
-struct DocPosting {
-    tid: crate::storage::ItemPointer,
-    positions: Vec<(u32, u8)>, // (position, flags)
-}
-
-fn delta_decode(values: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(values.len());
-    let mut acc = 0_u32;
-    for v in values {
-        acc = acc.wrapping_add(*v);
-        out.push(acc);
-    }
-    out
-}
-
-fn take_slice<'a>(
-    page: &'a [u8],
-    cursor: &mut usize,
-    len: usize,
-) -> anyhow::Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(len)
-        .context("overflow while slicing postings")?;
-    if end > page.len() {
-        anyhow::bail!("postings overrun");
-    }
-    let slice = &page[*cursor..end];
-    *cursor = end;
-    Ok(slice)
-}
-
-unsafe fn decode_postings(
-    rel: pg_sys::Relation,
-    entry: &crate::storage::IndexEntry,
-) -> anyhow::Result<Vec<DocPosting>> {
-    let mut buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, entry.block);
-    let page = buf.as_ref();
-    let start = entry.offset as usize;
-    if start >= page.len() {
-        anyhow::bail!("offset out of bounds");
-    }
-    let header_bytes = page
-        .get(start..start + std::mem::size_of::<crate::storage::CompressedBlockHeader>())
-        .context("header slice")?;
-    let hdr = *crate::storage::CompressedBlockHeader::try_ref_from_bytes(header_bytes)
-        .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
-    let mut cursor = start + std::mem::size_of::<crate::storage::CompressedBlockHeader>();
-
-    let num_docs = hdr.num_docs as usize;
-    let blk_bytes = take_slice(page, &mut cursor, hdr.docs_blk_len as usize)?;
-    let mut blk_nums = vec![0u32; num_docs];
-    stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(blk_bytes, num_docs, &mut blk_nums);
-    let blk_nums = delta_decode(&blk_nums);
-
-    let off_bytes = take_slice(page, &mut cursor, hdr.docs_off_len as usize)?;
-    let mut offs = vec![0u32; num_docs];
-    stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(off_bytes, num_docs, &mut offs);
-
-    let count_bytes = take_slice(page, &mut cursor, hdr.counts_len as usize)?;
-    let mut counts = vec![0u32; num_docs];
-    stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(count_bytes, num_docs, &mut counts);
-
-    let total_positions: usize = counts.iter().copied().map(|c| c as usize).sum();
-    let pos_bytes = take_slice(page, &mut cursor, hdr.pos_len as usize)?;
-    let mut positions = vec![0u32; total_positions];
-    if total_positions > 0 {
-        stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(
-            pos_bytes,
-            total_positions,
-            &mut positions,
-        );
-    }
-    let positions = delta_decode(&positions);
-
-    let flag_bytes = take_slice(page, &mut cursor, hdr.flags_len as usize)?;
-    let flags = bitfield_rle::decode(flag_bytes.to_vec()).unwrap_or_default();
-
-    let mut pos_cursor = 0usize;
-    let mut postings = Vec::with_capacity(num_docs);
-    for i in 0..num_docs {
-        let num_pos = counts[i] as usize;
-        let doc_positions = positions
-            .get(pos_cursor..pos_cursor + num_pos)
-            .unwrap_or(&[]);
-        let doc_flags = flags
-            .get(pos_cursor..pos_cursor + num_pos)
-            .unwrap_or(&[]);
-        pos_cursor += num_pos;
-
-        let mut pairs = Vec::with_capacity(doc_positions.len());
-        for (p, f) in doc_positions.iter().zip(doc_flags.iter().copied().chain(std::iter::repeat(0)))
-        {
-            pairs.push((*p, f));
-        }
-
-        postings.push(DocPosting {
-            tid: crate::storage::ItemPointer {
-                block_number: blk_nums[i],
-                offset: offs[i] as u16,
-            },
-            positions: pairs,
-        });
-    }
-
-    Ok(postings)
-}
-
 fn relation_qualified_name(relid: pg_sys::Oid) -> Option<String> {
     unsafe {
         let relname_ptr = pg_sys::get_rel_name(relid);
@@ -256,7 +144,11 @@ fn relation_qualified_name(relid: pg_sys::Oid) -> Option<String> {
             Some(CStr::from_ptr(nspname_ptr).to_string_lossy().into_owned())
         };
         Some(match nspname {
-            Some(n) => format!("\"{}\".\"{}\"", n.replace('"', "\"\""), relname.replace('"', "\"\"")),
+            Some(n) => format!(
+                "\"{}\".\"{}\"",
+                n.replace('"', "\"\""),
+                relname.replace('"', "\"\"")
+            ),
             None => relname.into_owned(),
         })
     }
@@ -275,18 +167,88 @@ fn is_case_sensitive(keys: pg_sys::ScanKey) -> bool {
     }
 }
 
-fn extract_pattern_trigrams(pattern: &str) -> Vec<PatternTrgm> {
-    let mut res = Vec::new();
-    for (trgm, pos) in crate::trgm::Extractor::extract(pattern) {
-        if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
-            res.push(PatternTrgm {
-                trigram: ct.trgm(),
-                pos: pos as u32,
-                flags: ct.flags(),
-            });
+fn extract_literal_segments(pattern: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            '_' => {
+                // single-char wildcard: terminate current literal run
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            '\\' => {
+                // escape: treat next char as literal if present
+                if let Some(n) = chars.next() {
+                    current.push(n);
+                }
+            }
+            other => current.push(other),
         }
     }
-    res
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
+    let mut leading = false;
+    let mut has_single = false;
+    let mut iter = pattern.chars().peekable();
+    let mut at_start = true;
+    while let Some(ch) = iter.next() {
+        match ch {
+            '\\' => {
+                _ = iter.next();
+                at_start = false;
+            }
+            '%' => {
+                if at_start {
+                    leading = true;
+                }
+                at_start = false;
+            }
+            '_' => {
+                has_single = true;
+                if at_start {
+                    leading = true;
+                }
+                at_start = false;
+            }
+            _ => {
+                at_start = false;
+            }
+        }
+    }
+    (leading, has_single)
+}
+
+fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
+    let mut segments = Vec::new();
+    for seg in extract_literal_segments(pattern) {
+        let mut trigms = Vec::new();
+        for (trgm, pos) in crate::trgm::Extractor::extract(&seg) {
+            if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
+                trigms.push(PatternTrgm {
+                    trigram: ct.trgm(),
+                    pos: pos as u32,
+                    flags: ct.flags(),
+                });
+            }
+        }
+        if !trigms.is_empty() {
+            segments.push(SegmentPattern { trigrams: trigms });
+        }
+    }
+    segments
 }
 
 fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
@@ -294,6 +256,205 @@ fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
         return true;
     }
     (doc_flag & 0b111) == (pattern_flag & 0b111)
+}
+
+fn entry_for_trigram(
+    rel: pg_sys::Relation,
+    segments: &[crate::storage::Segment],
+    trigram: u32,
+) -> Vec<crate::storage::IndexEntry> {
+    let mut entries = Vec::new();
+    for seg in segments {
+        if let Ok(Some(entry)) = unsafe { find_entry_for_trigram(rel, seg.block, trigram) } {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+fn stream_segment_occurrences(
+    rel: pg_sys::Relation,
+    index_segments: &[crate::storage::Segment],
+    seg_pattern: &SegmentPattern,
+    case_sensitive: bool,
+) -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
+    if seg_pattern.trigrams.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    struct TrgmWork {
+        pat_idx: usize,
+        pt: PatternTrgm,
+        entries: Vec<crate::storage::IndexEntry>,
+        freq: u32,
+    }
+
+    struct TrigramCursor {
+        cursors: Vec<PostingCursor>,
+        cur_idx: usize,
+    }
+
+    impl TrigramCursor {
+        fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
+            self.cursors.get(self.cur_idx)?.current_tid()
+        }
+
+        fn current(&self) -> Option<&crate::storage::decode::DocPosting> {
+            self.cursors.get(self.cur_idx)?.current()
+        }
+
+        fn advance(&mut self) -> anyhow::Result<bool> {
+            if self.cur_idx >= self.cursors.len() {
+                return Ok(false);
+            }
+            if self.cursors[self.cur_idx].advance()? {
+                return Ok(true);
+            }
+            self.cur_idx += 1;
+            while self.cur_idx < self.cursors.len() {
+                if self.cursors[self.cur_idx].advance()? {
+                    return Ok(true);
+                }
+                self.cur_idx += 1;
+            }
+            Ok(false)
+        }
+    }
+
+    let mut trgm_entries: Vec<TrgmWork> = Vec::new();
+    for (idx, pt) in seg_pattern.trigrams.iter().enumerate() {
+        let entries = entry_for_trigram(rel, index_segments, pt.trigram);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        };
+        let freq = entries
+            .iter()
+            .map(|e| e.frequency)
+            .min()
+            .unwrap_or(u32::MAX);
+        trgm_entries.push(TrgmWork {
+            pat_idx: idx,
+            pt: pt.clone(),
+            entries,
+            freq,
+        });
+    }
+
+    trgm_entries.sort_by_key(|w| w.freq);
+
+    let mut cursors = Vec::with_capacity(trgm_entries.len());
+    for work in &trgm_entries {
+        let mut per_seg = Vec::new();
+        for entry in &work.entries {
+            let mut cur = unsafe { PostingCursor::new(rel, entry)? };
+            // Start positioned at the first doc for this segment.
+            if !cur.advance()? {
+                continue;
+            }
+            per_seg.push(cur);
+        }
+        if per_seg.is_empty() {
+            return Ok(Vec::new());
+        }
+        cursors.push(TrigramCursor {
+            cursors: per_seg,
+            cur_idx: 0,
+        });
+    }
+
+    let mut occurrences: Vec<(crate::storage::ItemPointer, Vec<u32>)> = Vec::new();
+
+    'driver: loop {
+        let driver_tid = match cursors[0].current_tid() {
+            Some(t) => t,
+            None => break,
+        };
+
+        let mut mismatch = false;
+        for idx in 1..cursors.len() {
+            loop {
+                let tid = match cursors[idx].current_tid() {
+                    Some(t) => t,
+                    None => break 'driver,
+                };
+                match tid.cmp(&driver_tid) {
+                    Ordering::Less => {
+                        if !cursors[idx].advance()? {
+                            break 'driver;
+                        }
+                        continue;
+                    }
+                    Ordering::Equal => break,
+                    Ordering::Greater => {
+                        mismatch = true;
+                        break;
+                    }
+                }
+            }
+            if mismatch {
+                break;
+            }
+        }
+
+        if mismatch {
+            if !cursors[0].advance()? {
+                break;
+            }
+            continue 'driver;
+        }
+
+        let anchor_pattern_idx = trgm_entries[0].pat_idx;
+        let anchor_pt = &seg_pattern.trigrams[anchor_pattern_idx];
+        let anchor_doc = cursors[0].current().expect("cursor populated");
+
+        let mut starts: Vec<u32> = Vec::new();
+        for (pos, flag) in &anchor_doc.positions {
+            if *pos < anchor_pt.pos || !flags_match(*flag, anchor_pt.flags, case_sensitive) {
+                continue;
+            }
+            let mut ok = true;
+            for cur_idx in 1..cursors.len() {
+                let pat_idx = trgm_entries[cur_idx].pat_idx;
+                let pt = &seg_pattern.trigrams[pat_idx];
+                let delta = pt.pos as i64 - anchor_pt.pos as i64;
+                let target = if delta.is_negative() {
+                    let delta = (-delta) as u32;
+                    if *pos < delta {
+                        ok = false;
+                        break;
+                    }
+                    *pos - delta
+                } else {
+                    *pos + delta as u32
+                };
+                let doc = cursors[cur_idx].current().expect("aligned cursor");
+                if !doc
+                    .positions
+                    .iter()
+                    .any(|(p, f)| *p == target && flags_match(*f, pt.flags, case_sensitive))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let start = *pos - anchor_pt.pos;
+                if !starts.contains(&start) {
+                    starts.push(start);
+                }
+            }
+        }
+
+        if !starts.is_empty() {
+            occurrences.push((driver_tid, starts));
+        }
+
+        if !cursors[0].advance()? {
+            break;
+        }
+    }
+
+    Ok(occurrences)
 }
 
 unsafe fn build_scan_state(
@@ -309,80 +470,104 @@ unsafe fn build_scan_state(
     };
 
     let case_sensitive = is_case_sensitive(keys);
-    let pattern_trgms = extract_pattern_trigrams(&pattern_str);
-    if pattern_trgms.is_empty() {
+    let segments = extract_pattern_segments(&pattern_str);
+    if segments.is_empty() {
         return ScanState::default();
     }
+    let (leading_wildcard, has_single_char_wildcard) = pattern_wildcard_info(&pattern_str);
 
-    // Decode postings per trigram.
-    let mut trigram_hits: Vec<HashMap<crate::storage::ItemPointer, Vec<(u32, u8)>>> = Vec::new();
-    if let Ok(segments) = read_segments(index_relation) {
-        for pt in &pattern_trgms {
-            let mut map: HashMap<crate::storage::ItemPointer, Vec<(u32, u8)>> = HashMap::new();
-            for seg in &segments {
-                if let Ok(Some(entry)) =
-                    find_entry_for_trigram(index_relation, seg.block, pt.trigram)
-                {
-                    match decode_postings(index_relation, &entry) {
-                        Ok(postings) => {
-                            for doc in postings {
-                                map.entry(doc.tid)
-                                    .or_default()
-                                    .extend(doc.positions.into_iter());
+    if let Ok(index_segments) = read_segments(index_relation) {
+        let mut state = ScanState::default();
+        state.lossy = has_single_char_wildcard;
+
+        // Fast path: single literal segment with one trigram and anchored start (e.g. `xyz%`).
+        if !leading_wildcard
+            && !has_single_char_wildcard
+            && segments.len() == 1
+            && segments[0].trigrams.len() == 1
+        {
+            let pt = &segments[0].trigrams[0];
+            let entries = entry_for_trigram(index_relation, &index_segments, pt.trigram);
+            for entry in &entries {
+                match PostingCursor::new(index_relation, entry) {
+                    Ok(mut cur) => loop {
+                        match cur.advance_check_position(pt.pos, pt.flags, case_sensitive) {
+                            Ok(Some((tid, ok))) => {
+                                if ok {
+                                    state.push_match(tid);
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                warning!("failed to stream postings: {e:#}");
+                                break;
                             }
                         }
-                        Err(e) => warning!("failed to decode postings: {e:#}"),
-                    }
+                    },
+                    Err(e) => warning!("failed to stream postings: {e:#}"),
                 }
             }
-            trigram_hits.push(map);
+            state.sort_dedup();
+            return state;
         }
-    }
+        let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> = Vec::new();
 
-    // Intersect postings with positional alignment.
-    let mut state = ScanState::default();
-    if trigram_hits.iter().any(|m| m.is_empty()) {
-        return state;
-    }
-    let anchor_hits = &trigram_hits[0];
-    let anchor_pt = &pattern_trgms[0];
-    let anchor_pattern_pos = anchor_pt.pos as i64;
-
-    for (tid, positions) in anchor_hits {
-        for (anchor_pos, anchor_flag) in positions {
-            let mut ok = true;
-            for (idx, pt) in pattern_trgms.iter().enumerate().skip(1) {
-                let delta = pt.pos as i64 - anchor_pattern_pos;
-                if delta.is_negative() && (*anchor_pos as i64) < -delta {
-                    ok = false;
-                    break;
+        for seg_pattern in &segments {
+            match stream_segment_occurrences(
+                index_relation,
+                &index_segments,
+                seg_pattern,
+                case_sensitive,
+            ) {
+                Ok(occs) if !occs.is_empty() => segment_occurrences.push(occs),
+                Ok(_) => return state,
+                Err(e) => {
+                    warning!("failed to stream segment postings: {e:#}");
+                    return state;
                 }
-                let target = (*anchor_pos as i64 + delta) as u32;
-                let Some(doc_positions) = trigram_hits[idx].get(tid) else {
-                    ok = false;
-                    break;
+            }
+        }
+
+        if segment_occurrences.is_empty() {
+            return state;
+        }
+
+        let first = &segment_occurrences[0];
+        'tid_loop: for (tid, starts) in first {
+            let mut prev_start = if leading_wildcard {
+                *starts.iter().min().unwrap_or(&0)
+            } else if starts.contains(&0) {
+                0
+            } else {
+                continue;
+            };
+            for seg_idx in 1..segment_occurrences.len() {
+                let Some(starts_next) = segment_occurrences[seg_idx]
+                    .iter()
+                    .find(|(t, _)| t == tid)
+                    .map(|(_, s)| s)
+                else {
+                    continue 'tid_loop;
                 };
-                let mut found = false;
-                for (p, f) in doc_positions {
-                    if *p == target && flags_match(*f, pt.flags, case_sensitive) {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    ok = false;
-                    break;
+                if let Some(next_start) = starts_next
+                    .iter()
+                    .copied()
+                    .filter(|s| *s >= prev_start)
+                    .min()
+                {
+                    prev_start = next_start;
+                } else {
+                    continue 'tid_loop;
                 }
             }
-            if ok && flags_match(*anchor_flag, anchor_pt.flags, case_sensitive) {
-                state.push_match(*tid);
-                break;
-            }
+            state.push_match(*tid);
         }
-    }
 
-    state.sort_dedup();
-    state
+        state.sort_dedup();
+        state
+    } else {
+        ScanState::default()
+    }
 }
 
 pub unsafe extern "C-unwind" fn ambeginscan(
@@ -390,7 +575,8 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     nkeys: std::os::raw::c_int,
     norderbys: std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
-    let scan = pg_sys::RelationGetIndexScan(index_relation, nkeys, norderbys);
+    let scan: *mut pg_sys::IndexScanDescData =
+        pg_sys::RelationGetIndexScan(index_relation, nkeys, norderbys);
     if scan.is_null() {
         return std::ptr::null_mut();
     }
@@ -436,11 +622,42 @@ pub unsafe extern "C-unwind" fn amgettuple(
     };
     if let Some(tid) = state.next() {
         (*scan).xs_heaptid = tid;
-        (*scan).xs_recheck = true; // Caller should recheck the LIKE/regex predicate.
+        (*scan).xs_recheck = state.lossy; // Only recheck when single-char wildcards made matching lossy.
         true
     } else {
         false
     }
+}
+
+pub unsafe extern "C-unwind" fn amgetbitmap(
+    scan: pg_sys::IndexScanDesc,
+    tbm: *mut pg_sys::TIDBitmap,
+) -> i64 {
+    if scan.is_null() || tbm.is_null() {
+        return 0;
+    }
+    let state_ptr = (*scan).opaque as *mut ScanState;
+    let state_ref = if let Some(state) = state_ptr.as_mut() {
+        state
+    } else {
+        let mut fallback =
+            build_scan_state((*scan).indexRelation, (*scan).keyData, (*scan).numberOfKeys);
+        fallback.sort_dedup();
+        (*scan).opaque = Box::into_raw(Box::new(fallback)) as *mut std::ffi::c_void;
+        (*scan).opaque as *mut ScanState
+    };
+    let state = &mut *state_ref;
+    let mut added = 0_i64;
+    for chunk in state.matches.chunks(128) {
+        pg_sys::tbm_add_tuples(
+            tbm,
+            chunk.as_ptr() as pg_sys::ItemPointer,
+            chunk.len() as i32,
+            state.lossy,
+        );
+        added += chunk.len() as i64;
+    }
+    added
 }
 
 pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
@@ -465,12 +682,14 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     index_correlation: *mut f64,
     index_pages: *mut f64,
 ) {
-    // Basic cost model: heavily bias toward seq scan until index execution is mature.
-    // Still provide sane estimates to keep the planner stable.
+    // Cost model that favors bitmap scans over plain index scans.
     let indexinfo = path.as_ref().and_then(|p| unsafe { p.indexinfo.as_ref() });
 
     let pages = indexinfo.map(|i| i.pages as f64).unwrap_or(1000.0).max(1.0);
-    let tuples = indexinfo.map(|i| i.tuples as f64).unwrap_or(10000.0).max(1.0);
+    let tuples = indexinfo
+        .map(|i| i.tuples as f64)
+        .unwrap_or(10000.0)
+        .max(1.0);
 
     if !index_pages.is_null() {
         unsafe {
@@ -478,15 +697,20 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         }
     }
 
-    let selectivity = (1.0 / tuples.sqrt()).clamp(0.0001, 0.25);
+    // Assume moderately selective LIKE/regex predicates.
+    let selectivity = (1.0 / (tuples.sqrt())).clamp(0.0001, 0.02);
     if !index_selectivity.is_null() {
         unsafe {
             *index_selectivity = selectivity;
         }
     }
 
-    let startup = 100.0 + loop_count;
-    let total = startup + pages * selectivity * 50.0;
+    // Make plain IndexScan very expensive but keep bitmap-friendly total cost.
+    // Bitmap plans use index_total_cost as the cost to build the bitmap, while
+    // index scans pay startup + total. Keeping total small and startup huge
+    // biases toward BitmapIndexScan.
+    let startup = 100_000.0 + loop_count;
+    let total = pages * selectivity * 1.0 + 5.0;
 
     if !index_startup_cost.is_null() {
         unsafe { *index_startup_cost = startup };
@@ -496,5 +720,52 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     }
     if !index_correlation.is_null() {
         unsafe { *index_correlation = 0.0 };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trgm::CompactTrgm;
+
+    #[test]
+    fn test_extract_literal_segments_basic() {
+        let segments = extract_literal_segments("abc%def_g\\%h");
+        assert_eq!(
+            segments,
+            vec!["abc".to_string(), "def".to_string(), "g%h".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_literal_segments_wildcards_only() {
+        let segments = extract_literal_segments("%%a__b%");
+        assert_eq!(segments, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_pattern_segments_trigrams() {
+        let segments = extract_pattern_segments("abcd%bcde");
+        assert_eq!(segments.len(), 2);
+
+        let t1: Vec<String> = segments[0]
+            .trigrams
+            .iter()
+            .map(|pt| CompactTrgm(pt.trigram).txt())
+            .collect();
+        assert_eq!(t1, vec!["abc".to_string(), "bcd".to_string()]);
+
+        let t2: Vec<String> = segments[1]
+            .trigrams
+            .iter()
+            .map(|pt| CompactTrgm(pt.trigram).txt())
+            .collect();
+        assert_eq!(t2, vec!["bcd".to_string(), "cde".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_pattern_segments_too_short() {
+        let segments = extract_pattern_segments("ab%cd");
+        assert!(segments.is_empty());
     }
 }

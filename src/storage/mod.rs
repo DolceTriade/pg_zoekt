@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 /// Storing stuff
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
+pub mod decode;
 pub mod encode;
 pub mod pgbuffer;
 pub mod wal;
