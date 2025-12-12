@@ -1,9 +1,10 @@
 
 mod am;
 mod build;
+mod operators;
+mod query;
 mod storage;
 mod trgm;
-pub use am::pg_zoekt_handler;
 
 ::pgrx::pg_module_magic!(name, version);
 

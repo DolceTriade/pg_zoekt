@@ -12,7 +12,7 @@ pub const BLOCK_MAGIC: u32 = u32::from_ne_bytes(*b"sZKT");
 pub const WAL_MAGIC: u32 = u32::from_ne_bytes(*b"wZKT");
 pub const WAL_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"WL");
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct RootBlockList {
     pub magic: u32,
@@ -59,27 +59,27 @@ impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
     }
 }
 
-#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
 #[repr(C, packed)]
 pub struct Segment {
     pub block: u32,
     pub size: u64,
 }
 
-#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct Segments {
     pub entries: [Segment],
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct BlockPointer {
     pub min_trigram: u32,
     pub block: u32,
 }
 
-#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct BlockHeader {
     pub magic: u32,
@@ -87,7 +87,7 @@ pub struct BlockHeader {
     pub num_entries: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
 #[repr(C, packed)]
 pub struct IndexEntry {
     pub trigram: u32,
@@ -100,10 +100,10 @@ pub struct IndexEntry {
     pub frequency: u32,
 }
 
-#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
-struct IndexList {
-    entries: [IndexEntry],
+pub struct IndexList {
+    pub entries: [IndexEntry],
 }
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
@@ -135,19 +135,19 @@ pub struct WALEntry {
     pub num_positions: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
 #[repr(C, packed)]
 
 pub struct CompressedBlockHeader {
     // Max of 128 docs per batch
-    num_docs: u8,
+    pub num_docs: u8,
     // hopefully good enough, we'll see.
-    docs_blk_len: u16,
-    docs_off_len: u16,
+    pub docs_blk_len: u16,
+    pub docs_off_len: u16,
 
-    counts_len: u16,
+    pub counts_len: u16,
 
-    pos_len: u16,
+    pub pos_len: u16,
 
-    flags_len: u16,
+    pub flags_len: u16,
 }

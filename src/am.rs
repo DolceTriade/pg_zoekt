@@ -5,7 +5,7 @@ use pgrx::prelude::*;
 const AM_NAME: &str = "pg_zoekt";
 
 /// Helper to make the stubs noisy at runtime.
-fn not_implemented<T>() -> T {
+pub fn not_implemented<T>() -> T {
     error!("index access method `{AM_NAME}` is not implemented yet")
 }
 
@@ -36,54 +36,13 @@ mod implementation {
         not_implemented()
     }
 
-    unsafe extern "C-unwind" fn ambeginscan(
-        _index_relation: pg_sys::Relation,
-        _nkeys: std::os::raw::c_int,
-        _norderbys: std::os::raw::c_int,
-    ) -> pg_sys::IndexScanDesc {
-        not_implemented()
-    }
-
-    unsafe extern "C-unwind" fn amrescan(
-        _scan: pg_sys::IndexScanDesc,
-        _keys: pg_sys::ScanKey,
-        _nkeys: std::os::raw::c_int,
-        _orderbys: pg_sys::ScanKey,
-        _norderbys: std::os::raw::c_int,
-    ) {
-        not_implemented::<()>()
-    }
-
-    unsafe extern "C-unwind" fn amgettuple(
-        _scan: pg_sys::IndexScanDesc,
-        _direction: pg_sys::ScanDirection::Type,
-    ) -> bool {
-        not_implemented()
-    }
-
-    unsafe extern "C-unwind" fn amendscan(_scan: pg_sys::IndexScanDesc) {
-        not_implemented::<()>()
-    }
-
     // --- Optional callbacks -------------------------------------------------
-
-    unsafe extern "C-unwind" fn amcostestimate(
-        _root: *mut pg_sys::PlannerInfo,
-        _path: *mut pg_sys::IndexPath,
-        _loop_count: f64,
-        _index_startup_cost: *mut pg_sys::Cost,
-        _index_total_cost: *mut pg_sys::Cost,
-        _index_selectivity: *mut pg_sys::Selectivity,
-        _index_correlation: *mut f64,
-        _index_pages: *mut f64,
-    ) {
-        not_implemented::<()>()
-    }
 
     unsafe extern "C-unwind" fn amoptions(
         _reloptions: pg_sys::Datum,
         _validate: bool,
     ) -> *mut pg_sys::bytea {
+        info!("NOT IMPLEMENTED");
         not_implemented()
     }
 
@@ -96,8 +55,8 @@ mod implementation {
         };
 
         // Capabilities: keep everything minimal/false until implemented.
-        routine.amstrategies = 0;
-        routine.amsupport = 0;
+        routine.amstrategies = crate::operators::NUM_STRATEGIES.into();
+        routine.amsupport = crate::operators::NUM_SUPPORT;
         routine.amoptsprocnum = 0;
         routine.amcanorder = false;
         routine.amcanorderbyop = false;
@@ -125,13 +84,13 @@ mod implementation {
         routine.ambuild = Some(crate::build::ambuild);
         routine.ambuildempty = Some(ambuildempty);
         routine.aminsert = Some(aminsert);
-        routine.ambeginscan = Some(ambeginscan);
-        routine.amrescan = Some(amrescan);
-        routine.amgettuple = Some(amgettuple);
-        routine.amendscan = Some(amendscan);
+        routine.ambeginscan = Some(crate::query::ambeginscan);
+        routine.amrescan = Some(crate::query::amrescan);
+        routine.amgettuple = Some(crate::query::amgettuple);
+        routine.amendscan = Some(crate::query::amendscan);
 
         // Optional callbacks left unimplemented for now
-        routine.amcostestimate = Some(amcostestimate);
+        routine.amcostestimate = Some(crate::query::amcostestimate);
         routine.amoptions = Some(amoptions);
 
         routine
@@ -165,46 +124,6 @@ mod implementation {
 #[cfg(feature = "pg18")]
 pub use implementation::pg_zoekt_handler;
 
-// Install a default operator class for text so users can say USING pg_zoekt without specifying one.
-extension_sql!(
-    r#"
-DO $$
-DECLARE
-    have_family int;
-    have_class int;
-BEGIN
-    -- Does the operator family already exist in this schema?
-    SELECT count(*)
-    INTO have_family
-    FROM pg_catalog.pg_opfamily f
-    WHERE f.opfname = 'pg_zoekt_text_ops'
-      AND f.opfmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'pg_zoekt')
-      AND f.opfnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname='@extschema@');
-
-    IF have_family = 0 THEN
-        CREATE OPERATOR FAMILY pg_zoekt_text_ops USING pg_zoekt;
-    END IF;
-
-    -- Is the default operator class already present?
-    SELECT count(*)
-    INTO have_class
-    FROM pg_catalog.pg_opclass c
-    WHERE c.opcname = 'pg_zoekt_text_ops'
-      AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'pg_zoekt')
-      AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname='@extschema@');
-
-    IF have_class = 0 THEN
-        CREATE OPERATOR CLASS pg_zoekt_text_ops DEFAULT
-        FOR TYPE text USING pg_zoekt AS
-            STORAGE text;
-    END IF;
-END;
-$$;
-"#,
-    name = "pg_zoekt_default_text_opclass",
-    requires = [pg_zoekt_handler]
-);
-
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -233,7 +152,20 @@ mod tests {
             CREATE INDEX idx_documents_text_zoekt ON documents
             USING pg_zoekt (text);
         ";
-        Spi::run(sql)?;
+        let explain_plan = Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
+            client.update(sql, None, &[])?;
+
+            // Force the planner to consider our index and grab the text-format EXPLAIN output.
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+            client
+                .select("SELECT text FROM documents WHERE text LIKE 'xyz%';", None, &[])?
+                .into_iter()
+                .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
+                .collect()
+        })?;
+
+        explain_plan.iter().for_each(|s| info!("{}", s));
+        assert!(!explain_plan.is_empty());
         assert!(false);
         Ok(())
     }
