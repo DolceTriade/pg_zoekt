@@ -23,7 +23,10 @@ impl BuildCallbackState {
         if trgms.is_empty() {
             return;
         }
-        match crate::storage::encode::Encoder::encode_trgms(rel, &trgms) {
+        // Ensure large temporary maps are dropped promptly after encoding.
+        let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);
+        drop(trgms);
+        match res {
             Ok(mut segs) => {
                 self.segments.append(&mut segs);
             }
@@ -77,10 +80,18 @@ unsafe extern "C-unwind" fn log_index_value_callback(
         let isnull = std::slice::from_raw_parts(isnull, state.key_count);
 
         if !isnull[0] {
-            if let Some(text) = String::from_datum(values[0], false) {
-                crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
+            // Avoid allocating a Rust `String` per tuple; we only need a temporary view.
+            if let Some(text) = <&str>::from_datum(values[0], false) {
+                // Large documents can blow past the flush threshold inside a single callback.
+                // Check periodically while extracting to cap peak memory.
+                let mut extracted = 0usize;
+                for (trgm, pos) in crate::trgm::Extractor::extract(text) {
                     _ = state.collector.add(ctid, trgm, pos as u32);
-                });
+                    extracted += 1;
+                    if (extracted & 0xff) == 0 {
+                        state.flush_if_needed(index);
+                    }
+                }
             }
             state.seen += 1;
             state.flush_if_needed(index);
@@ -112,7 +123,9 @@ pub extern "C-unwind" fn ambuild(
         wal.magic = crate::storage::WAL_MAGIC;
     }
     let mem_bytes = maintenance_work_mem_bytes();
-    let mut flush_threshold = mem_bytes.saturating_mul(9) / 10;
+    // Aim lower than `maintenance_work_mem` because our estimate is conservative and
+    // Rust allocations aren't accounted in Postgres' memory accounting.
+    let mut flush_threshold = mem_bytes.saturating_mul(7) / 10;
     if flush_threshold == 0 {
         flush_threshold = mem_bytes;
     }
@@ -137,7 +150,8 @@ pub extern "C-unwind" fn ambuild(
 
     callback_state.flush_segments(index_relation);
     let segments = std::mem::take(&mut callback_state.segments);
-    info!("Wrote segments: {:?}", segments);
+    let total_size: u64 = segments.iter().map(|s| s.size).sum();
+    info!("Wrote {} segments ({} bytes)", segments.len(), total_size);
     let merged_segments = match crate::storage::merge(
         index_relation,
         &segments,

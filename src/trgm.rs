@@ -1,5 +1,8 @@
 /// Trigram stuff
-use std::{collections::BTreeMap, str::CharIndices};
+use std::{
+    collections::{BTreeMap, HashMap},
+    str::CharIndices,
+};
 
 use anyhow::Context;
 
@@ -45,6 +48,27 @@ impl TryFrom<&str> for CompactTrgm {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
+        // Hot path: ASCII trigrams are exactly 3 bytes.
+        if value.len() == 3 && value.is_ascii() {
+            let b = value.as_bytes();
+            if b[0] == 0 || b[1] == 0 || b[2] == 0 {
+                anyhow::bail!("not a trigram: {value}");
+            }
+
+            let mut flags = 0u8;
+            let mut trgm = 0u32;
+            for idx in 0..3 {
+                let mut chr = b[idx];
+                if chr.is_ascii_uppercase() {
+                    flags |= 1 << idx;
+                    chr = chr.to_ascii_lowercase();
+                }
+                trgm |= (chr as u32) << (idx * 8);
+            }
+
+            return Ok(CompactTrgm(trgm | (flags as u32) << 24));
+        }
+
         let bits = value.chars().enumerate().try_fold(
             (0_u8, 0_u32, false),
             |(flags, trgm, lossy), (idx, chr): (usize, char)| -> anyhow::Result<(u8, u32, bool)> {
@@ -176,14 +200,21 @@ impl Occurance {
 
 #[derive(Debug)]
 pub struct Collector {
-    trgms: BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>>,
+    // Hot-path friendly: fast inserts during heap scan / merge.
+    // We sort only on flush.
+    trgms: HashMap<u32, HashMap<crate::storage::ItemPointer, Vec<Occurance>>>,
     size_estimate: usize,
 }
 
 impl Collector {
+    // Intentionally conservative constants: we want to flush early rather than let
+    // Rust allocations run away during `CREATE INDEX`.
+    const PER_TRGM_OVERHEAD: usize = 128;
+    const PER_DOC_OVERHEAD: usize = 128;
+
     pub fn new() -> Self {
         Self {
-            trgms: BTreeMap::new(),
+            trgms: HashMap::new(),
             size_estimate: 0,
         }
     }
@@ -196,7 +227,18 @@ impl Collector {
         &mut self,
     ) -> BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>> {
         self.size_estimate = 0;
-        std::mem::take(&mut self.trgms)
+        let trgms = std::mem::take(&mut self.trgms);
+        let mut out: BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>> =
+            BTreeMap::new();
+        for (trgm, docs) in trgms {
+            let mut sorted_docs: BTreeMap<crate::storage::ItemPointer, Vec<Occurance>> =
+                BTreeMap::new();
+            for (doc, occs) in docs {
+                sorted_docs.insert(doc, occs);
+            }
+            out.insert(trgm, sorted_docs);
+        }
+        out
     }
 
     pub fn add_occurrences(
@@ -205,18 +247,47 @@ impl Collector {
         ctid: crate::storage::ItemPointer,
         occs: &[Occurance],
     ) {
-        let entry = self.trgms.entry(trigram).or_insert_with(|| {
-            self.size_estimate += std::mem::size_of::<u32>();
-            BTreeMap::new()
-        });
+        let docs = match self.trgms.get_mut(&trigram) {
+            Some(existing) => existing,
+            None => {
+                self.size_estimate = self
+                    .size_estimate
+                    .saturating_add(std::mem::size_of::<u32>())
+                    .saturating_add(Self::PER_TRGM_OVERHEAD);
+                self.trgms.insert(trigram, HashMap::new());
+                self.trgms
+                    .get_mut(&trigram)
+                    .expect("just inserted trigram map")
+            }
+        };
 
-        let docs = entry.entry(ctid).or_insert_with(|| {
-            self.size_estimate += std::mem::size_of::<crate::storage::ItemPointer>();
-            Vec::new()
-        });
+        let list = match docs.get_mut(&ctid) {
+            Some(existing) => existing,
+            None => {
+                self.size_estimate = self
+                    .size_estimate
+                    .saturating_add(std::mem::size_of::<crate::storage::ItemPointer>())
+                    .saturating_add(std::mem::size_of::<Vec<Occurance>>())
+                    .saturating_add(Self::PER_DOC_OVERHEAD);
+                docs.insert(ctid, Vec::new());
+                docs.get_mut(&ctid).expect("just inserted doc")
+            }
+        };
 
-        self.size_estimate += occs.len() * std::mem::size_of::<Occurance>();
-        docs.extend_from_slice(occs);
+        // Track the Vec's allocation growth conservatively.
+        let before_cap = list.capacity();
+        list.extend_from_slice(occs);
+        let after_cap = list.capacity();
+        if after_cap > before_cap {
+            let added = (after_cap - before_cap)
+                .saturating_mul(std::mem::size_of::<Occurance>());
+            self.size_estimate = self.size_estimate.saturating_add(added);
+        }
+
+        // Also count logical occurrence growth (overestimates but keeps flushes timely).
+        self.size_estimate = self
+            .size_estimate
+            .saturating_add(occs.len().saturating_mul(std::mem::size_of::<Occurance>() * 2));
     }
 
     pub fn add(

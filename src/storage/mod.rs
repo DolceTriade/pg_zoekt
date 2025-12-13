@@ -78,11 +78,17 @@ pub struct Segments {
     pub entries: [Segment],
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C, packed)]
 pub struct BlockPointer {
     pub min_trigram: u32,
     pub block: u32,
+}
+
+#[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
+#[repr(C, packed)]
+pub struct BlockPointerList {
+    pub entries: [BlockPointer],
 }
 
 #[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
@@ -182,18 +188,92 @@ impl SegmentCursor {
 }
 
 fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<Vec<IndexEntry>> {
-    let mut buf = pgbuffer::BlockBuffer::acquire(rel, segment.block);
-    let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
-    if header.magic != BLOCK_MAGIC {
-        anyhow::bail!("invalid block magic while merging");
+    let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
+    let mut all_entries = Vec::new();
+    for leaf_block in leaf_blocks {
+        let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block);
+        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        if header.magic != BLOCK_MAGIC {
+            anyhow::bail!("invalid block magic while merging");
+        }
+        if header.level != 0 {
+            anyhow::bail!("expected leaf page while merging");
+        }
+        let entries = buf
+            .as_struct_with_elems::<IndexList>(
+                std::mem::size_of::<BlockHeader>(),
+                header.num_entries as usize,
+            )
+            .context("index entries")?;
+        all_entries.extend_from_slice(&entries.entries[..header.num_entries as usize]);
     }
-    let entries = buf
-        .as_struct_with_elems::<IndexList>(
-            std::mem::size_of::<BlockHeader>(),
-            header.num_entries as usize,
-        )
-        .context("index entries")?;
-    Ok(entries.entries[..header.num_entries as usize].to_vec())
+    Ok(all_entries)
+}
+
+pub fn resolve_leaf_for_trigram(
+    rel: pg_sys::Relation,
+    root_block: u32,
+    trigram: u32,
+) -> Result<Option<u32>> {
+    let mut block = root_block;
+    loop {
+        let buf = pgbuffer::BlockBuffer::acquire(rel, block);
+        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        if header.magic != BLOCK_MAGIC {
+            anyhow::bail!("invalid block magic");
+        }
+        if header.level == 0 {
+            return Ok(Some(block));
+        }
+        let pointers = buf
+            .as_struct_with_elems::<BlockPointerList>(
+                std::mem::size_of::<BlockHeader>(),
+                header.num_entries as usize,
+            )
+            .context("block pointers")?;
+        let slice = &pointers.entries[..header.num_entries as usize];
+        if slice.is_empty() {
+            return Ok(None);
+        }
+        let idx = match slice.binary_search_by(|p| {
+            let mt = p.min_trigram;
+            mt.cmp(&trigram)
+        }) {
+            Ok(i) => i,
+            Err(0) => return Ok(None),
+            Err(i) => i - 1,
+        };
+        block = slice[idx].block;
+    }
+}
+
+pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec<u32>> {
+    fn collect(rel: pg_sys::Relation, block: u32, out: &mut Vec<u32>) -> Result<()> {
+        let buf = pgbuffer::BlockBuffer::acquire(rel, block);
+        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        if header.magic != BLOCK_MAGIC {
+            anyhow::bail!("invalid block magic");
+        }
+        if header.level == 0 {
+            out.push(block);
+            return Ok(());
+        }
+        let pointers = buf
+            .as_struct_with_elems::<BlockPointerList>(
+                std::mem::size_of::<BlockHeader>(),
+                header.num_entries as usize,
+            )
+            .context("block pointers")?;
+        let slice = &pointers.entries[..header.num_entries as usize];
+        for p in slice {
+            collect(rel, p.block, out)?;
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    collect(rel, root_block, &mut out)?;
+    Ok(out)
 }
 
 fn peek_next_trigram(cursors: &[SegmentCursor]) -> Option<u32> {

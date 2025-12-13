@@ -130,6 +130,44 @@ pub use implementation::pg_zoekt_handler;
 mod tests {
     use pgrx::prelude::*;
 
+    fn de_bruijn(k: &[u8], n: usize) -> String {
+        // Classic de Bruijn sequence generator: returns a string where every length-n
+        // substring over alphabet k appears exactly once (cyclic).
+        fn db(
+            t: usize,
+            p: usize,
+            n: usize,
+            k: &[u8],
+            a: &mut [usize],
+            out: &mut Vec<u8>,
+        ) {
+            if t > n {
+                if n % p == 0 {
+                    for i in 1..=p {
+                        out.push(k[a[i]]);
+                    }
+                }
+            } else {
+                a[t] = a[t - p];
+                db(t + 1, p, n, k, a, out);
+                for j in (a[t - p] + 1)..k.len() {
+                    a[t] = j;
+                    db(t + 1, t, n, k, a, out);
+                }
+            }
+        }
+
+        let mut a = vec![0usize; n * k.len() + 1];
+        let mut out = Vec::new();
+        db(1, 1, n, k, &mut a, &mut out);
+        // Make it linear: append first n-1 chars so all windows appear as substrings.
+        if n > 1 {
+            let prefix: Vec<u8> = out[..n - 1].to_vec();
+            out.extend_from_slice(&prefix);
+        }
+        String::from_utf8(out).expect("ascii alphabet")
+    }
+
     #[pg_test]
     pub fn test_build() -> spi::Result<()> {
         let sql = "
@@ -279,5 +317,47 @@ mod tests {
                 .collect()
         })?;
         Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_meta_pages_trigram_lookup() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update("CREATE EXTENSION IF NOT EXISTS pg_trgm", None, &[])?;
+            client.update(
+                "CREATE TABLE meta_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            // Ensure we keep a single collector flush so one segment contains >1 leaf page.
+            client.update("SET maintenance_work_mem = '64MB'", None, &[])?;
+
+            let seq = de_bruijn(b"abcdefghij", 3);
+            client.update(
+                "INSERT INTO meta_docs (text) VALUES ($1)",
+                None,
+                &[seq.as_str().into()],
+            )?;
+            client.update(
+                "CREATE INDEX idx_meta_docs_text_zoekt ON meta_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+
+            // Pick a trigram late in the string to ensure we traverse meta pages.
+            let trgm = &seq[900..903];
+            let pat = format!("%{}%", trgm);
+            let count: i64 = client
+                .select(
+                    "SELECT count(*) FROM meta_docs WHERE text LIKE $1",
+                    None,
+                    &[pat.as_str().into()],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(count, 1);
+            Ok(())
+        })
     }
 }

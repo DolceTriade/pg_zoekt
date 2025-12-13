@@ -106,7 +106,10 @@ unsafe fn find_entry_for_trigram(
     block: u32,
     trigram: u32,
 ) -> anyhow::Result<Option<crate::storage::IndexEntry>> {
-    let mut buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, block);
+    let Some(leaf_block) = crate::storage::resolve_leaf_for_trigram(rel, block, trigram)? else {
+        return Ok(None);
+    };
+    let mut buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block);
     let bh = buf
         .as_struct::<crate::storage::BlockHeader>(0)
         .context("block header")?;

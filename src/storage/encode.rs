@@ -24,14 +24,13 @@ impl Encoder {
         let mut occ_count = 0;
         let mut byte_count = 0;
         let mut segment = super::Segment { block: 0, size: 0 };
+        let mut leaf_pointers: Vec<super::BlockPointer> = Vec::new();
 
         let mut p = PageWriter::new(rel, super::pgbuffer::SPECIAL_SIZE);
 
         while remaining_trgms > 0 {
             let mut leaf = BlockBuffer::allocate(rel);
-            if segment.block == 0 {
-                segment.block = leaf.block_number();
-            }
+            let leaf_block = leaf.block_number();
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
             let bh = leaf
                 .as_struct_mut::<super::BlockHeader>(0)
@@ -42,23 +41,28 @@ impl Encoder {
             let num_entries =
                 ((super::pgbuffer::SPECIAL_SIZE - BH_SIZE) / ENTRY_SIZE).min(remaining_trgms);
             bh.num_entries = num_entries as u32;
-            info!("Num entries is {num_entries}");
             let entries = leaf
                 .as_struct_with_elems_mut::<super::IndexList>(BH_SIZE, num_entries)
                 .context("could not parse entries")?;
+            let mut leaf_min_trigram: Option<u32> = None;
             for i in 0..num_entries {
                 let Some((key, val)) = iter.next() else {
                     anyhow::bail!("Unexpected end of iterator");
                 };
+                if leaf_min_trigram.is_none() {
+                    leaf_min_trigram = Some(*key);
+                }
                 let idx = &mut entries.entries[i];
                 idx.trigram = *key;
                 idx.block = 0;
                 idx.offset = 0;
+                idx.data_length = 0;
                 idx.frequency = val.len() as u32;
                 let mut b = CompressedBatchBuilder::new();
                 let max_chunk_size =
                     super::pgbuffer::SPECIAL_SIZE - std::mem::size_of::<super::PostingPageHeader>();
                 let mut first_chunk = false;
+                let mut compressed = Vec::<u8>::new();
 
                 let mut flush_chunk = |builder: &mut CompressedBatchBuilder,
                                        idx: &mut super::IndexEntry,
@@ -68,16 +72,16 @@ impl Encoder {
                     if builder.is_empty() {
                         return Ok(());
                     }
-                    let buf = builder.compress();
-                    if buf.len() > max_chunk_size {
+                    builder.compress_into(&mut compressed);
+                    if compressed.len() > max_chunk_size {
                         anyhow::bail!(
                             "chunk size {} exceeds page capacity {}",
-                            buf.len(),
+                            compressed.len(),
                             max_chunk_size
                         );
                     }
-                    let loc = p.start_chunk(buf.len());
-                    p.write(&buf).expect("Write to succeed");
+                    let loc = p.start_chunk(compressed.len());
+                    p.write_all(&compressed).expect("Write to succeed");
                     if !*first_chunk {
                         idx.block = loc.block_number;
                         idx.offset = loc.offset as u16;
@@ -85,9 +89,9 @@ impl Encoder {
                     }
                     idx.data_length = idx
                         .data_length
-                        .checked_add(buf.len() as u32)
+                        .checked_add(compressed.len() as u32)
                         .expect("overflow on data length");
-                    *byte_count += buf.len();
+                    *byte_count += compressed.len();
                     builder.reset();
                     Ok(())
                 };
@@ -100,33 +104,39 @@ impl Encoder {
                         continue;
                     }
 
-                    let mut start = 0;
+                    let mut start = 0usize;
                     while start < occs.len() {
-                        let mut end = occs.len();
-                        loop {
-                            let slice = &occs[start..end];
-                            b.add(*doc, slice);
-                            let chunk_len = b.compress().len();
-                            if chunk_len <= max_chunk_size {
-                                break;
-                            }
-                            b.pop_last_doc();
-                            if end == start + 1 {
+                        if b.num_docs() >= u8::MAX as usize {
+                            flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
+                            continue;
+                        }
+
+                        let remaining = occs.len() - start;
+                        let can_take = b.max_positions_fit(max_chunk_size).min(remaining);
+                        if can_take == 0 {
+                            if b.is_empty() {
                                 anyhow::bail!(
                                     "single doc chunk size {} exceeds page capacity {}",
-                                    chunk_len,
+                                    occs.len(),
                                     max_chunk_size
                                 );
                             }
-                            end = start + (end - start + 1) / 2;
+                            flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
+                            continue;
                         }
-                        flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
-                        start = end;
+
+                        b.add(*doc, &occs[start..start + can_take]);
+                        start += can_take;
                     }
                 }
                 flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
             }
             remaining_trgms -= num_entries;
+            let min_trigram = leaf_min_trigram.context("leaf should have min trigram")?;
+            leaf_pointers.push(super::BlockPointer {
+                min_trigram,
+                block: leaf_block,
+            });
 
             // Start with leaf node.
             // Write until full.
@@ -141,31 +151,138 @@ impl Encoder {
         }
         info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
         segment.size = byte_count as u64;
+        segment.block = build_segment_root(rel, &leaf_pointers)?;
         Ok(vec![segment])
     }
 }
 
-#[derive(Debug, Default)]
+fn build_segment_root(rel: pg_sys::Relation, leaves: &[super::BlockPointer]) -> anyhow::Result<u32> {
+    if leaves.is_empty() {
+        anyhow::bail!("no leaves");
+    }
+    if leaves.len() == 1 {
+        return Ok(leaves[0].block);
+    }
+
+    const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
+    const PTR_SIZE: usize = std::mem::size_of::<super::BlockPointer>();
+    let per_page = (super::pgbuffer::SPECIAL_SIZE - BH_SIZE) / PTR_SIZE;
+    if per_page == 0 {
+        anyhow::bail!("block pointers do not fit on a page");
+    }
+
+    let mut level: u8 = 1;
+    let mut current: Vec<super::BlockPointer> = leaves.to_vec();
+    while current.len() > 1 {
+        let mut next = Vec::new();
+        for chunk in current.chunks(per_page) {
+            let mut page = BlockBuffer::allocate(rel);
+            let block_no = page.block_number();
+            let bh = page
+                .as_struct_mut::<super::BlockHeader>(0)
+                .context("block header")?;
+            bh.magic = super::BLOCK_MAGIC;
+            bh.level = level;
+            bh.num_entries = chunk.len() as u32;
+            let ptrs = page
+                .as_struct_with_elems_mut::<super::BlockPointerList>(BH_SIZE, chunk.len())
+                .context("pointer list")?;
+            for (idx, p) in chunk.iter().enumerate() {
+                ptrs.entries[idx] = *p;
+            }
+            next.push(super::BlockPointer {
+                min_trigram: chunk[0].min_trigram,
+                block: block_no,
+            });
+        }
+        current = next;
+        level = level.saturating_add(1);
+    }
+    Ok(current[0].block)
+}
+
+#[derive(Debug)]
 pub(super) struct CompressedBatchBuilder {
     blks: Vec<u32>,
     offs: Vec<u16>,
 
-    counts: Vec<u16>,
+    counts: Vec<u32>,
 
     positions: Vec<u32>,
 
     flags: Vec<u8>,
+    // Conservative upper bound used for chunk-splitting decisions.
+    // We intentionally overestimate to keep the hot path linear.
+    worst_size: usize,
+
+    encoder: StreamVByteEncoder,
+    scratch: Vec<u32>,
+    payload: Vec<u8>,
+}
+
+fn encode_section_into<F>(
+    out: &mut Vec<u8>,
+    encoder: &mut StreamVByteEncoder,
+    scratch: &mut Vec<u32>,
+    fill: F,
+) -> usize
+where
+    F: FnOnce(&mut Vec<u32>),
+{
+    scratch.clear();
+    fill(scratch);
+    encoder.clear();
+    encoder.append(scratch.as_slice());
+    let len = encoder.len();
+    encoder.append_into(out);
+    len
 }
 
 impl CompressedBatchBuilder {
+    // Worst-case accounting (intentionally conservative):
+    // - StreamVByte worst-case ~5 bytes per integer (data+control).
+    // - Flags RLE can be pathological; budget 2 bytes per flag.
+    const DOC_OVERHEAD_WORST: usize = 5 * 3;
+    const PER_POS_WORST: usize = 5 + 2;
+
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            blks: Vec::new(),
+            offs: Vec::new(),
+            counts: Vec::new(),
+            positions: Vec::new(),
+            flags: Vec::new(),
+            worst_size: std::mem::size_of::<super::CompressedBlockHeader>(),
+            encoder: StreamVByteEncoder::new(),
+            scratch: Vec::new(),
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn num_docs(&self) -> usize {
+        self.blks.len()
+    }
+
+    pub fn max_positions_fit(&self, max_chunk_size: usize) -> usize {
+        if self.num_docs() >= u8::MAX as usize {
+            return 0;
+        }
+        let remaining = max_chunk_size.saturating_sub(self.worst_size);
+        if remaining <= Self::DOC_OVERHEAD_WORST {
+            return 0;
+        }
+        (remaining - Self::DOC_OVERHEAD_WORST) / Self::PER_POS_WORST
     }
 
     pub fn add(&mut self, doc: super::ItemPointer, occs: &[crate::trgm::Occurance]) {
+        self.worst_size += Self::DOC_OVERHEAD_WORST + Self::PER_POS_WORST * occs.len();
+
         self.blks.push(doc.block_number);
+
         self.offs.push(doc.offset);
-        self.counts.push(occs.len() as u16);
+
+        self.counts.push(occs.len() as u32);
+
         self.positions.reserve(occs.len());
         self.flags.reserve(occs.len());
         for occ in occs {
@@ -174,36 +291,42 @@ impl CompressedBatchBuilder {
         }
     }
 
-    pub fn compress(&mut self) -> Vec<u8> {
+    pub fn compress_into(&mut self, dst: &mut Vec<u8>) {
         let num_docs = self.blks.len();
         let header_size = std::mem::size_of::<super::CompressedBlockHeader>();
-        let estimated_ints =
-            self.positions.len() + self.blks.len() * 3 + self.counts.len() + self.offs.len();
-        let mut out = Vec::with_capacity(header_size + (estimated_ints * 5) + self.flags.len());
-        let mut encoder = StreamVByteEncoder::new();
-        let mut scratch = Vec::with_capacity(
+        let estimated_ints = self.positions.len() + self.blks.len() * 3;
+        let payload = &mut self.payload;
+        payload.clear();
+        payload.reserve((estimated_ints * 5) + self.flags.len());
+
+        let encoder = &mut self.encoder;
+        let scratch = &mut self.scratch;
+        scratch.reserve(
             self.positions
                 .len()
                 .max(self.blks.len())
                 .max(self.counts.len())
                 .max(self.offs.len()),
         );
-        let blks_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
-            tmp.extend(self.blks.iter().copied().deltas());
-        });
-        let offs_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
-            tmp.extend(self.offs.iter().map(|v| *v as u32));
-        });
-        let counts_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
-            tmp.extend(self.counts.iter().map(|v| *v as u32));
-        });
-        let positions_len = self.encode_section(&mut out, &mut encoder, &mut scratch, |tmp| {
-            tmp.extend(self.positions.iter().copied().deltas());
-        });
+
+        let blks = &self.blks;
+        let offs = &self.offs;
+        let counts = &self.counts;
+        let positions = &self.positions;
+
+        let blks_len =
+            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(blks.iter().copied().deltas()));
+        let offs_len =
+            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(offs.iter().map(|v| *v as u32)));
+        let counts_len =
+            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(counts.iter().copied()));
+        let positions_len =
+            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(positions.iter().copied().deltas()));
+
         let flags_len = {
             let mut b = bitfield_rle::encode(&self.flags);
             let l = b.len();
-            out.append(&mut b);
+            payload.append(&mut b);
             l
         };
         let hdr = super::CompressedBlockHeader {
@@ -214,10 +337,10 @@ impl CompressedBatchBuilder {
             pos_len: positions_len as u16,
             flags_len: flags_len as u16,
         };
-        let mut buf = Vec::with_capacity(header_size + out.len());
-        hdr.write_to_io(&mut buf).expect("not fail");
-        buf.extend_from_slice(&out);
-        buf
+        dst.clear();
+        dst.reserve(header_size + payload.len());
+        hdr.write_to_io(&mut *dst).expect("not fail");
+        dst.extend_from_slice(payload);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -230,40 +353,32 @@ impl CompressedBatchBuilder {
         self.counts.clear();
         self.positions.clear();
         self.flags.clear();
-    }
+        self.worst_size = std::mem::size_of::<super::CompressedBlockHeader>();
 
-    pub fn pop_last_doc(&mut self) {
-        if self.blks.is_empty() {
-            return;
+        // Avoid retaining huge allocations after an outlier trigram/doc.
+        const MAX_RETAIN_BYTES: usize = 256 * 1024;
+        fn maybe_shrink<T>(v: &mut Vec<T>, max_retain_bytes: usize) {
+            let retained = v.capacity().saturating_mul(std::mem::size_of::<T>());
+            if retained > max_retain_bytes {
+                v.shrink_to_fit();
+            }
         }
-        self.blks.pop();
-        self.offs.pop();
-        let count = self.counts.pop().unwrap_or(0) as usize;
-        let pos_len = self.positions.len().saturating_sub(count);
-        self.positions.truncate(pos_len);
-        self.flags.truncate(pos_len);
+
+        maybe_shrink(&mut self.positions, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.flags, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.blks, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.offs, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.counts, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.scratch, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.payload, MAX_RETAIN_BYTES);
+        maybe_shrink(&mut self.encoder.buffer, MAX_RETAIN_BYTES);
     }
 
-    fn encode_section<F>(
-        &self,
-        out: &mut Vec<u8>,
-        encoder: &mut StreamVByteEncoder,
-        scratch: &mut Vec<u32>,
-        fill: F,
-    ) -> usize
-    where
-        F: FnOnce(&mut Vec<u32>),
-    {
-        scratch.clear();
-        fill(scratch);
-        encoder.clear();
-        encoder.append(scratch.as_slice());
-        let len = encoder.len();
-        encoder.append_into(out);
-        len
-    }
+    // Encoding helpers live outside the impl (see `encode_section_into`) so we
+    // can split borrows between the input vectors and the reusable scratch/encoder.
 }
 
+#[derive(Debug)]
 pub(super) struct StreamVByteEncoder {
     buffer: Vec<u8>,
 }
