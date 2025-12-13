@@ -28,24 +28,25 @@ enum FlagsMode<'a> {
 
 #[derive(Debug)]
 pub struct PostingCursor {
-    _buf: BlockBuffer,
-    tids: Vec<ItemPointer>,
-    counts: Vec<u32>,
+    reader: PostingReader,
 
-    _pos_storage: Vec<u8>,
-    _flag_storage: Vec<u8>,
+    chunk_tids: Vec<ItemPointer>,
+    chunk_counts: Vec<u32>,
+    chunk_doc_idx: usize,
 
+    pos_storage: Vec<u8>,
+    flag_storage: Vec<u8>,
     pos_cursor: stream_vbyte::decode::cursor::DecodeCursor<'static>,
     pos_buf: Vec<u32>,
     pos_buf_idx: usize,
     pos_buf_len: usize,
     pos_acc: u32,
     flags: FlagsCursor<'static>,
-    doc_idx: usize,
 
     current: Option<DocPosting>,
 }
 
+#[derive(Debug)]
 struct PostingReader {
     rel: pg_sys::Relation,
     buf: BlockBuffer,
@@ -350,101 +351,111 @@ impl PostingCursor {
     }
 
     /// Build a streaming cursor for a single index entry. The cursor keeps only the
-    /// doc headers in memory and streams positions as it advances.
+    /// doc headers for the current compressed chunk in memory and streams positions as it advances.
     pub unsafe fn new(rel: pg_sys::Relation, entry: &IndexEntry) -> anyhow::Result<Self> {
-        let mut reader = PostingReader::new(rel, entry)?;
-        let mut tids = Vec::new();
-        let mut counts = Vec::new();
-        let mut pos_bytes = Vec::new();
-        let mut flag_bytes = Vec::new();
-        let mut total_positions = 0usize;
-
-        while reader.has_remaining() {
-            let header_bytes = reader.take_slice(std::mem::size_of::<CompressedBlockHeader>())?;
-            let hdr = *CompressedBlockHeader::try_ref_from_bytes(header_bytes)
-                .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
-            let num_docs = hdr.num_docs as usize;
-
-            let blk_bytes = reader.take_slice(hdr.docs_blk_len as usize)?;
-            let mut blk_nums = vec![0u32; num_docs];
-            stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
-                blk_bytes,
-                num_docs,
-                &mut blk_nums,
-            );
-            let blk_nums = blk_nums.into_iter().original().collect::<Vec<u32>>();
-
-            let off_bytes = reader.take_slice(hdr.docs_off_len as usize)?;
-            let mut offs = vec![0u32; num_docs];
-            stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
-                off_bytes, num_docs, &mut offs,
-            );
-
-            let count_bytes = reader.take_slice(hdr.counts_len as usize)?;
-            let mut chunk_counts = vec![0u32; num_docs];
-            stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
-                count_bytes,
-                num_docs,
-                &mut chunk_counts,
-            );
-            let chunk_positions = chunk_counts
-                .iter()
-                .copied()
-                .map(|c| c as usize)
-                .sum::<usize>();
-            counts.extend(chunk_counts.iter().copied());
-            total_positions += chunk_positions;
-
-            for (blk, off) in blk_nums.into_iter().zip(offs.into_iter()) {
-                tids.push(ItemPointer {
-                    block_number: blk,
-                    offset: off as u16,
-                });
-            }
-
-            let pos_slice = reader.take_slice(hdr.pos_len as usize)?;
-            pos_bytes.extend_from_slice(pos_slice);
-
-            let flag_slice = reader.take_slice(hdr.flags_len as usize)?;
-            flag_bytes.extend_from_slice(flag_slice);
-        }
-
-        let buf = reader.into_buffer();
-
-        let pos_storage = pos_bytes;
-        let flag_storage = flag_bytes;
-        let pos_bytes_static: &'static [u8] = unsafe {
-            let slice = pos_storage.as_slice();
-            std::mem::transmute::<&[u8], &'static [u8]>(slice)
-        };
-        let flag_bytes_static: &'static [u8] = unsafe {
-            let slice = flag_storage.as_slice();
-            std::mem::transmute::<&[u8], &'static [u8]>(slice)
-        };
-        let pos_cursor =
-            stream_vbyte::decode::cursor::DecodeCursor::new(pos_bytes_static, total_positions);
+        let reader = PostingReader::new(rel, entry)?;
+        let pos_cursor = stream_vbyte::decode::cursor::DecodeCursor::new(&[], 0);
         let flags = FlagsCursor {
-            buf: flag_bytes_static,
+            buf: &[],
             offset: 0,
             remaining: 0,
             mode: FlagsMode::Repeat(0),
         };
-
-        Ok(Self {
-            _buf: buf,
-            tids,
-            counts,
-            _pos_storage: pos_storage,
-            _flag_storage: flag_storage,
+        let mut cursor = Self {
+            reader,
+            chunk_tids: Vec::new(),
+            chunk_counts: Vec::new(),
+            chunk_doc_idx: 0,
+            pos_storage: Vec::new(),
+            flag_storage: Vec::new(),
             pos_cursor,
             pos_buf: vec![0; 128],
             pos_buf_idx: 0,
             pos_buf_len: 0,
             pos_acc: 0,
             flags,
-            doc_idx: 0,
             current: None,
-        })
+        };
+        cursor.load_next_chunk()?;
+        Ok(cursor)
+    }
+
+    fn load_next_chunk(&mut self) -> anyhow::Result<bool> {
+        self.chunk_tids.clear();
+        self.chunk_counts.clear();
+        self.chunk_doc_idx = 0;
+        self.pos_storage.clear();
+        self.flag_storage.clear();
+        self.pos_buf_idx = 0;
+        self.pos_buf_len = 0;
+        self.pos_acc = 0;
+        self.flags.remaining = 0;
+        self.flags.offset = 0;
+
+        if !self.reader.has_remaining() {
+            return Ok(false);
+        }
+
+        let header_bytes = self
+            .reader
+            .take_slice(std::mem::size_of::<CompressedBlockHeader>())?;
+        let hdr = *CompressedBlockHeader::try_ref_from_bytes(header_bytes)
+            .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
+        let num_docs = hdr.num_docs as usize;
+
+        let blk_bytes = self.reader.take_slice(hdr.docs_blk_len as usize)?;
+        let mut blk_nums = vec![0u32; num_docs];
+        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
+            blk_bytes,
+            num_docs,
+            &mut blk_nums,
+        );
+        let blk_nums = blk_nums.into_iter().original().collect::<Vec<u32>>();
+
+        let off_bytes = self.reader.take_slice(hdr.docs_off_len as usize)?;
+        let mut offs = vec![0u32; num_docs];
+        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(off_bytes, num_docs, &mut offs);
+
+        let count_bytes = self.reader.take_slice(hdr.counts_len as usize)?;
+        let mut counts = vec![0u32; num_docs];
+        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
+            count_bytes,
+            num_docs,
+            &mut counts,
+        );
+        let total_positions = counts.iter().copied().map(|c| c as usize).sum::<usize>();
+
+        self.chunk_counts.extend(counts.iter().copied());
+        for (blk, off) in blk_nums.into_iter().zip(offs.into_iter()) {
+            self.chunk_tids.push(ItemPointer {
+                block_number: blk,
+                offset: off as u16,
+            });
+        }
+
+        let pos_slice = self.reader.take_slice(hdr.pos_len as usize)?;
+        self.pos_storage.extend_from_slice(pos_slice);
+        let flag_slice = self.reader.take_slice(hdr.flags_len as usize)?;
+        self.flag_storage.extend_from_slice(flag_slice);
+
+        let pos_bytes_static: &'static [u8] = unsafe {
+            let slice = self.pos_storage.as_slice();
+            std::mem::transmute::<&[u8], &'static [u8]>(slice)
+        };
+        let flag_bytes_static: &'static [u8] = unsafe {
+            let slice = self.flag_storage.as_slice();
+            std::mem::transmute::<&[u8], &'static [u8]>(slice)
+        };
+        self.pos_cursor =
+            stream_vbyte::decode::cursor::DecodeCursor::new(pos_bytes_static, total_positions);
+        self.flags = FlagsCursor {
+            buf: flag_bytes_static,
+            offset: 0,
+            remaining: 0,
+            mode: FlagsMode::Repeat(0),
+        };
+
+        Ok(true)
     }
 
     fn next_pos_delta(&mut self) -> anyhow::Result<u32> {
@@ -472,35 +483,44 @@ impl PostingCursor {
     }
 
     pub fn advance(&mut self) -> anyhow::Result<bool> {
-        if self.doc_idx >= self.tids.len() {
-            self.current = None;
-            return Ok(false);
-        }
+        loop {
+            if self.chunk_doc_idx >= self.chunk_tids.len() {
+                if !self.load_next_chunk()? {
+                    self.current = None;
+                    return Ok(false);
+                }
+                continue;
+            }
 
-        let tid = self.tids[self.doc_idx];
-        let num_pos = self.counts[self.doc_idx] as usize;
+            let tid = self.chunk_tids[self.chunk_doc_idx];
+            let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
+            self.chunk_doc_idx += 1;
 
-        let mut positions = if let Some(doc) = self.current.take() {
-            let mut p = doc.positions;
-            p.clear();
-            p
-        } else {
-            Vec::with_capacity(num_pos.max(4))
-        };
-        positions.clear();
+            while self.chunk_doc_idx < self.chunk_tids.len()
+                && self.chunk_tids[self.chunk_doc_idx] == tid
+            {
+                total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
+                self.chunk_doc_idx += 1;
+            }
 
-        if num_pos > 0 {
-            for _ in 0..num_pos {
+            let mut positions = if let Some(doc) = self.current.take() {
+                let mut p = doc.positions;
+                p.clear();
+                p
+            } else {
+                Vec::with_capacity(total_needed_positions.max(4))
+            };
+
+            for _ in 0..total_needed_positions {
                 let delta = self.next_pos_delta()?;
                 self.pos_acc = self.pos_acc.wrapping_add(delta);
                 let flag = Self::next_flag(&mut self.flags)?;
                 positions.push((self.pos_acc, flag));
             }
-        }
 
-        self.doc_idx += 1;
-        self.current = Some(DocPosting { tid, positions });
-        Ok(true)
+            self.current = Some(DocPosting { tid, positions });
+            return Ok(true);
+        }
     }
 
     /// Advance one document and return whether it contains `target_pos` with matching flags.
@@ -511,27 +531,40 @@ impl PostingCursor {
         pattern_flag: u8,
         case_sensitive: bool,
     ) -> anyhow::Result<Option<(ItemPointer, bool)>> {
-        if self.doc_idx >= self.tids.len() {
-            self.current = None;
-            return Ok(None);
-        }
-
-        let tid = self.tids[self.doc_idx];
-        let num_pos = self.counts[self.doc_idx] as usize;
-        let mut found = false;
-
-        for _ in 0..num_pos {
-            let delta = self.next_pos_delta()?;
-            self.pos_acc = self.pos_acc.wrapping_add(delta);
-            let flag = Self::next_flag(&mut self.flags)?;
-            if self.pos_acc == target_pos
-                && (!case_sensitive || (flag & 0b111) == (pattern_flag & 0b111))
-            {
-                found = true;
+        loop {
+            if self.chunk_doc_idx >= self.chunk_tids.len() {
+                if !self.load_next_chunk()? {
+                    self.current = None;
+                    return Ok(None);
+                }
+                continue;
             }
+
+            let tid = self.chunk_tids[self.chunk_doc_idx];
+            let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
+            self.chunk_doc_idx += 1;
+
+            while self.chunk_doc_idx < self.chunk_tids.len()
+                && self.chunk_tids[self.chunk_doc_idx] == tid
+            {
+                total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
+                self.chunk_doc_idx += 1;
+            }
+
+            let mut found = false;
+            for _ in 0..total_needed_positions {
+                let delta = self.next_pos_delta()?;
+                self.pos_acc = self.pos_acc.wrapping_add(delta);
+                let flag = Self::next_flag(&mut self.flags)?;
+                if self.pos_acc == target_pos
+                    && (!case_sensitive || (flag & 0b111) == (pattern_flag & 0b111))
+                {
+                    found = true;
+                }
+            }
+
+            self.current = None;
+            return Ok(Some((tid, found)));
         }
-        self.doc_idx += 1;
-        self.current = None;
-        Ok(Some((tid, found)))
     }
 }
