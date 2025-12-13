@@ -241,7 +241,43 @@ mod tests {
         })?;
 
         explain_plan.iter().for_each(|s| info!("{}", s));
-        assert!(false);
+        //assert!(false);
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_chunk_split_single_doc() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE chunk_split_large (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO chunk_split_large (text) VALUES (repeat(md5('linear'), 16384))",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_chunk_split_large ON chunk_split_large USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+            client
+                .select(
+                    "EXPLAIN (ANALYZE) SELECT text FROM chunk_split_large WHERE text LIKE 'abcdef%';",
+                    None,
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
+                .collect()
+        })?;
         Ok(())
     }
 }
