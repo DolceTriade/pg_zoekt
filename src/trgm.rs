@@ -188,6 +188,17 @@ impl Collector {
         }
     }
 
+    pub fn memory_usage(&self) -> usize {
+        self.size_estimate
+    }
+
+    pub fn take_trgms(
+        &mut self,
+    ) -> BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>> {
+        self.size_estimate = 0;
+        std::mem::take(&mut self.trgms)
+    }
+
     pub fn add(
         &mut self,
         ctid: crate::storage::ItemPointer,
@@ -209,10 +220,6 @@ impl Collector {
         self.size_estimate +=
             std::mem::size_of_val(&ct) + std::mem::size_of_val(&o) + std::mem::size_of_val(&ctid);
         Ok(())
-    }
-
-    pub fn trgms(&self) -> &BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<Occurance>>> {
-        &self.trgms
     }
 }
 

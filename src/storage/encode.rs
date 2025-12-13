@@ -1,4 +1,5 @@
-use std::io::{Read, Write};
+use std::collections::BTreeMap;
+use std::io::Write;
 
 use super::pgbuffer::BlockBuffer;
 use anyhow::Context;
@@ -6,22 +7,19 @@ use delta_encoding::DeltaEncoderExt;
 use pgrx::prelude::*;
 use zerocopy::IntoBytes;
 
-pub struct Encoder<'a> {
-    collector: &'a crate::trgm::Collector,
-}
+pub struct Encoder;
 
-impl<'a> Encoder<'a> {
-    pub fn new(collector: &'a crate::trgm::Collector) -> Self {
-        Self { collector }
-    }
-
-    pub fn encode(&self, rel: pg_sys::Relation) -> anyhow::Result<super::Segment> {
-        let trgms = self.collector.trgms();
-        let meta1: Option<BlockBuffer> = None;
-        let data: Option<BlockBuffer> = None;
+impl Encoder {
+    pub fn encode_trgms(
+        rel: pg_sys::Relation,
+        trgms: &BTreeMap<u32, BTreeMap<crate::storage::ItemPointer, Vec<crate::trgm::Occurance>>>,
+    ) -> anyhow::Result<Vec<super::Segment>> {
+        if trgms.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut remaining_trgms = trgms.len();
         let mut iter = trgms.iter();
-        info!("Encoding {remaining_trgms}");
+        info!("Encoding {remaining_trgms} trigram entries");
         let mut doc_count = 0;
         let mut occ_count = 0;
         let mut byte_count = 0;
@@ -31,7 +29,9 @@ impl<'a> Encoder<'a> {
 
         while remaining_trgms > 0 {
             let mut leaf = BlockBuffer::allocate(rel);
-            segment.block = leaf.block_number();
+            if segment.block == 0 {
+                segment.block = leaf.block_number();
+            }
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
             let bh = leaf
                 .as_struct_mut::<super::BlockHeader>(0)
@@ -62,11 +62,12 @@ impl<'a> Encoder<'a> {
                     occ_count += occs.len();
                 }
                 let buf = b.compress();
-                let loc = p.ensure_space_or_allocate_location(buf.len());
+                let loc = p.start_chunk();
                 p.write(&buf).expect("Write to succeed");
                 idx.block = loc.block_number;
                 idx.offset = loc.offset as u16;
                 byte_count += buf.len();
+                idx.data_length = buf.len() as u32;
             }
             remaining_trgms -= num_entries;
 
@@ -83,7 +84,7 @@ impl<'a> Encoder<'a> {
         }
         info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
         segment.size = byte_count as u64;
-        Ok(segment)
+        Ok(vec![segment])
     }
 }
 
@@ -244,6 +245,8 @@ impl StreamVByteEncoder {
     }
 }
 
+const POSTING_PAGE_HEADER_SIZE: usize = std::mem::size_of::<super::PostingPageHeader>();
+
 struct PageWriter {
     rel: pg_sys::Relation,
     buff: Option<BlockBuffer>,
@@ -253,61 +256,101 @@ struct PageWriter {
 
 impl PageWriter {
     pub fn new(rel: pg_sys::Relation, size: usize) -> Self {
-        Self {
+        let mut writer = Self {
             rel,
-            buff: Some(BlockBuffer::allocate(rel)),
+            buff: None,
             size,
             pos: 0,
+        };
+        writer.ensure_page_available();
+        writer
+    }
+
+    fn ensure_page_available(&mut self) {
+        if self.buff.is_none() {
+            self.allocate_page();
+        } else if self.pos >= self.size {
+            self.allocate_next_page();
         }
     }
 
-    pub fn location(&self) -> Option<super::ItemPointer> {
-        match self.buff.as_ref() {
-            Some(b) => Some(super::ItemPointer {
-                block_number: b.block_number(),
-                offset: self.pos as u16,
-            }),
-            None => None,
-        }
+    fn allocate_page(&mut self) {
+        let mut page = BlockBuffer::allocate(self.rel);
+        let header = page
+            .as_struct_mut::<super::PostingPageHeader>(0)
+            .expect("header should fit");
+        header.magic = super::POSTING_PAGE_MAGIC;
+        header.next_block = pg_sys::InvalidBlockNumber;
+        header.next_offset = POSTING_PAGE_HEADER_SIZE as u16;
+        header.free = POSTING_PAGE_HEADER_SIZE as u16;
+        self.buff = Some(page);
+        self.pos = POSTING_PAGE_HEADER_SIZE;
     }
 
-    pub fn ensure_space_or_allocate_location(&mut self, size: usize) -> super::ItemPointer {
-        if self.buff.is_some() && self.pos + size < self.size {
-            return self.location().expect("guaranteed to have a location");
+    fn allocate_next_page(&mut self) {
+        let mut next_page = BlockBuffer::allocate(self.rel);
+        let next_block = next_page.block_number();
+        if let Some(mut old) = self.buff.take() {
+            let header = old
+                .as_struct_mut::<super::PostingPageHeader>(0)
+                .expect("header should fit");
+            header.next_block = next_block;
+            header.next_offset = POSTING_PAGE_HEADER_SIZE as u16;
+            header.free = self.pos as u16;
         }
-        _ = self.buff.take();
-        _ = self.buff.replace(BlockBuffer::allocate(self.rel));
-        self.pos = 0;
-        self.location().expect("guaranteed to have a location")
+        let header = next_page
+            .as_struct_mut::<super::PostingPageHeader>(0)
+            .expect("header should fit");
+        header.magic = super::POSTING_PAGE_MAGIC;
+        header.next_block = pg_sys::InvalidBlockNumber;
+        header.next_offset = POSTING_PAGE_HEADER_SIZE as u16;
+        header.free = POSTING_PAGE_HEADER_SIZE as u16;
+        self.buff = Some(next_page);
+        self.pos = POSTING_PAGE_HEADER_SIZE;
+    }
+
+    fn location(&self) -> Option<super::ItemPointer> {
+        self.buff.as_ref().map(|b| super::ItemPointer {
+            block_number: b.block_number(),
+            offset: self.pos as u16,
+        })
+    }
+
+    pub fn start_chunk(&mut self) -> super::ItemPointer {
+        self.ensure_page_available();
+        self.location().expect("location should exist")
     }
 }
 
 impl Write for PageWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.len() >= self.size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "cannot fit in buffer",
-            ));
-        }
-        if self.buff.is_none() || self.pos + buf.len() >= self.size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "need to re-allocate",
-            ));
-        }
-        if let Some(b) = self.buff.as_mut() {
-            unsafe {
-                let p = b.as_ptr_mut().add(self.pos);
-                std::ptr::copy(buf.as_ptr(), p as *mut u8, buf.len());
+    fn write(&mut self, mut buf: &[u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while !buf.is_empty() {
+            self.ensure_page_available();
+            let available = self.size - self.pos;
+            if available == 0 {
+                self.allocate_next_page();
+                continue;
             }
+            let to_write = available.min(buf.len());
+            if let Some(b) = self.buff.as_mut() {
+                unsafe {
+                    let p = b.as_ptr_mut().add(self.pos);
+                    std::ptr::copy(buf.as_ptr(), p as *mut u8, to_write);
+                }
+                self.pos += to_write;
+                let header = b
+                    .as_struct_mut::<super::PostingPageHeader>(0)
+                    .expect("header should fit");
+                header.free = self.pos as u16;
+            }
+            written += to_write;
+            buf = &buf[to_write..];
         }
-        self.pos += buf.len();
-        Ok(buf.len())
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // drop to force flush
         _ = self.buff.take();
         self.pos = 0;
         Ok(())

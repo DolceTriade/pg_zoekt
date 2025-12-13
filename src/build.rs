@@ -7,6 +7,39 @@ struct BuildCallbackState {
     key_count: usize,
     seen: u64,
     collector: crate::trgm::Collector,
+    segments: Vec<crate::storage::Segment>,
+    flush_threshold: usize,
+}
+
+impl BuildCallbackState {
+    fn flush_if_needed(&mut self, rel: pg_sys::Relation) {
+        if self.collector.memory_usage() >= self.flush_threshold {
+            self.flush_segments(rel);
+        }
+    }
+
+    fn flush_segments(&mut self, rel: pg_sys::Relation) {
+        let trgms = self.collector.take_trgms();
+        if trgms.is_empty() {
+            return;
+        }
+        match crate::storage::encode::Encoder::encode_trgms(rel, &trgms) {
+            Ok(mut segs) => {
+                self.segments.append(&mut segs);
+            }
+            Err(e) => {
+                error!("failed to flush segment: {e:#?}");
+            }
+        }
+    }
+}
+
+fn maintenance_work_mem_bytes() -> usize {
+    let mut kb = unsafe { pg_sys::maintenance_work_mem as usize };
+    if kb == 0 {
+        kb = 64 * 1024;
+    }
+    kb * 1024
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -45,15 +78,12 @@ unsafe extern "C-unwind" fn log_index_value_callback(
 
         if !isnull[0] {
             if let Some(text) = String::from_datum(values[0], false) {
-                info!(
-                    "pg_zoekt ambuild text: {} {} {:?}",
-                    text, tuple_is_alive, &ctid
-                );
                 crate::trgm::Extractor::extract(&text).for_each(|(trgm, pos)| {
                     _ = state.collector.add(ctid, trgm, pos as u32);
                 });
             }
             state.seen += 1;
+            state.flush_if_needed(_index);
         }
     }
 }
@@ -81,11 +111,18 @@ pub extern "C-unwind" fn ambuild(
             .expect("WAL should always be in bounds");
         wal.magic = crate::storage::WAL_MAGIC;
     }
+    let mem_bytes = maintenance_work_mem_bytes();
+    let mut flush_threshold = mem_bytes.saturating_mul(9) / 10;
+    if flush_threshold == 0 {
+        flush_threshold = mem_bytes;
+    }
     let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
     let mut callback_state = BuildCallbackState {
         key_count,
         seen: 0,
         collector: crate::trgm::Collector::new(),
+        segments: Vec::new(),
+        flush_threshold,
     };
     info!("Starting scan");
     unsafe {
@@ -98,24 +135,22 @@ pub extern "C-unwind" fn ambuild(
         );
     }
 
-    let e = crate::storage::encode::Encoder::new(&callback_state.collector);
-    let segment = match e.encode(index_relation) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("failed to write segment: {e:?}");
+    callback_state.flush_segments(index_relation);
+    let segments = std::mem::take(&mut callback_state.segments);
+    info!("Wrote segments: {:?}", segments);
+    rbl.num_segments = segments.len() as u32;
+
+    if !segments.is_empty() {
+        let mut segment_list = root_buffer
+            .as_struct_with_elems_mut::<crate::storage::Segments>(
+                std::mem::size_of::<crate::storage::RootBlockList>(),
+                segments.len(),
+            )
+            .expect("get segment list");
+        for (idx, segment) in segments.iter().enumerate() {
+            segment_list.entries[idx] = *segment;
         }
-    };
-
-    info!("Wrote segment: {segment:?}");
-    rbl.num_segments = 1;
-
-    let segments = root_buffer
-        .as_struct_with_elems_mut::<crate::storage::Segments>(
-            std::mem::size_of::<crate::storage::RootBlockList>(),
-            1,
-        )
-        .expect("get segment list");
-    segments.entries[0] = segment;
+    }
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = callback_state.seen as f64;
     result.index_tuples = callback_state.seen as f64;

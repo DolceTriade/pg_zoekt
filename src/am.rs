@@ -151,8 +151,9 @@ mod tests {
             ('xyzxyaxzyxyxyzxyzxyzxyzxyz  xyz xyzyxzxyz xyz  xyzxyxzxyzxyzxyxzxyz');
 
             -- 3. Create the index
-            CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text);
+            -- CREATE INDEX idx_documents_text_zoekt ON chunks USING pg_zoekt (text_content);
             -- CREATE INDEX idx_documents_text_trgm ON documents USING GIN (text gin_trgm_ops);
+            CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text);
         ";
         let explain_plan = Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
             client.update(sql, None, &[])?;
@@ -160,7 +161,7 @@ mod tests {
             // Force the planner to consider our index and grab the text-format EXPLAIN output.
             client.update("SET enable_seqscan = OFF", None, &[])?;
             client
-                .select("EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, VERBOSE) SELECT text FROM documents WHERE text LIKE 'xyz%';", None, &[])?
+                .select("SELECT text FROM documents WHERE text LIKE '%xyz%';", None, &[])?
                 .into_iter()
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()

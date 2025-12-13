@@ -12,6 +12,7 @@ pub const ROOT_MAGIC: u32 = u32::from_ne_bytes(*b"pZKT");
 pub const BLOCK_MAGIC: u32 = u32::from_ne_bytes(*b"sZKT");
 pub const WAL_MAGIC: u32 = u32::from_ne_bytes(*b"wZKT");
 pub const WAL_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"WL");
+pub const POSTING_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"oZKT");
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
@@ -138,7 +139,15 @@ pub struct WALEntry {
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
 #[repr(C, packed)]
+pub struct PostingPageHeader {
+    pub magic: u32,
+    pub next_block: u32,
+    pub next_offset: u16,
+    pub free: u16,
+}
 
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
+#[repr(C, packed)]
 pub struct CompressedBlockHeader {
     // Max of 128 docs per batch
     pub num_docs: u8,
