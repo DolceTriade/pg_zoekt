@@ -279,15 +279,15 @@ impl Collector {
         list.extend_from_slice(occs);
         let after_cap = list.capacity();
         if after_cap > before_cap {
-            let added = (after_cap - before_cap)
-                .saturating_mul(std::mem::size_of::<Occurance>());
+            let added = (after_cap - before_cap).saturating_mul(std::mem::size_of::<Occurance>());
             self.size_estimate = self.size_estimate.saturating_add(added);
         }
 
         // Also count logical occurrence growth (overestimates but keeps flushes timely).
-        self.size_estimate = self
-            .size_estimate
-            .saturating_add(occs.len().saturating_mul(std::mem::size_of::<Occurance>() * 2));
+        self.size_estimate = self.size_estimate.saturating_add(
+            occs.len()
+                .saturating_mul(std::mem::size_of::<Occurance>() * 2),
+        );
     }
 
     pub fn add(

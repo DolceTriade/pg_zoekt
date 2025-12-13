@@ -27,8 +27,13 @@ impl Encoder {
         let mut leaf_pointers: Vec<super::BlockPointer> = Vec::new();
 
         let mut p = PageWriter::new(rel, super::pgbuffer::SPECIAL_SIZE);
+        let mut interrupt_counter: u32 = 0;
 
         while remaining_trgms > 0 {
+            interrupt_counter = interrupt_counter.wrapping_add(1);
+            if (interrupt_counter & 0x3ff) == 0 {
+                pg_sys::check_for_interrupts!();
+            }
             let mut leaf = BlockBuffer::allocate(rel);
             let leaf_block = leaf.block_number();
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
@@ -46,6 +51,10 @@ impl Encoder {
                 .context("could not parse entries")?;
             let mut leaf_min_trigram: Option<u32> = None;
             for i in 0..num_entries {
+                interrupt_counter = interrupt_counter.wrapping_add(1);
+                if (interrupt_counter & 0x3ff) == 0 {
+                    pg_sys::check_for_interrupts!();
+                }
                 let Some((key, val)) = iter.next() else {
                     anyhow::bail!("Unexpected end of iterator");
                 };
@@ -97,6 +106,10 @@ impl Encoder {
                 };
 
                 for (doc, occs) in val {
+                    interrupt_counter = interrupt_counter.wrapping_add(1);
+                    if (interrupt_counter & 0x3ff) == 0 {
+                        pg_sys::check_for_interrupts!();
+                    }
                     doc_count += 1;
                     occ_count += occs.len();
 
@@ -156,7 +169,10 @@ impl Encoder {
     }
 }
 
-fn build_segment_root(rel: pg_sys::Relation, leaves: &[super::BlockPointer]) -> anyhow::Result<u32> {
+fn build_segment_root(
+    rel: pg_sys::Relation,
+    leaves: &[super::BlockPointer],
+) -> anyhow::Result<u32> {
     if leaves.is_empty() {
         anyhow::bail!("no leaves");
     }
@@ -314,14 +330,18 @@ impl CompressedBatchBuilder {
         let counts = &self.counts;
         let positions = &self.positions;
 
-        let blks_len =
-            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(blks.iter().copied().deltas()));
-        let offs_len =
-            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(offs.iter().map(|v| *v as u32)));
-        let counts_len =
-            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(counts.iter().copied()));
-        let positions_len =
-            encode_section_into(payload, encoder, scratch, |tmp| tmp.extend(positions.iter().copied().deltas()));
+        let blks_len = encode_section_into(payload, encoder, scratch, |tmp| {
+            tmp.extend(blks.iter().copied().deltas())
+        });
+        let offs_len = encode_section_into(payload, encoder, scratch, |tmp| {
+            tmp.extend(offs.iter().map(|v| *v as u32))
+        });
+        let counts_len = encode_section_into(payload, encoder, scratch, |tmp| {
+            tmp.extend(counts.iter().copied())
+        });
+        let positions_len = encode_section_into(payload, encoder, scratch, |tmp| {
+            tmp.extend(positions.iter().copied().deltas())
+        });
 
         let flags_len = {
             let mut b = bitfield_rle::encode(&self.flags);

@@ -7,7 +7,6 @@ struct BuildCallbackState {
     key_count: usize,
     seen: u64,
     collector: crate::trgm::Collector,
-    segments: Vec<crate::storage::Segment>,
     flush_threshold: usize,
 }
 
@@ -28,7 +27,32 @@ impl BuildCallbackState {
         drop(trgms);
         match res {
             Ok(mut segs) => {
-                self.segments.append(&mut segs);
+                let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
+                let rbl = root
+                    .as_struct_mut::<crate::storage::RootBlockList>(0)
+                    .expect("root header");
+                if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
+                    error!("failed to append segments: {e:#?}");
+                }
+
+                // Avoid pathologically frequent compactions on tiny maintenance_work_mem.
+                // We compact only when the on-disk list grows large, and we compact to a
+                // moderate size (final merge later reduces further).
+                const MAX_ACTIVE_SEGMENTS: u32 = 512;
+                const COMPACT_TARGET_SEGMENTS: usize = 64;
+                if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
+                    let existing = crate::storage::segment_list_read(rel, rbl)
+                        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+                    let merged = crate::storage::merge(
+                        rel,
+                        &existing,
+                        COMPACT_TARGET_SEGMENTS,
+                        self.flush_threshold.saturating_mul(16).max(1024 * 1024),
+                    )
+                    .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
+                    crate::storage::segment_list_rewrite(rel, rbl, &merged)
+                        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+                }
             }
             Err(e) => {
                 error!("failed to flush segment: {e:#?}");
@@ -89,11 +113,13 @@ unsafe extern "C-unwind" fn log_index_value_callback(
                     _ = state.collector.add(ctid, trgm, pos as u32);
                     extracted += 1;
                     if (extracted & 0xff) == 0 {
+                        pg_sys::check_for_interrupts!();
                         state.flush_if_needed(index);
                     }
                 }
             }
             state.seen += 1;
+            pg_sys::check_for_interrupts!();
             state.flush_if_needed(index);
         }
     }
@@ -105,15 +131,20 @@ pub extern "C-unwind" fn ambuild(
     index_relation: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    let mut root_buffer = BlockBuffer::allocate(index_relation);
-    let rbl = root_buffer
-        .as_struct_mut::<crate::storage::RootBlockList>(0)
-        .expect("Root should always be in bounds");
-    rbl.magic = crate::storage::ROOT_MAGIC;
-    rbl.num_segments = 0;
-    rbl.version = crate::storage::VERSION;
+    // IMPORTANT: do not hold an exclusive lock on the root buffer throughout the
+    // heap scan; callbacks need to acquire it to append segment records.
+    let root_block = {
+        let mut root_buffer = BlockBuffer::allocate(index_relation);
+        let root_block = root_buffer.block_number();
+        let rbl = root_buffer
+            .as_struct_mut::<crate::storage::RootBlockList>(0)
+            .expect("Root should always be in bounds");
+        rbl.magic = crate::storage::ROOT_MAGIC;
+        rbl.num_segments = 0;
+        rbl.version = crate::storage::VERSION;
+        rbl.segment_list_head = pg_sys::InvalidBlockNumber;
+        rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
 
-    {
         let mut wal_buffer = BlockBuffer::allocate(index_relation);
         rbl.wal_block = wal_buffer.block_number();
 
@@ -121,7 +152,8 @@ pub extern "C-unwind" fn ambuild(
             .as_struct_mut::<crate::storage::WALBuckets>(0)
             .expect("WAL should always be in bounds");
         wal.magic = crate::storage::WAL_MAGIC;
-    }
+        root_block
+    };
     let mem_bytes = maintenance_work_mem_bytes();
     // Aim lower than `maintenance_work_mem` because our estimate is conservative and
     // Rust allocations aren't accounted in Postgres' memory accounting.
@@ -134,7 +166,6 @@ pub extern "C-unwind" fn ambuild(
         key_count,
         seen: 0,
         collector: crate::trgm::Collector::new(),
-        segments: Vec::new(),
         flush_threshold,
     };
     info!("Starting scan");
@@ -149,39 +180,25 @@ pub extern "C-unwind" fn ambuild(
     }
 
     callback_state.flush_segments(index_relation);
-    let segments = std::mem::take(&mut callback_state.segments);
-    let total_size: u64 = segments.iter().map(|s| s.size).sum();
-    info!("Wrote {} segments ({} bytes)", segments.len(), total_size);
-    let merged_segments = match crate::storage::merge(
+
+    // Final merge down to the target segment count and write back to the on-disk segment list.
+    let mut root_buffer = BlockBuffer::aquire_mut(index_relation, root_block);
+    let rbl = root_buffer
+        .as_struct_mut::<crate::storage::RootBlockList>(0)
+        .expect("root header");
+    let existing = crate::storage::segment_list_read(index_relation, rbl)
+        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+    let total_size: u64 = existing.iter().map(|s| s.size).sum();
+    info!("Wrote {} segments ({} bytes)", existing.len(), total_size);
+    let merged = crate::storage::merge(
         index_relation,
-        &segments,
+        &existing,
         crate::storage::TARGET_SEGMENTS,
         callback_state.flush_threshold,
-    ) {
-        Ok(result) => result,
-        Err(err) => {
-            error!("failed to merge segments: {err:#?}");
-            segments.clone()
-        }
-    };
-    let final_segments = if merged_segments.is_empty() {
-        segments.clone()
-    } else {
-        merged_segments
-    };
-    rbl.num_segments = final_segments.len() as u32;
-
-    if !final_segments.is_empty() {
-        let mut segment_list = root_buffer
-            .as_struct_with_elems_mut::<crate::storage::Segments>(
-                std::mem::size_of::<crate::storage::RootBlockList>(),
-                final_segments.len(),
-            )
-            .expect("get segment list");
-        for (idx, segment) in final_segments.iter().enumerate() {
-            segment_list.entries[idx] = *segment;
-        }
-    }
+    )
+    .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
+    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
+        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = callback_state.seen as f64;
     result.index_tuples = callback_state.seen as f64;

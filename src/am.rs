@@ -133,14 +133,7 @@ mod tests {
     fn de_bruijn(k: &[u8], n: usize) -> String {
         // Classic de Bruijn sequence generator: returns a string where every length-n
         // substring over alphabet k appears exactly once (cyclic).
-        fn db(
-            t: usize,
-            p: usize,
-            n: usize,
-            k: &[u8],
-            a: &mut [usize],
-            out: &mut Vec<u8>,
-        ) {
+        fn db(t: usize, p: usize, n: usize, k: &[u8], a: &mut [usize], out: &mut Vec<u8>) {
             if t > n {
                 if n % p == 0 {
                     for i in 1..=p {

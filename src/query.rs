@@ -92,10 +92,19 @@ pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::
     if rbl.magic != crate::storage::ROOT_MAGIC {
         anyhow::bail!("invalid root magic");
     }
+
+    if rbl.version >= 2 {
+        return crate::storage::segment_list_read(rel, rbl);
+    }
+
+    // Legacy v1: segments stored inline right after the root header.
+    let rbl1 = root
+        .as_struct::<crate::storage::RootBlockListV1>(0)
+        .context("root header v1")?;
     let segments = root
         .as_struct_with_elems::<crate::storage::Segments>(
-            std::mem::size_of::<crate::storage::RootBlockList>(),
-            rbl.num_segments as usize,
+            std::mem::size_of::<crate::storage::RootBlockListV1>(),
+            rbl1.num_segments as usize,
         )
         .context("segments")?;
     Ok(segments.entries.to_vec())

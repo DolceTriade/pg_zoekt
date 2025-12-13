@@ -11,16 +11,29 @@ pub mod encode;
 pub mod pgbuffer;
 pub mod wal;
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const ROOT_MAGIC: u32 = u32::from_ne_bytes(*b"pZKT");
 pub const BLOCK_MAGIC: u32 = u32::from_ne_bytes(*b"sZKT");
 pub const WAL_MAGIC: u32 = u32::from_ne_bytes(*b"wZKT");
 pub const WAL_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"WL");
 pub const POSTING_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"oZKT");
+pub const SEGMENT_LIST_MAGIC: u32 = u32::from_ne_bytes(*b"lZKT");
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct RootBlockList {
+    pub magic: u32,
+    pub version: u16,
+    pub wal_block: u32,
+    pub num_segments: u32,
+    pub segment_list_head: u32,
+    pub segment_list_tail: u32,
+    // Segments...
+}
+
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
+#[repr(C, packed)]
+pub struct RootBlockListV1 {
     pub magic: u32,
     pub version: u16,
     pub wal_block: u32,
@@ -70,6 +83,152 @@ impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
 pub struct Segment {
     pub block: u32,
     pub size: u64,
+}
+
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
+#[repr(C, packed)]
+pub struct SegmentListPageHeader {
+    pub magic: u32,
+    pub next_block: u32,
+    pub count: u16,
+}
+
+fn segment_list_capacity() -> usize {
+    let header = std::mem::size_of::<SegmentListPageHeader>();
+    let seg = std::mem::size_of::<Segment>();
+    (pgbuffer::SPECIAL_SIZE - header) / seg
+}
+
+fn segment_list_init_page(rel: pg_sys::Relation) -> Result<pgbuffer::BlockBuffer> {
+    let mut page = pgbuffer::BlockBuffer::allocate(rel);
+    let hdr = page
+        .as_struct_mut::<SegmentListPageHeader>(0)
+        .context("segment list header")?;
+    hdr.magic = SEGMENT_LIST_MAGIC;
+    hdr.next_block = pg_sys::InvalidBlockNumber;
+    hdr.count = 0;
+    Ok(page)
+}
+
+pub fn segment_list_append(
+    rel: pg_sys::Relation,
+    root: &mut RootBlockList,
+    segments: &[Segment],
+) -> Result<()> {
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let cap = segment_list_capacity();
+    if cap == 0 {
+        anyhow::bail!("segment list page capacity is 0");
+    }
+
+    // Ensure we have a head/tail page.
+    if root.segment_list_head == pg_sys::InvalidBlockNumber {
+        let page = segment_list_init_page(rel)?;
+        let blk = page.block_number();
+        root.segment_list_head = blk;
+        root.segment_list_tail = blk;
+        drop(page);
+    }
+
+    let mut remaining = segments;
+    while !remaining.is_empty() {
+        let mut tail = pgbuffer::BlockBuffer::aquire_mut(rel, root.segment_list_tail);
+        let (used, next_block) = {
+            let hdr = tail
+                .as_struct_mut::<SegmentListPageHeader>(0)
+                .context("segment list header")?;
+            if hdr.magic != SEGMENT_LIST_MAGIC {
+                anyhow::bail!("bad segment list magic");
+            }
+            (hdr.count as usize, hdr.next_block)
+        };
+        let avail = cap.saturating_sub(used);
+        if avail == 0 {
+            // Allocate next page and link it.
+            let next_page = segment_list_init_page(rel)?;
+            let next_blk = next_page.block_number();
+            {
+                let hdr = tail
+                    .as_struct_mut::<SegmentListPageHeader>(0)
+                    .context("segment list header")?;
+                hdr.next_block = next_blk;
+            }
+            root.segment_list_tail = next_blk;
+            drop(next_page);
+            continue;
+        }
+
+        let take = avail.min(remaining.len());
+        let header_size = std::mem::size_of::<SegmentListPageHeader>();
+        let seg_size = std::mem::size_of::<Segment>();
+        let start_off = header_size + used * seg_size;
+        let bytes = unsafe {
+            let p = tail.as_ptr_mut().add(start_off) as *mut u8;
+            std::slice::from_raw_parts_mut(p, take * seg_size)
+        };
+        // SAFETY: `Segment` is plain old data and packed; we just copy bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                remaining.as_ptr() as *const u8,
+                bytes.as_mut_ptr(),
+                take * seg_size,
+            );
+        }
+        {
+            let hdr = tail
+                .as_struct_mut::<SegmentListPageHeader>(0)
+                .context("segment list header")?;
+            hdr.count = (used + take) as u16;
+            hdr.next_block = next_block;
+        }
+        root.num_segments = root
+            .num_segments
+            .checked_add(take as u32)
+            .expect("segment count overflow");
+
+        remaining = &remaining[take..];
+    }
+    Ok(())
+}
+
+pub fn segment_list_read(rel: pg_sys::Relation, root: &RootBlockList) -> Result<Vec<Segment>> {
+    if root.num_segments == 0 || root.segment_list_head == pg_sys::InvalidBlockNumber {
+        return Ok(Vec::new());
+    }
+    let cap = segment_list_capacity();
+    let mut out = Vec::with_capacity(root.num_segments as usize);
+    let mut blk = root.segment_list_head;
+    while blk != pg_sys::InvalidBlockNumber && out.len() < root.num_segments as usize {
+        let buf = pgbuffer::BlockBuffer::acquire(rel, blk);
+        let hdr = buf
+            .as_struct::<SegmentListPageHeader>(0)
+            .context("segment list header")?;
+        if hdr.magic != SEGMENT_LIST_MAGIC {
+            anyhow::bail!("bad segment list magic");
+        }
+        let count = (hdr.count as usize).min(cap);
+        let list = buf
+            .as_struct_with_elems::<Segments>(std::mem::size_of::<SegmentListPageHeader>(), count)
+            .context("segment list entries")?;
+        out.extend_from_slice(&list.entries[..count]);
+        blk = hdr.next_block;
+    }
+    out.truncate(root.num_segments as usize);
+    Ok(out)
+}
+
+pub fn segment_list_rewrite(
+    rel: pg_sys::Relation,
+    root: &mut RootBlockList,
+    segments: &[Segment],
+) -> Result<()> {
+    root.num_segments = 0;
+    root.segment_list_head = pg_sys::InvalidBlockNumber;
+    root.segment_list_tail = pg_sys::InvalidBlockNumber;
+    segment_list_append(rel, root, segments)?;
+    Ok(())
 }
 
 #[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
@@ -348,8 +507,13 @@ pub fn merge(
     let mut collector = crate::trgm::Collector::new();
     let mut bytes_since_flush = 0usize;
     let mut result = Vec::new();
+    let mut interrupt_counter: u32 = 0;
 
     while let Some(trigram) = peek_next_trigram(&cursors) {
+        interrupt_counter = interrupt_counter.wrapping_add(1);
+        if (interrupt_counter & 0x3ff) == 0 {
+            pg_sys::check_for_interrupts!();
+        }
         let mut group_entries = Vec::new();
         for cursor in cursors.iter_mut() {
             while let Some(entry) = cursor.current_entry() {
@@ -365,6 +529,7 @@ pub fn merge(
             occs.sort_unstable_by_key(|occ| occ.position());
             collector.add_occurrences(trigram, *doc, occs);
         }
+        drop(postings);
         bytes_since_flush += group_entries
             .iter()
             .map(|entry| entry.data_length as usize)
