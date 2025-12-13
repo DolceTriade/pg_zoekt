@@ -56,18 +56,75 @@ impl Encoder {
                 idx.offset = 0;
                 idx.frequency = val.len() as u32;
                 let mut b = CompressedBatchBuilder::new();
+                let max_chunk_size =
+                    super::pgbuffer::SPECIAL_SIZE - std::mem::size_of::<super::PostingPageHeader>();
+                let mut first_chunk = false;
+
+                let mut flush_chunk = |builder: &mut CompressedBatchBuilder,
+                                       idx: &mut super::IndexEntry,
+                                       first_chunk: &mut bool,
+                                       byte_count: &mut usize|
+                 -> anyhow::Result<()> {
+                    if builder.is_empty() {
+                        return Ok(());
+                    }
+                    let buf = builder.compress();
+                    if buf.len() > max_chunk_size {
+                        anyhow::bail!(
+                            "chunk size {} exceeds page capacity {}",
+                            buf.len(),
+                            max_chunk_size
+                        );
+                    }
+                    let loc = p.start_chunk(buf.len());
+                    p.write(&buf).expect("Write to succeed");
+                    if !*first_chunk {
+                        idx.block = loc.block_number;
+                        idx.offset = loc.offset as u16;
+                        *first_chunk = true;
+                    }
+                    idx.data_length = idx
+                        .data_length
+                        .checked_add(buf.len() as u32)
+                        .expect("overflow on data length");
+                    *byte_count += buf.len();
+                    builder.reset();
+                    Ok(())
+                };
+
                 for (doc, occs) in val {
-                    b.add(*doc, &occs);
                     doc_count += 1;
                     occ_count += occs.len();
+
+                    if occs.is_empty() {
+                        continue;
+                    }
+
+                    let mut start = 0;
+                    while start < occs.len() {
+                        let mut end = occs.len();
+                        loop {
+                            let slice = &occs[start..end];
+                            b.add(*doc, slice);
+                            let chunk_len = b.compress().len();
+                            if chunk_len <= max_chunk_size {
+                                break;
+                            }
+                            b.pop_last_doc();
+                            if end == start + 1 {
+                                anyhow::bail!(
+                                    "single doc chunk size {} exceeds page capacity {}",
+                                    chunk_len,
+                                    max_chunk_size
+                                );
+                            }
+                            end = start + (end - start + 1) / 2;
+                        }
+                        flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
+                        start = end;
+                    }
                 }
-                let buf = b.compress();
-                let loc = p.start_chunk();
-                p.write(&buf).expect("Write to succeed");
-                idx.block = loc.block_number;
-                idx.offset = loc.offset as u16;
-                byte_count += buf.len();
-                idx.data_length = buf.len() as u32;
+                flush_chunk(&mut b, idx, &mut first_chunk, &mut byte_count)?;
             }
             remaining_trgms -= num_entries;
 
@@ -89,7 +146,7 @@ impl Encoder {
 }
 
 #[derive(Debug, Default)]
-struct CompressedBatchBuilder {
+pub(super) struct CompressedBatchBuilder {
     blks: Vec<u32>,
     offs: Vec<u16>,
 
@@ -163,6 +220,30 @@ impl CompressedBatchBuilder {
         buf
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.blks.is_empty()
+    }
+
+    pub fn reset(&mut self) {
+        self.blks.clear();
+        self.offs.clear();
+        self.counts.clear();
+        self.positions.clear();
+        self.flags.clear();
+    }
+
+    pub fn pop_last_doc(&mut self) {
+        if self.blks.is_empty() {
+            return;
+        }
+        self.blks.pop();
+        self.offs.pop();
+        let count = self.counts.pop().unwrap_or(0) as usize;
+        let pos_len = self.positions.len().saturating_sub(count);
+        self.positions.truncate(pos_len);
+        self.flags.truncate(pos_len);
+    }
+
     fn encode_section<F>(
         &self,
         out: &mut Vec<u8>,
@@ -183,7 +264,7 @@ impl CompressedBatchBuilder {
     }
 }
 
-pub struct StreamVByteEncoder {
+pub(super) struct StreamVByteEncoder {
     buffer: Vec<u8>,
 }
 
@@ -247,7 +328,7 @@ impl StreamVByteEncoder {
 
 const POSTING_PAGE_HEADER_SIZE: usize = std::mem::size_of::<super::PostingPageHeader>();
 
-struct PageWriter {
+pub(super) struct PageWriter {
     rel: pg_sys::Relation,
     buff: Option<BlockBuffer>,
     size: usize,
@@ -270,6 +351,24 @@ impl PageWriter {
         if self.buff.is_none() {
             self.allocate_page();
         } else if self.pos >= self.size {
+            self.allocate_next_page();
+        }
+    }
+
+    fn ensure_page_available_for(&mut self, required: usize) {
+        let max_chunk = self.size - POSTING_PAGE_HEADER_SIZE;
+        if required > max_chunk {
+            panic!("chunk size {required} exceeds page capacity {max_chunk}");
+        }
+        loop {
+            if self.buff.is_none() {
+                self.allocate_page();
+                continue;
+            }
+            let available = self.size - self.pos;
+            if available >= required {
+                break;
+            }
             self.allocate_next_page();
         }
     }
@@ -316,8 +415,8 @@ impl PageWriter {
         })
     }
 
-    pub fn start_chunk(&mut self) -> super::ItemPointer {
-        self.ensure_page_available();
+    pub fn start_chunk(&mut self, size: usize) -> super::ItemPointer {
+        self.ensure_page_available_for(size);
         self.location().expect("location should exist")
     }
 }

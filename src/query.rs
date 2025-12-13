@@ -84,7 +84,7 @@ struct SegmentPattern {
     trigrams: Vec<PatternTrgm>,
 }
 
-unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
+pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
     let mut root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0);
     let rbl = root
         .as_struct::<crate::storage::RootBlockList>(0)

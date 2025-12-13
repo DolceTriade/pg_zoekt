@@ -199,6 +199,26 @@ impl Collector {
         std::mem::take(&mut self.trgms)
     }
 
+    pub fn add_occurrences(
+        &mut self,
+        trigram: u32,
+        ctid: crate::storage::ItemPointer,
+        occs: &[Occurance],
+    ) {
+        let entry = self.trgms.entry(trigram).or_insert_with(|| {
+            self.size_estimate += std::mem::size_of::<u32>();
+            BTreeMap::new()
+        });
+
+        let docs = entry.entry(ctid).or_insert_with(|| {
+            self.size_estimate += std::mem::size_of::<crate::storage::ItemPointer>();
+            Vec::new()
+        });
+
+        self.size_estimate += occs.len() * std::mem::size_of::<Occurance>();
+        docs.extend_from_slice(occs);
+    }
+
     pub fn add(
         &mut self,
         ctid: crate::storage::ItemPointer,
@@ -211,14 +231,7 @@ impl Collector {
         }
         let mut o = Occurance(position);
         o.set_flags(ct.flags());
-        self.trgms
-            .entry(ct.trgm())
-            .or_insert(BTreeMap::new())
-            .entry(ctid)
-            .or_insert(Vec::new())
-            .push(o);
-        self.size_estimate +=
-            std::mem::size_of_val(&ct) + std::mem::size_of_val(&o) + std::mem::size_of_val(&ctid);
+        self.add_occurrences(ct.trgm(), ctid, std::slice::from_ref(&o));
         Ok(())
     }
 }

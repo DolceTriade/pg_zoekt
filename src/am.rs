@@ -151,7 +151,7 @@ mod tests {
             ('xyzxyaxzyxyxyzxyzxyzxyzxyz  xyz xyzyxzxyz xyz  xyzxyxzxyzxyzxyxzxyz');
 
             -- 3. Create the index
-            -- CREATE INDEX idx_documents_text_zoekt ON chunks USING pg_zoekt (text_content);
+            -- CREATE INDEX idx_chunks_text_zoekt ON chunks USING pg_zoekt (text_content);
             -- CREATE INDEX idx_documents_text_trgm ON documents USING GIN (text gin_trgm_ops);
             CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text);
         ";
@@ -161,7 +161,11 @@ mod tests {
             // Force the planner to consider our index and grab the text-format EXPLAIN output.
             client.update("SET enable_seqscan = OFF", None, &[])?;
             client
-                .select("SELECT text FROM documents WHERE text LIKE '%xyz%';", None, &[])?
+                .select(
+                    "SELECT text FROM documents WHERE text LIKE '%xyz%';",
+                    None,
+                    &[],
+                )?
                 .into_iter()
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()
@@ -169,6 +173,74 @@ mod tests {
 
         explain_plan.iter().for_each(|s| info!("{}", s));
         // Intentional failure to force pgrx to print captured output during tests.
+        //assert!(false);
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_merge_segments_compact() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update("CREATE EXTENSION IF NOT EXISTS pg_trgm", None, &[])?;
+            client.update(
+                "CREATE TABLE merge_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO merge_docs (text) SELECT repeat(md5(i::text), 10) FROM generate_series(1, 1024) s(i)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_merge_docs_text_zoekt ON merge_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_merge_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read index segments");
+            assert!(
+                segments.len() > 1,
+                "expected multiple segments before merge"
+            );
+            info!("Read {}", segments.len());
+            let merged =
+                crate::storage::merge(rel, &segments, 1, 1024 * 1024 * 1024).expect("merge failed");
+            info!("merged.len() = {}", merged.len());
+            assert!(!merged.is_empty());
+            assert!(merged.len() == 1);
+
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+        let explain_plan = Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+            client
+                .select(
+                    // "EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, VERBOSE) SELECT text FROM merge_docs WHERE text LIKE '%xyz%';",
+                    "EXPLAIN (ANALYZE, COSTS, BUFFERS, TIMING, VERBOSE) SELECT text FROM merge_docs WHERE text ILIKE '%123%';",
+                    None,
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
+                .collect()
+        })?;
+
+        explain_plan.iter().for_each(|s| info!("{}", s));
         assert!(false);
         Ok(())
     }

@@ -44,7 +44,7 @@ fn maintenance_work_mem_bytes() -> usize {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 unsafe extern "C-unwind" fn log_index_value_callback(
-    _index: pg_sys::Relation,
+    index: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
@@ -83,7 +83,7 @@ unsafe extern "C-unwind" fn log_index_value_callback(
                 });
             }
             state.seen += 1;
-            state.flush_if_needed(_index);
+            state.flush_if_needed(index);
         }
     }
 }
@@ -138,16 +138,33 @@ pub extern "C-unwind" fn ambuild(
     callback_state.flush_segments(index_relation);
     let segments = std::mem::take(&mut callback_state.segments);
     info!("Wrote segments: {:?}", segments);
-    rbl.num_segments = segments.len() as u32;
+    let merged_segments = match crate::storage::merge(
+        index_relation,
+        &segments,
+        crate::storage::TARGET_SEGMENTS,
+        callback_state.flush_threshold,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            error!("failed to merge segments: {err:#?}");
+            segments.clone()
+        }
+    };
+    let final_segments = if merged_segments.is_empty() {
+        segments.clone()
+    } else {
+        merged_segments
+    };
+    rbl.num_segments = final_segments.len() as u32;
 
-    if !segments.is_empty() {
+    if !final_segments.is_empty() {
         let mut segment_list = root_buffer
             .as_struct_with_elems_mut::<crate::storage::Segments>(
                 std::mem::size_of::<crate::storage::RootBlockList>(),
-                segments.len(),
+                final_segments.len(),
             )
             .expect("get segment list");
-        for (idx, segment) in segments.iter().enumerate() {
+        for (idx, segment) in final_segments.iter().enumerate() {
             segment_list.entries[idx] = *segment;
         }
     }

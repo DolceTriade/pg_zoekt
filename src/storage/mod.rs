@@ -1,6 +1,10 @@
+use anyhow::{Context, Result};
 use pgrx::prelude::*;
 /// Storing stuff
+use std::collections::BTreeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
+
+pub const TARGET_SEGMENTS: usize = 10;
 
 pub mod decode;
 pub mod encode;
@@ -160,4 +164,140 @@ pub struct CompressedBlockHeader {
     pub pos_len: u16,
 
     pub flags_len: u16,
+}
+
+struct SegmentCursor {
+    entries: Vec<IndexEntry>,
+    idx: usize,
+}
+
+impl SegmentCursor {
+    fn current_entry(&self) -> Option<&IndexEntry> {
+        self.entries.get(self.idx)
+    }
+
+    fn advance(&mut self) {
+        self.idx += 1;
+    }
+}
+
+fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<Vec<IndexEntry>> {
+    let mut buf = pgbuffer::BlockBuffer::acquire(rel, segment.block);
+    let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+    if header.magic != BLOCK_MAGIC {
+        anyhow::bail!("invalid block magic while merging");
+    }
+    let entries = buf
+        .as_struct_with_elems::<IndexList>(
+            std::mem::size_of::<BlockHeader>(),
+            header.num_entries as usize,
+        )
+        .context("index entries")?;
+    Ok(entries.entries[..header.num_entries as usize].to_vec())
+}
+
+fn peek_next_trigram(cursors: &[SegmentCursor]) -> Option<u32> {
+    cursors
+        .iter()
+        .filter_map(|c| c.current_entry().map(|entry| entry.trigram))
+        .min()
+}
+
+fn merge_entry_postings(
+    rel: pg_sys::Relation,
+    entries: &[IndexEntry],
+) -> Result<BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>>> {
+    let mut docs: BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>> = BTreeMap::new();
+    for entry in entries {
+        for posting in unsafe { crate::storage::decode::decode_postings(rel, entry)? } {
+            let list = docs.entry(posting.tid).or_insert_with(Vec::new);
+            for (position, flags) in posting.positions {
+                let mut occ = crate::trgm::Occurance(position);
+                occ.set_flags(flags);
+                list.push(occ);
+            }
+        }
+    }
+    Ok(docs)
+}
+
+fn flush_collector(
+    rel: pg_sys::Relation,
+    collector: &mut crate::trgm::Collector,
+    target: &mut Vec<Segment>,
+) -> Result<()> {
+    let trgms = collector.take_trgms();
+    if trgms.is_empty() {
+        return Ok(());
+    }
+    let mut segments = encode::Encoder::encode_trgms(rel, &trgms)?;
+    target.append(&mut segments);
+    Ok(())
+}
+
+pub fn merge(
+    rel: pg_sys::Relation,
+    segments: &[Segment],
+    target_segments: usize,
+    flush_threshold: usize,
+) -> Result<Vec<Segment>> {
+    let target_segments = target_segments.max(1);
+    if segments.len() <= target_segments {
+        return Ok(segments.to_vec());
+    }
+
+    let total_bytes = segments
+        .iter()
+        .map(|segment| segment.size)
+        .sum::<u64>()
+        .min(usize::MAX as u64) as usize;
+    let per_segment_target = std::cmp::max(1usize, total_bytes / target_segments);
+
+    let mut cursors = Vec::new();
+    for segment in segments {
+        let entries = read_segment_entries(rel, segment)?;
+        if !entries.is_empty() {
+            cursors.push(SegmentCursor { entries, idx: 0 });
+        }
+    }
+
+    if cursors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut collector = crate::trgm::Collector::new();
+    let mut bytes_since_flush = 0usize;
+    let mut result = Vec::new();
+
+    while let Some(trigram) = peek_next_trigram(&cursors) {
+        let mut group_entries = Vec::new();
+        for cursor in cursors.iter_mut() {
+            while let Some(entry) = cursor.current_entry() {
+                if entry.trigram != trigram {
+                    break;
+                }
+                group_entries.push(*entry);
+                cursor.advance();
+            }
+        }
+        let mut postings = merge_entry_postings(rel, &group_entries)?;
+        for (doc, occs) in postings.iter_mut() {
+            occs.sort_unstable_by_key(|occ| occ.position());
+            collector.add_occurrences(trigram, *doc, occs);
+        }
+        bytes_since_flush += group_entries
+            .iter()
+            .map(|entry| entry.data_length as usize)
+            .sum::<usize>();
+        if collector.memory_usage() >= flush_threshold || bytes_since_flush >= per_segment_target {
+            flush_collector(rel, &mut collector, &mut result)?;
+            bytes_since_flush = 0;
+        }
+    }
+
+    if collector.memory_usage() > 0 {
+        flush_collector(rel, &mut collector, &mut result)?;
+    }
+
+    Ok(result)
 }
