@@ -7,3 +7,13 @@ Cargo.lock
 tests/pg_regress/results
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out
+.cargo/
+.worktrees/
+GEMINI.md
+TODO.md
+pg_trgm.txt
+pg_trgm/
+pgvectorscale/
+postgres/
+src/build/
+zoekt/
