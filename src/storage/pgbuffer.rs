@@ -239,7 +239,7 @@ mod tests {
     use std::ffi::CString;
 
     use super::*;
-    use pgrx::{spi, Spi};
+    use pgrx::{Spi, spi};
 
     #[pg_test]
     pub fn test_sanity() -> spi::Result<()> {

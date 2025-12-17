@@ -130,11 +130,17 @@ mod implementation {
         if existing.is_empty() || existing.len() <= crate::storage::TARGET_SEGMENTS {
             return Ok(());
         }
+        let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
+            .unwrap_or_else(|e| {
+                warning!("failed to load tombstones during merge: {e:#?}");
+                crate::storage::tombstone::Snapshot::default()
+            });
         let merged = crate::storage::merge(
             rel,
             &existing,
             crate::storage::TARGET_SEGMENTS,
             flush_threshold,
+            &tombstones,
         )?;
         crate::storage::segment_list_rewrite(rel, rbl, &merged)?;
         Ok(())
@@ -160,6 +166,28 @@ mod implementation {
             }
 
             pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+        }
+    }
+
+    #[pg_extern]
+    fn pg_zoekt_tombstone(index: pg_sys::Oid, tids: pgrx::Array<pg_sys::ItemPointerData>) -> i64 {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
+            let mut to_delete = Vec::new();
+            for tid in tids.iter().flatten() {
+                let converted =
+                    <crate::storage::ItemPointer as From<pg_sys::ItemPointerData>>::from(tid);
+                to_delete.push(converted);
+            }
+            let applied = match crate::storage::tombstone::apply_deletions(rel, to_delete) {
+                Ok(count) => count as i64,
+                Err(e) => {
+                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+                    error!("failed to record tombstones: {e:#}");
+                }
+            };
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+            applied
         }
     }
 
@@ -318,6 +346,9 @@ mod tests {
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()
         })?;
+        Spi::run(
+            "SELECT pg_zoekt_seal('idx_documents_text_zoekt'::regclass)",
+        )?;
 
         explain_plan.iter().for_each(|s| info!("{}", s));
         // Intentional failure to force pgrx to print captured output during tests.
@@ -366,8 +397,14 @@ mod tests {
                 "expected multiple segments before merge"
             );
             info!("Read {}", segments.len());
-            let merged =
-                crate::storage::merge(rel, &segments, 1, 1024 * 1024 * 1024).expect("merge failed");
+            let merged = crate::storage::merge(
+                rel,
+                &segments,
+                1,
+                1024 * 1024 * 1024,
+                &crate::storage::tombstone::Snapshot::default(),
+            )
+            .expect("merge failed");
             info!("merged.len() = {}", merged.len());
             assert!(!merged.is_empty());
             assert!(merged.len() == 1);
@@ -469,6 +506,45 @@ mod tests {
             assert_eq!(count, 1);
             Ok(())
         })
+    }
+
+    #[pg_test]
+    pub fn test_tombstone_filters_results() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE tombstone_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO tombstone_docs (text) VALUES ('keep mee'), ('delete mee soon'), ('keep mee too')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_tombstone_docs_text_zoekt ON tombstone_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        Spi::run("SET enable_seqscan = OFF")?;
+        let before: i64 =
+            Spi::get_one("SELECT count(*) FROM tombstone_docs WHERE text LIKE '%mee%';")?
+                .unwrap_or(0);
+        assert_eq!(before, 3);
+        Spi::run(
+            "SELECT pg_zoekt_tombstone(
+                'idx_tombstone_docs_text_zoekt'::regclass,
+                array(SELECT ctid FROM tombstone_docs WHERE text LIKE 'delete mee%')
+            );",
+        )?;
+        Spi::run("SET enable_seqscan = OFF")?;
+        let after: i64 =
+            Spi::get_one("SELECT count(*) FROM tombstone_docs WHERE text LIKE '%mee%';")?
+                .unwrap_or(0);
+        assert_eq!(after, 2);
+        Ok(())
     }
 
     #[pg_test]

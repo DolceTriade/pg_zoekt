@@ -48,6 +48,7 @@ impl BuildCallbackState {
                         &existing,
                         COMPACT_TARGET_SEGMENTS,
                         self.flush_threshold.saturating_mul(16).max(1024 * 1024),
+                        &crate::storage::tombstone::Snapshot::default(),
                     )
                     .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                     crate::storage::segment_list_rewrite(rel, rbl, &merged)
@@ -155,6 +156,8 @@ pub extern "C-unwind" fn ambuild(
         rbl.version = crate::storage::VERSION;
         rbl.segment_list_head = pg_sys::InvalidBlockNumber;
         rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_block = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_bytes = 0;
 
         let mut wal_buffer = BlockBuffer::allocate(index_relation);
         rbl.wal_block = wal_buffer.block_number();
@@ -204,6 +207,7 @@ pub extern "C-unwind" fn ambuild(
         &existing,
         crate::storage::TARGET_SEGMENTS,
         callback_state.flush_threshold,
+        &crate::storage::tombstone::Snapshot::default(),
     )
     .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
     crate::storage::segment_list_rewrite(index_relation, rbl, &merged)

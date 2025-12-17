@@ -9,15 +9,17 @@ pub const TARGET_SEGMENTS: usize = 10;
 pub mod decode;
 pub mod encode;
 pub mod pgbuffer;
+pub mod tombstone;
 pub mod wal;
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const ROOT_MAGIC: u32 = u32::from_ne_bytes(*b"pZKT");
 pub const BLOCK_MAGIC: u32 = u32::from_ne_bytes(*b"sZKT");
 pub const WAL_MAGIC: u32 = u32::from_ne_bytes(*b"wZKT");
 pub const WAL_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"WL");
 pub const POSTING_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"oZKT");
 pub const SEGMENT_LIST_MAGIC: u32 = u32::from_ne_bytes(*b"lZKT");
+pub const TOMBSTONE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"tZKT");
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
@@ -28,6 +30,8 @@ pub struct RootBlockList {
     pub num_segments: u32,
     pub segment_list_head: u32,
     pub segment_list_tail: u32,
+    pub tombstone_block: u32,
+    pub tombstone_bytes: u32,
     // Segments...
 }
 
@@ -76,6 +80,16 @@ impl TryFrom<pg_sys::ItemPointer> for ItemPointer {
             block_number: blk,
             offset: off,
         })
+    }
+}
+
+impl From<pg_sys::ItemPointerData> for ItemPointer {
+    fn from(value: pg_sys::ItemPointerData) -> Self {
+        let blk = ((value.ip_blkid.bi_hi as u32) << 16) | (value.ip_blkid.bi_lo as u32);
+        Self {
+            block_number: blk,
+            offset: value.ip_posid,
+        }
     }
 }
 
@@ -259,11 +273,16 @@ pub fn append_segments(
     if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
         let existing = segment_list_read(rel, rbl)
             .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+        let tombstones = tombstone::load_snapshot_for_root(rel, rbl).unwrap_or_else(|e| {
+            warning!("failed to load tombstones for merge: {e:#?}");
+            tombstone::Snapshot::default()
+        });
         let merged = merge(
             rel,
             &existing,
             COMPACT_TARGET_SEGMENTS,
             flush_threshold.saturating_mul(16).max(1024 * 1024),
+            &tombstones,
         )
         .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
         segment_list_rewrite(rel, rbl, &merged)
@@ -488,10 +507,14 @@ fn peek_next_trigram(cursors: &[SegmentCursor]) -> Option<u32> {
 fn merge_entry_postings(
     rel: pg_sys::Relation,
     entries: &[IndexEntry],
+    tombstones: &tombstone::Snapshot,
 ) -> Result<BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>>> {
     let mut docs: BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>> = BTreeMap::new();
     for entry in entries {
         for posting in unsafe { crate::storage::decode::decode_postings(rel, entry)? } {
+            if tombstones.contains(posting.tid) {
+                continue;
+            }
             let list = docs.entry(posting.tid).or_insert_with(Vec::new);
             for (position, flags) in posting.positions {
                 let mut occ = crate::trgm::Occurance(position);
@@ -522,6 +545,7 @@ pub fn merge(
     segments: &[Segment],
     target_segments: usize,
     flush_threshold: usize,
+    tombstones: &tombstone::Snapshot,
 ) -> Result<Vec<Segment>> {
     let target_segments = target_segments.max(1);
     if segments.len() <= target_segments {
@@ -567,7 +591,7 @@ pub fn merge(
                 cursor.advance();
             }
         }
-        let mut postings = merge_entry_postings(rel, &group_entries)?;
+        let mut postings = merge_entry_postings(rel, &group_entries, tombstones)?;
         for (doc, occs) in postings.iter_mut() {
             occs.sort_unstable_by_key(|occ| occ.position());
             collector.add_occurrences(trigram, *doc, occs);

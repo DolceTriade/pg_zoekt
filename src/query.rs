@@ -1,19 +1,34 @@
-use std::cmp::Ordering;
 use anyhow::Context;
 use pgrx::datum::FromDatum;
 use pgrx::prelude::*;
+use std::cmp::Ordering;
 
 type PostingCursor = crate::storage::decode::PostingCursor;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ScanState {
     matches: Vec<pg_sys::ItemPointerData>,
     cursor: usize,
     lossy: bool,
+    tombstones: crate::storage::tombstone::Snapshot,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self {
+            matches: Vec::new(),
+            cursor: 0,
+            lossy: false,
+            tombstones: crate::storage::tombstone::Snapshot::default(),
+        }
+    }
 }
 
 impl ScanState {
     fn push_match(&mut self, item: crate::storage::ItemPointer) {
+        if self.tombstones.contains(item) {
+            return;
+        }
         let mut tid = pg_sys::ItemPointerData::default();
         let blk = item.block_number;
         let blk_hi = (blk >> 16) as u16;
@@ -310,7 +325,11 @@ fn stream_segment_occurrences(
             .map(|e| e.frequency)
             .min()
             .unwrap_or(u32::MAX);
-        trgm_entries.push(TrgmWork { pat_idx: idx, entries, freq });
+        trgm_entries.push(TrgmWork {
+            pat_idx: idx,
+            entries,
+            freq,
+        });
     }
 
     trgm_entries.sort_by_key(|w| w.freq);
@@ -452,6 +471,11 @@ unsafe fn build_scan_state(
     if let Ok(index_segments) = unsafe { read_segments(index_relation) } {
         let mut state = ScanState::default();
         state.lossy = has_single_char_wildcard;
+        state.tombstones =
+            crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
+                warning!("failed to load tombstones: {e:#}");
+                crate::storage::tombstone::Snapshot::default()
+            });
 
         // Fast path: single literal segment with one trigram and anchored start (e.g. `xyz%`).
         if !leading_wildcard

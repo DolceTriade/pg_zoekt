@@ -136,7 +136,6 @@ impl PostingReader {
         self.page_free = header_copy.free as usize;
         Ok(())
     }
-
 }
 
 pub unsafe fn decode_postings(
