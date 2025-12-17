@@ -1,5 +1,6 @@
 use anyhow::Context;
 use pgrx::datum::FromDatum;
+use pgrx::list::PgList;
 use pgrx::prelude::*;
 use std::cmp::Ordering;
 
@@ -243,6 +244,12 @@ fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
         }
     }
     segments
+}
+
+fn pattern_has_trigram(pattern: &str) -> bool {
+    extract_pattern_segments(pattern)
+        .into_iter()
+        .any(|segment| !segment.trigrams.is_empty())
 }
 
 fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
@@ -680,6 +687,63 @@ pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
     }
 }
 
+unsafe fn const_pattern_from_op(op: *mut pg_sys::OpExpr) -> Option<String> {
+    if op.is_null() {
+        return None;
+    }
+    let args_ptr = unsafe { (*op).args };
+    if args_ptr.is_null() {
+        return None;
+    }
+    let args = unsafe { PgList::<pg_sys::Expr>::from_pg(args_ptr) };
+    let const_arg = args.get_ptr(1)?;
+    unsafe { const_text(const_arg) }
+}
+
+unsafe fn const_text(expr: *mut pg_sys::Expr) -> Option<String> {
+    if expr.is_null() {
+        return None;
+    }
+    let node = expr as *mut pg_sys::Node;
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_Const {
+        return None;
+    }
+    let cnst = expr as *mut pg_sys::Const;
+    if unsafe { (*cnst).constisnull } || unsafe { (*cnst).consttype } != pg_sys::TEXTOID {
+        return None;
+    }
+    unsafe { String::from_datum((*cnst).constvalue, false) }
+}
+
+unsafe fn index_path_constant_trigram(path: *mut pg_sys::IndexPath) -> Option<bool> {
+    if path.is_null() {
+        return None;
+    }
+    let clauses_ptr = unsafe { (*path).indexclauses };
+    if clauses_ptr.is_null() {
+        return None;
+    }
+    let clauses = unsafe { PgList::<pg_sys::RestrictInfo>::from_pg(clauses_ptr) };
+    let mut saw_constant = false;
+    for restrict_ptr in clauses.iter_ptr() {
+        if restrict_ptr.is_null() {
+            continue;
+        }
+        let clause = unsafe { (*restrict_ptr).clause } as *mut pg_sys::Node;
+        if clause.is_null() || unsafe { (*clause).type_ } != pg_sys::NodeTag::T_OpExpr {
+            continue;
+        }
+        let op = clause as *mut pg_sys::OpExpr;
+        if let Some(pattern) = unsafe { const_pattern_from_op(op) } {
+            saw_constant = true;
+            if pattern_has_trigram(&pattern) {
+                return Some(true);
+            }
+        }
+    }
+    if saw_constant { Some(false) } else { None }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C-unwind" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
@@ -704,6 +768,31 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         unsafe {
             *index_pages = pages;
         }
+    }
+
+    if let Some(false) = unsafe { index_path_constant_trigram(path) } {
+        let base_cost = (pages * tuples.max(1.0)).max(1.0) * 1000.0;
+        if !index_startup_cost.is_null() {
+            unsafe {
+                *index_startup_cost = base_cost;
+            }
+        }
+        if !index_total_cost.is_null() {
+            unsafe {
+                *index_total_cost = base_cost;
+            }
+        }
+        if !index_selectivity.is_null() {
+            unsafe {
+                *index_selectivity = 1.0;
+            }
+        }
+        if !index_correlation.is_null() {
+            unsafe {
+                *index_correlation = 0.0;
+            }
+        }
+        return;
     }
 
     // Assume moderately selective LIKE/regex predicates.

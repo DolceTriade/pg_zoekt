@@ -346,9 +346,7 @@ mod tests {
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()
         })?;
-        Spi::run(
-            "SELECT pg_zoekt_seal('idx_documents_text_zoekt'::regclass)",
-        )?;
+        Spi::run("SELECT pg_zoekt_seal('idx_documents_text_zoekt'::regclass)")?;
 
         explain_plan.iter().for_each(|s| info!("{}", s));
         // Intentional failure to force pgrx to print captured output during tests.
@@ -544,6 +542,38 @@ mod tests {
             Spi::get_one("SELECT count(*) FROM tombstone_docs WHERE text LIKE '%mee%';")?
                 .unwrap_or(0);
         assert_eq!(after, 2);
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_planner_avoids_index_without_trigram() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE planner_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO planner_docs (text)
+                 VALUES ('a'), ('ab'), ('abc'), ('abcd'), ('abcde')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_planner_docs_text_zoekt ON planner_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        Spi::run("SELECT pg_zoekt_seal('idx_planner_docs_text_zoekt'::regclass)")?;
+        let explain =
+            Spi::get_one::<String>("EXPLAIN SELECT text FROM planner_docs WHERE text LIKE 'ab%';")?
+                .unwrap_or_default();
+        assert!(
+            !explain.contains("zoekt"),
+            "planner unexpectedly chose pg_zoekt: {explain}"
+        );
         Ok(())
     }
 
