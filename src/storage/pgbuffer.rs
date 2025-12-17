@@ -69,10 +69,6 @@ impl BlockBuffer {
         unsafe { pg_sys::BufferGetBlockNumber(self.buffer) }
     }
 
-    pub fn page_header(&self) -> &'static pg_sys::PageHeaderData {
-        unsafe { &*(self.page as *const pg_sys::PageHeaderData) }
-    }
-
     pub fn as_struct<'a, T>(&'a self, offset: usize) -> anyhow::Result<&'a T>
     where
         T: TryFromBytes + KnownLayout + Immutable,
@@ -243,7 +239,7 @@ mod tests {
     use std::ffi::CString;
 
     use super::*;
-    use pgrx::prelude::*;
+    use pgrx::{spi, Spi};
 
     #[pg_test]
     pub fn test_sanity() -> spi::Result<()> {
@@ -255,15 +251,15 @@ mod tests {
 
         let table = "public.documents";
         let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
-        let mut blkno = 0;
-        {
+        let blkno = {
             let mut buff = BlockBuffer::allocate(relation.as_ptr());
-            blkno = buff.block_number();
+            let block = buff.block_number();
             let s = CString::new("hello").expect("string made");
             unsafe {
                 std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
             }
-        }
+            block
+        };
 
         {
             let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno);

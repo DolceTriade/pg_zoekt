@@ -106,13 +106,6 @@ mod implementation {
 
     // --- Optional callbacks -------------------------------------------------
 
-    unsafe extern "C-unwind" fn ambulkdelete(
-        _info: *mut pg_sys::IndexVacuumInfo,
-        _stats: *mut pg_sys::IndexBulkDeleteResult,
-    ) -> *mut pg_sys::IndexBulkDeleteResult {
-        not_implemented()
-    }
-
     unsafe extern "C-unwind" fn amoptions(
         _reloptions: pg_sys::Datum,
         _validate: bool,
@@ -132,7 +125,7 @@ mod implementation {
         let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"))?;
         let existing = crate::storage::segment_list_read(rel, rbl)?;
         if existing.is_empty() || existing.len() <= crate::storage::TARGET_SEGMENTS {
             return Ok(());
@@ -152,16 +145,16 @@ mod implementation {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
             let flush_threshold = crate::build::flush_threshold_bytes();
-            
+
             match crate::storage::wal::flush_pending(rel, 0) {
                 Ok(sealed) => {
-                     if !sealed.is_empty() {
-                         crate::storage::append_segments(rel, 0, &sealed, flush_threshold);
-                     }
+                    if !sealed.is_empty() {
+                        crate::storage::append_segments(rel, 0, &sealed, flush_threshold);
+                    }
                 }
                 Err(e) => warning!("failed to flush WAL: {e:#?}"),
             }
-            
+
             if let Err(e) = merge_segments(rel, flush_threshold) {
                 warning!("failed to merge segments: {e:#?}");
             }
@@ -246,6 +239,7 @@ mod implementation {
 }
 
 #[cfg(feature = "pg18")]
+#[allow(unused_imports)]
 pub use implementation::pg_zoekt_handler;
 
 #[cfg(any(test, feature = "pg_test"))]

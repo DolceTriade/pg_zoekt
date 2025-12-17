@@ -9,14 +9,6 @@ use anyhow::Context;
 pub struct CompactTrgm(pub u32);
 
 impl CompactTrgm {
-    pub fn is_lossy(&self) -> bool {
-        self.0 & 1_u32 << 31 != 0
-    }
-
-    pub fn case_bits(&self) -> u8 {
-        (self.0 >> 24 & 0b111) as u8
-    }
-
     pub fn flags(&self) -> u8 {
         (self.0 >> 24) as u8
     }
@@ -180,14 +172,6 @@ impl Occurance {
         self.0 & 0xffffff
     }
 
-    pub fn is_lossy(&self) -> bool {
-        self.0 & 1_u32 << 31 != 0
-    }
-
-    pub fn case_bits(&self) -> u8 {
-        (self.0 >> 24 & 0b111) as u8
-    }
-
     pub fn flags(&self) -> u8 {
         (self.0 >> 24) as u8
     }
@@ -332,32 +316,34 @@ mod test {
 
     #[test]
     pub fn test_compact() {
+        const LOSSY: u8 = 0x80;
+        const CASE_MASK: u8 = 0b111;
         _ = CompactTrgm::try_from("abcd").expect_err("Expected error");
         let a = CompactTrgm::try_from("abc").expect("not error");
         assert_eq!(a.0, 0x636261);
-        assert!(!a.is_lossy());
-        assert_eq!(a.case_bits(), 0);
+        assert_eq!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0);
         assert_eq!(a.trgm(), 0x636261);
         let a = CompactTrgm::try_from("Abc").expect("not error");
         assert_eq!(a.0, 0x1636261);
-        assert!(!a.is_lossy());
-        assert_eq!(a.case_bits(), 0b001);
+        assert_eq!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0b001);
         let a = CompactTrgm::try_from("aBc").expect("not error");
         assert_eq!(a.0, 0x2636261);
         assert_eq!(a.trgm(), 0x636261);
-        assert!(!a.is_lossy());
-        assert_eq!(a.case_bits(), 0b010);
+        assert_eq!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0b010);
         let a = CompactTrgm::try_from("abC").expect("not error");
         assert_eq!(a.0, 0x4636261);
-        assert!(!a.is_lossy());
-        assert_eq!(a.case_bits(), 0b100);
+        assert_eq!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0b100);
         let a = CompactTrgm::try_from("ABC").expect("not error");
         assert_eq!(a.0, 0x7636261);
-        assert!(!a.is_lossy());
-        assert_eq!(a.case_bits(), 0b111);
+        assert_eq!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0b111);
         let a = CompactTrgm::try_from("aβΒ").expect("not error");
-        assert!(a.is_lossy());
-        assert_eq!(a.case_bits(), 0b100);
+        assert_ne!(a.flags() & LOSSY, 0);
+        assert_eq!(a.flags() & CASE_MASK, 0b100);
         assert_eq!(a.0, 0x849f9f61);
     }
 }

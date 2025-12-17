@@ -442,11 +442,6 @@ impl StreamVByteEncoder {
         bytes_written
     }
 
-    /// Finish and return the underlying buffer
-    pub fn into_inner(self) -> Vec<u8> {
-        self.buffer
-    }
-
     pub fn append_into(&mut self, out: &mut Vec<u8>) {
         out.append(&mut self.buffer);
     }

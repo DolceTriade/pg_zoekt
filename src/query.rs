@@ -1,8 +1,6 @@
 use std::cmp::Ordering;
-use std::ffi::CStr;
-
 use anyhow::Context;
-use pgrx::datum::{DatumWithOid, FromDatum};
+use pgrx::datum::FromDatum;
 use pgrx::prelude::*;
 
 type PostingCursor = crate::storage::decode::PostingCursor;
@@ -15,12 +13,6 @@ struct ScanState {
 }
 
 impl ScanState {
-    fn reset(&mut self) {
-        self.matches.clear();
-        self.cursor = 0;
-        self.lossy = true;
-    }
-
     fn push_match(&mut self, item: crate::storage::ItemPointer) {
         let mut tid = pg_sys::ItemPointerData::default();
         let blk = item.block_number;
@@ -85,7 +77,7 @@ struct SegmentPattern {
 }
 
 pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
-    let mut root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0);
+    let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0);
     let rbl = root
         .as_struct::<crate::storage::RootBlockList>(0)
         .context("root header")?;
@@ -118,7 +110,7 @@ unsafe fn find_entry_for_trigram(
     let Some(leaf_block) = crate::storage::resolve_leaf_for_trigram(rel, block, trigram)? else {
         return Ok(None);
     };
-    let mut buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block);
+    let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block);
     let bh = buf
         .as_struct::<crate::storage::BlockHeader>(0)
         .context("block header")?;
@@ -141,41 +133,16 @@ unsafe fn find_entry_for_trigram(
     Ok(pos.map(|idx| slice[idx]))
 }
 
-fn relation_qualified_name(relid: pg_sys::Oid) -> Option<String> {
-    unsafe {
-        let relname_ptr = pg_sys::get_rel_name(relid);
-        if relname_ptr.is_null() {
-            return None;
-        }
-        let relname = CStr::from_ptr(relname_ptr).to_string_lossy();
-        let nsp = pg_sys::get_rel_namespace(relid);
-        let nspname_ptr = pg_sys::get_namespace_name(nsp);
-        let nspname = if nspname_ptr.is_null() {
-            None
-        } else {
-            Some(CStr::from_ptr(nspname_ptr).to_string_lossy().into_owned())
-        };
-        Some(match nspname {
-            Some(n) => format!(
-                "\"{}\".\"{}\"",
-                n.replace('"', "\"\""),
-                relname.replace('"', "\"\"")
-            ),
-            None => relname.into_owned(),
-        })
-    }
-}
-
 fn is_case_sensitive(keys: pg_sys::ScanKey) -> bool {
     if keys.is_null() {
         return true;
     }
     unsafe {
-        let strategy = (*keys).sk_strategy as u16;
-        matches!(
-            strategy,
-            crate::operators::STRATEGY_LIKE | crate::operators::STRATEGY_REGEX
-        )
+        match (*keys).sk_strategy as u16 {
+            crate::operators::STRATEGY_ILIKE | crate::operators::STRATEGY_IREGEX => false,
+            crate::operators::STRATEGY_LIKE | crate::operators::STRATEGY_REGEX => true,
+            _ => true,
+        }
     }
 }
 
@@ -296,7 +263,6 @@ fn stream_segment_occurrences(
 
     struct TrgmWork {
         pat_idx: usize,
-        pt: PatternTrgm,
         entries: Vec<crate::storage::IndexEntry>,
         freq: u32,
     }
@@ -344,12 +310,7 @@ fn stream_segment_occurrences(
             .map(|e| e.frequency)
             .min()
             .unwrap_or(u32::MAX);
-        trgm_entries.push(TrgmWork {
-            pat_idx: idx,
-            pt: pt.clone(),
-            entries,
-            freq,
-        });
+        trgm_entries.push(TrgmWork { pat_idx: idx, entries, freq });
     }
 
     trgm_entries.sort_by_key(|w| w.freq);
@@ -488,7 +449,7 @@ unsafe fn build_scan_state(
     }
     let (leading_wildcard, has_single_char_wildcard) = pattern_wildcard_info(&pattern_str);
 
-    if let Ok(index_segments) = read_segments(index_relation) {
+    if let Ok(index_segments) = unsafe { read_segments(index_relation) } {
         let mut state = ScanState::default();
         state.lossy = has_single_char_wildcard;
 
@@ -501,7 +462,7 @@ unsafe fn build_scan_state(
             let pt = &segments[0].trigrams[0];
             let entries = entry_for_trigram(index_relation, &index_segments, pt.trigram);
             for entry in &entries {
-                match PostingCursor::new(index_relation, entry) {
+                match unsafe { PostingCursor::new(index_relation, entry) } {
                     Ok(mut cur) => loop {
                         match cur.advance_check_position(pt.pos, pt.flags, case_sensitive) {
                             Ok(Some((tid, ok))) => {
@@ -588,14 +549,16 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     norderbys: std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
     let scan: *mut pg_sys::IndexScanDescData =
-        pg_sys::RelationGetIndexScan(index_relation, nkeys, norderbys);
+        unsafe { pg_sys::RelationGetIndexScan(index_relation, nkeys, norderbys) };
     if scan.is_null() {
         return std::ptr::null_mut();
     }
 
     // Keys arrive via amrescan; start with an empty state.
     let state = ScanState::default();
-    (*scan).opaque = Box::into_raw(Box::new(state)) as *mut std::ffi::c_void;
+    unsafe {
+        (*scan).opaque = Box::into_raw(Box::new(state)) as *mut std::ffi::c_void;
+    }
     scan
 }
 
@@ -609,15 +572,17 @@ pub unsafe extern "C-unwind" fn amrescan(
     if scan.is_null() {
         return;
     }
-    let state_ptr = (*scan).opaque as *mut ScanState;
-    let state_ref = if let Some(state) = state_ptr.as_mut() {
-        state
-    } else {
-        let boxed = Box::new(ScanState::default());
-        (*scan).opaque = Box::into_raw(boxed) as *mut _;
-        (*scan).opaque as *mut ScanState
+    let state_ref: &mut ScanState = unsafe {
+        let state_ptr = (*scan).opaque as *mut ScanState;
+        if let Some(state) = state_ptr.as_mut() {
+            state
+        } else {
+            let boxed = Box::new(ScanState::default());
+            (*scan).opaque = Box::into_raw(boxed) as *mut _;
+            &mut *((*scan).opaque as *mut ScanState)
+        }
     };
-    let new_state = build_scan_state((*scan).indexRelation, keys, nkeys);
+    let new_state = unsafe { build_scan_state((*scan).indexRelation, keys, nkeys) };
     *state_ref = new_state;
 }
 
@@ -628,13 +593,15 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if scan.is_null() {
         return false;
     }
-    let state_ptr = (*scan).opaque as *mut ScanState;
-    let Some(state) = state_ptr.as_mut() else {
+    let state_ptr = unsafe { (*scan).opaque as *mut ScanState };
+    let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return false;
     };
     if let Some(tid) = state.next() {
-        (*scan).xs_heaptid = tid;
-        (*scan).xs_recheck = state.lossy; // Only recheck when single-char wildcards made matching lossy.
+        unsafe {
+            (*scan).xs_heaptid = tid;
+            (*scan).xs_recheck = state.lossy; // Only recheck when single-char wildcards made matching lossy.
+        }
         true
     } else {
         false
@@ -648,25 +615,29 @@ pub unsafe extern "C-unwind" fn amgetbitmap(
     if scan.is_null() || tbm.is_null() {
         return 0;
     }
-    let state_ptr = (*scan).opaque as *mut ScanState;
-    let state_ref = if let Some(state) = state_ptr.as_mut() {
-        state
-    } else {
-        let mut fallback =
-            build_scan_state((*scan).indexRelation, (*scan).keyData, (*scan).numberOfKeys);
-        fallback.sort_dedup();
-        (*scan).opaque = Box::into_raw(Box::new(fallback)) as *mut std::ffi::c_void;
-        (*scan).opaque as *mut ScanState
+    let state_ref: *mut ScanState = unsafe {
+        let state_ptr = (*scan).opaque as *mut ScanState;
+        if let Some(state) = state_ptr.as_mut() {
+            state
+        } else {
+            let mut fallback =
+                build_scan_state((*scan).indexRelation, (*scan).keyData, (*scan).numberOfKeys);
+            fallback.sort_dedup();
+            (*scan).opaque = Box::into_raw(Box::new(fallback)) as *mut std::ffi::c_void;
+            (*scan).opaque as *mut ScanState
+        }
     };
-    let state = &mut *state_ref;
+    let state = unsafe { &mut *state_ref };
     let mut added = 0_i64;
     for chunk in state.matches.chunks(128) {
-        pg_sys::tbm_add_tuples(
-            tbm,
-            chunk.as_ptr() as pg_sys::ItemPointer,
-            chunk.len() as i32,
-            state.lossy,
-        );
+        unsafe {
+            pg_sys::tbm_add_tuples(
+                tbm,
+                chunk.as_ptr() as pg_sys::ItemPointer,
+                chunk.len() as i32,
+                state.lossy,
+            );
+        }
         added += chunk.len() as i64;
     }
     added
@@ -676,16 +647,18 @@ pub unsafe extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
     if scan.is_null() {
         return;
     }
-    let opaque = (*scan).opaque as *mut ScanState;
+    let opaque = unsafe { (*scan).opaque as *mut ScanState };
     if !opaque.is_null() {
-        _ = Box::from_raw(opaque);
-        (*scan).opaque = std::ptr::null_mut();
+        unsafe {
+            _ = Box::from_raw(opaque);
+            (*scan).opaque = std::ptr::null_mut();
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C-unwind" fn amcostestimate(
-    root: *mut pg_sys::PlannerInfo,
+    _root: *mut pg_sys::PlannerInfo,
     path: *mut pg_sys::IndexPath,
     loop_count: f64,
     index_startup_cost: *mut pg_sys::Cost,
@@ -695,7 +668,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     index_pages: *mut f64,
 ) {
     // Cost model that favors bitmap scans over plain index scans.
-    let indexinfo = path.as_ref().and_then(|p| unsafe { p.indexinfo.as_ref() });
+    let indexinfo = unsafe { path.as_ref() }.and_then(|p| unsafe { p.indexinfo.as_ref() });
 
     let pages = indexinfo.map(|i| i.pages as f64).unwrap_or(1000.0).max(1.0);
     let tuples = indexinfo

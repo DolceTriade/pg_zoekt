@@ -137,9 +137,6 @@ impl PostingReader {
         Ok(())
     }
 
-    fn into_buffer(self) -> BlockBuffer {
-        self.buf
-    }
 }
 
 pub unsafe fn decode_postings(
@@ -149,7 +146,7 @@ pub unsafe fn decode_postings(
     if entry.data_length == 0 {
         return Ok(Vec::new());
     }
-    let mut reader = PostingReader::new(rel, entry)?;
+    let mut reader = unsafe { PostingReader::new(rel, entry)? };
     let mut postings = Vec::new();
     while reader.has_remaining() {
         postings.append(&mut decode_chunk(&mut reader)?);
@@ -220,82 +217,6 @@ fn decode_chunk(reader: &mut PostingReader) -> anyhow::Result<Vec<DocPosting>> {
     Ok(postings)
 }
 
-/// Stream only TIDs from a posting list into `out`, skipping positional materialization.
-/// This is a fast path for simple patterns where we don't need positions/flags.
-pub unsafe fn stream_tids(
-    rel: pg_sys::Relation,
-    entry: &IndexEntry,
-    out: &mut Vec<ItemPointer>,
-) -> anyhow::Result<()> {
-    if entry.data_length == 0 {
-        return Ok(());
-    }
-    let mut reader = PostingReader::new(rel, entry)?;
-    while reader.has_remaining() {
-        let header_bytes = reader.take_slice(std::mem::size_of::<CompressedBlockHeader>())?;
-        let hdr = *CompressedBlockHeader::try_ref_from_bytes(header_bytes)
-            .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
-        let num_docs = hdr.num_docs as usize;
-
-        let blk_bytes = reader.take_slice(hdr.docs_blk_len as usize)?;
-        let mut blk_nums = vec![0u32; num_docs];
-        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
-            blk_bytes,
-            num_docs,
-            &mut blk_nums,
-        );
-        let blk_nums = blk_nums.into_iter().original().collect::<Vec<u32>>();
-
-        let off_bytes = reader.take_slice(hdr.docs_off_len as usize)?;
-        let mut offs = vec![0u32; num_docs];
-        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(off_bytes, num_docs, &mut offs);
-
-        let count_bytes = reader.take_slice(hdr.counts_len as usize)?;
-        let mut counts = vec![0u32; num_docs];
-        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
-            count_bytes,
-            num_docs,
-            &mut counts,
-        );
-
-        let pos_bytes = reader.take_slice(hdr.pos_len as usize)?;
-        let total_positions: usize = counts.iter().copied().map(|c| c as usize).sum();
-        let pos_bytes_static: &'static [u8] = std::mem::transmute(pos_bytes);
-        let mut pos_cursor =
-            stream_vbyte::decode::cursor::DecodeCursor::new(pos_bytes_static, total_positions);
-        let mut buf = vec![0u32; 128];
-        let mut buf_len = 0usize;
-        let mut buf_idx = 0usize;
-        let mut next_delta = || -> anyhow::Result<u32> {
-            if buf_idx >= buf_len {
-                let decoded = pos_cursor.decode_slice::<stream_vbyte::x86::Ssse3>(&mut buf[..]);
-                if decoded == 0 {
-                    anyhow::bail!("failed to decode positions");
-                }
-                buf_len = decoded;
-                buf_idx = 0;
-            }
-            let v = buf[buf_idx];
-            buf_idx += 1;
-            Ok(v)
-        };
-
-        for i in 0..num_docs {
-            let num_pos = counts[i] as usize;
-            for _ in 0..num_pos {
-                let _ = next_delta()?;
-            }
-            out.push(ItemPointer {
-                block_number: blk_nums[i],
-                offset: offs[i] as u16,
-            });
-        }
-
-        let _ = reader.take_slice(hdr.flags_len as usize)?;
-    }
-    Ok(())
-}
-
 impl PostingCursor {
     #[inline]
     fn decode_var_u64(buf: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
@@ -353,7 +274,7 @@ impl PostingCursor {
     /// Build a streaming cursor for a single index entry. The cursor keeps only the
     /// doc headers for the current compressed chunk in memory and streams positions as it advances.
     pub unsafe fn new(rel: pg_sys::Relation, entry: &IndexEntry) -> anyhow::Result<Self> {
-        let reader = PostingReader::new(rel, entry)?;
+        let reader = unsafe { PostingReader::new(rel, entry)? };
         let pos_cursor = stream_vbyte::decode::cursor::DecodeCursor::new(&[], 0);
         let flags = FlagsCursor {
             buf: &[],

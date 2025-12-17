@@ -6,7 +6,7 @@ use super::{
     WALEntry, WALHeader, WALTrigram, encode, pgbuffer::BlockBuffer,
 };
 use crate::trgm::{Collector, Occurance};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use pgrx::pg_sys;
 
 const PAGE_HEADER_SIZE: usize = std::mem::size_of::<WALBucket>();
@@ -64,9 +64,9 @@ pub fn append_document(
     }
     let wal_block = load_wal_block(rel, root_block)?;
     let writer = WalWriter::new(rel, wal_block, flush_threshold)?;
-    
+
     // Check global threshold (approximate)
-    let mut sealed = if writer.should_flush() {
+    let sealed = if writer.should_flush() {
         writer.flush_all()?
     } else {
         Vec::new()
@@ -97,9 +97,7 @@ struct WalWriter {
 impl WalWriter {
     fn new(rel: pg_sys::Relation, wal_block: u32, flush_threshold: usize) -> Result<Self> {
         let wal_page = BlockBuffer::acquire(rel, wal_block);
-        let header = wal_page
-            .as_struct::<WALHeader>(0)
-            .context("wal header")?;
+        let header = wal_page.as_struct::<WALHeader>(0).context("wal header")?;
         if header.magic != WAL_MAGIC {
             bail!("invalid WAL magic");
         }
@@ -121,12 +119,7 @@ impl WalWriter {
         header.bytes_used as usize >= self.flush_threshold
     }
 
-    fn append_trigram(
-        &self,
-        trigram: u32,
-        ctid: ItemPointer,
-        occs: &[Occurance],
-    ) -> Result<()> {
+    fn append_trigram(&self, trigram: u32, ctid: ItemPointer, occs: &[Occurance]) -> Result<()> {
         let needed = record_size(occs.len());
         if needed > page_capacity() {
             bail!(
@@ -142,9 +135,9 @@ impl WalWriter {
             let wal = wal_buf
                 .as_struct_mut::<WALHeader>(0)
                 .context("wal header")?;
-            
+
             let tail_blk = wal.tail_block;
-            
+
             if tail_blk == INVALID_BLOCK {
                 // Initialize first block
                 let new_block = self.allocate_page(&mut wal.free_head)?;
@@ -157,21 +150,19 @@ impl WalWriter {
             // Attempt to write to tail
             // We must release WAL header lock before acquiring tail page lock to avoid deadlocks?
             // Actually, usually we hold header lock if we are modifying the chain structure.
-            // But we want to allow concurrent writes if we had buckets. 
+            // But we want to allow concurrent writes if we had buckets.
             // Here, it's linear. Single mutex (WAL Header) is fine for simplicity and correctness.
             // However, strictly speaking, we should try to lock tail, check space, write.
-            
+
             // Optimization: Don't hold WAL header lock while writing data.
             // But we need to know `tail_block` hasn't changed.
             // Let's just hold the lock for now. It's "Staging", batch inserts are likely single-threaded per connection.
             // If parallel index build is used, we might need finer locking.
             // Given "Simple Linear Log", let's keep it simple.
-            
+
             let mut page = BlockBuffer::aquire_mut(self.rel, tail_blk);
             let free = {
-                let header = page
-                    .as_struct::<WALBucket>(0)
-                    .context("wal page header")?;
+                let header = page.as_struct::<WALBucket>(0).context("wal page header")?;
                 if header.magic != WAL_BUCKET_MAGIC {
                     bail!("corrupt WAL page");
                 }
@@ -182,10 +173,12 @@ impl WalWriter {
                 // Tail full. Allocate new.
                 drop(page);
                 let new_block = self.allocate_page(&mut wal.free_head)?;
-                
+
                 // Link old tail to new
                 let mut old_tail = BlockBuffer::aquire_mut(self.rel, tail_blk);
-                let old_header = old_tail.as_struct_mut::<WALBucket>(0).context("wal page header")?;
+                let old_header = old_tail
+                    .as_struct_mut::<WALBucket>(0)
+                    .context("wal page header")?;
                 old_header.next_block = new_block;
                 drop(old_tail);
 
@@ -202,7 +195,7 @@ impl WalWriter {
                 header.free = header.free.checked_sub(needed_u16).expect("underflow");
             }
             wal.bytes_used = wal.bytes_used.saturating_add(needed as u32);
-            
+
             return Ok(());
         }
     }
@@ -216,18 +209,16 @@ impl WalWriter {
     ) -> Result<()> {
         let payload_start = PAGE_HEADER_SIZE;
         let used = {
-            let header = page
-                .as_struct::<WALBucket>(0)
-                .context("wal page header")?;
+            let header = page.as_struct::<WALBucket>(0).context("wal page header")?;
             page_capacity().saturating_sub(header.free as usize)
         };
         let offset = payload_start + used;
         let bytes = page.as_mut();
         let total = record_size(occs.len());
-        
+
         // Safety check
         if offset + total > bytes.len() {
-             bail!("wal page write overflow");
+            bail!("wal page write overflow");
         }
 
         let record = &mut bytes[offset..offset + total];
@@ -260,7 +251,7 @@ impl WalWriter {
         let header = wal_buf
             .as_struct_mut::<WALHeader>(0)
             .context("wal header")?;
-        
+
         let head = header.head_block;
         if head == INVALID_BLOCK {
             return Ok(Vec::new());
@@ -270,10 +261,10 @@ impl WalWriter {
         header.head_block = INVALID_BLOCK;
         header.tail_block = INVALID_BLOCK;
         header.bytes_used = 0;
-        
-        // We will free blocks as we process them. 
+
+        // We will free blocks as we process them.
         // We need to keep track of the free list head inside the loop?
-        // Actually, we can just push them to a local list and then batch update free_head at the end 
+        // Actually, we can just push them to a local list and then batch update free_head at the end
         // OR just update it one by one (slow lock).
         // Let's hold the WAL header lock? No, decoding takes time.
         // We can temporarily detach the chain, process it, then re-acquire lock to free pages.
@@ -290,12 +281,10 @@ impl WalWriter {
             if (interrupt & 0x3ff) == 0 {
                 pg_sys::check_for_interrupts!();
             }
-            
+
             let page = BlockBuffer::acquire(self.rel, block); // Read lock enough? Yes.
             let (next, used) = {
-                let header = page
-                    .as_struct::<WALBucket>(0)
-                    .context("wal page header")?;
+                let header = page.as_struct::<WALBucket>(0).context("wal page header")?;
                 if header.magic != WAL_BUCKET_MAGIC {
                     bail!("corrupt WAL page during flush");
                 }
@@ -309,52 +298,64 @@ impl WalWriter {
 
             while offset < end {
                 if offset + WAL_TRIGRAM_SIZE > end {
-                     break; // Should error?
+                    break; // Should error?
                 }
                 let trig = read_struct::<WALTrigram>(&bytes[offset..offset + WAL_TRIGRAM_SIZE]);
                 offset += WAL_TRIGRAM_SIZE;
-                
+
                 // Assuming num_entries is 1 from our write path, but let's loop
                 for _ in 0..trig.num_entries {
-                     if offset + WAL_ENTRY_SIZE > end { break; }
-                     let entry = read_struct::<WALEntry>(&bytes[offset..offset + WAL_ENTRY_SIZE]);
-                     offset += WAL_ENTRY_SIZE;
-                     
-                     let positions = entry.num_positions as usize;
-                     let needed = positions * POSITION_SIZE;
-                     if offset + needed > end { break; }
-                     
-                     occ_buf.clear();
-                     occ_buf.reserve(positions);
-                     for chunk in bytes[offset..offset + needed].chunks_exact(POSITION_SIZE) {
-                         occ_buf.push(Occurance(u32::from_le_bytes(chunk.try_into().unwrap())));
-                     }
-                     collector.add_occurrences(trig.trigram, entry.ctid, &occ_buf);
-                     offset += needed;
+                    if offset + WAL_ENTRY_SIZE > end {
+                        break;
+                    }
+                    let entry = read_struct::<WALEntry>(&bytes[offset..offset + WAL_ENTRY_SIZE]);
+                    offset += WAL_ENTRY_SIZE;
+
+                    let positions = entry.num_positions as usize;
+                    let needed = positions * POSITION_SIZE;
+                    if offset + needed > end {
+                        break;
+                    }
+
+                    occ_buf.clear();
+                    occ_buf.reserve(positions);
+                    for chunk in bytes[offset..offset + needed].chunks_exact(POSITION_SIZE) {
+                        occ_buf.push(Occurance(u32::from_le_bytes(chunk.try_into().unwrap())));
+                    }
+                    collector.add_occurrences(trig.trigram, entry.ctid, &occ_buf);
+                    offset += needed;
                 }
             }
             drop(page);
             freed_pages.push(block);
-            
-            current_block = if next == INVALID_BLOCK { None } else { Some(next) };
+
+            current_block = if next == INVALID_BLOCK {
+                None
+            } else {
+                Some(next)
+            };
         }
 
         // Recycle pages
         let mut wal_buf = BlockBuffer::aquire_mut(self.rel, self.wal_block);
-        let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
-        
+        let wal = wal_buf
+            .as_struct_mut::<WALHeader>(0)
+            .context("wal header")?;
+
         for block in freed_pages {
-             // We need to write the "next" pointer of this block to point to current free_head
-             // then update free_head.
-             // This requires locking each page.
-             let mut page = BlockBuffer::aquire_mut(self.rel, block);
-             {
-                 let header = page.as_struct_mut::<WALBucket>(0).context("wal page header")?;
-                 header.magic = WAL_BUCKET_MAGIC;
-                 header.free = page_capacity() as u16;
-                 header.next_block = wal.free_head;
-             }
-             wal.free_head = block;
+            // We need to write the "next" pointer of this block to point to current free_head
+            // then update free_head.
+            // This requires locking each page.
+            let mut page = BlockBuffer::aquire_mut(self.rel, block);
+            {
+                let header = page
+                    .as_struct_mut::<WALBucket>(0)
+                    .context("wal page header")?;
+                header.magic = WAL_BUCKET_MAGIC;
+                header.free = page_capacity() as u16;
+                header.next_block = wal.free_head;
+            }
+            wal.free_head = block;
         }
 
         let trgms = collector.take_trgms();
@@ -373,17 +374,21 @@ impl WalWriter {
                 header.next_block
             };
             // Reset header
-            let header = page.as_struct_mut::<WALBucket>(0).context("wal page header")?;
+            let header = page
+                .as_struct_mut::<WALBucket>(0)
+                .context("wal page header")?;
             header.magic = WAL_BUCKET_MAGIC;
             header.free = page_capacity() as u16;
             header.next_block = INVALID_BLOCK;
-            
+
             *free_head = next;
             return Ok(block);
         }
-        
+
         let mut page = BlockBuffer::allocate(self.rel);
-        let header = page.as_struct_mut::<WALBucket>(0).context("wal page header")?;
+        let header = page
+            .as_struct_mut::<WALBucket>(0)
+            .context("wal page header")?;
         header.magic = WAL_BUCKET_MAGIC;
         header.free = page_capacity() as u16;
         header.next_block = INVALID_BLOCK;
