@@ -26,7 +26,7 @@ impl BuildCallbackState {
         let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);
         drop(trgms);
         match res {
-            Ok(mut segs) => {
+            Ok(segs) => {
                 let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
                 let rbl = root
                     .as_struct_mut::<crate::storage::RootBlockList>(0)
@@ -61,12 +61,23 @@ impl BuildCallbackState {
     }
 }
 
-fn maintenance_work_mem_bytes() -> usize {
+pub(crate) fn maintenance_work_mem_bytes() -> usize {
     let mut kb = unsafe { pg_sys::maintenance_work_mem as usize };
     if kb == 0 {
         kb = 64 * 1024;
     }
     kb * 1024
+}
+
+pub(crate) fn flush_threshold_bytes() -> usize {
+    let mem_bytes = maintenance_work_mem_bytes();
+    // Aim lower than `maintenance_work_mem` because our estimate is conservative and
+    // Rust allocations aren't accounted in Postgres' memory accounting.
+    let mut flush_threshold = mem_bytes.saturating_mul(7) / 10;
+    if flush_threshold == 0 {
+        flush_threshold = mem_bytes;
+    }
+    flush_threshold
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -149,18 +160,16 @@ pub extern "C-unwind" fn ambuild(
         rbl.wal_block = wal_buffer.block_number();
 
         let wal = wal_buffer
-            .as_struct_mut::<crate::storage::WALBuckets>(0)
+            .as_struct_mut::<crate::storage::WALHeader>(0)
             .expect("WAL should always be in bounds");
         wal.magic = crate::storage::WAL_MAGIC;
+        wal.bytes_used = 0;
+        wal.head_block = pg_sys::InvalidBlockNumber;
+        wal.tail_block = pg_sys::InvalidBlockNumber;
+        wal.free_head = pg_sys::InvalidBlockNumber;
         root_block
     };
-    let mem_bytes = maintenance_work_mem_bytes();
-    // Aim lower than `maintenance_work_mem` because our estimate is conservative and
-    // Rust allocations aren't accounted in Postgres' memory accounting.
-    let mut flush_threshold = mem_bytes.saturating_mul(7) / 10;
-    if flush_threshold == 0 {
-        flush_threshold = mem_bytes;
-    }
+    let flush_threshold = flush_threshold_bytes();
     let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
     let mut callback_state = BuildCallbackState {
         key_count,

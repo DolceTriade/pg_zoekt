@@ -54,6 +54,7 @@ pub struct RootBlockListV1 {
     IntoBytes,
     KnownLayout,
     Unaligned,
+    Immutable,
 )]
 #[repr(C, packed)]
 pub struct ItemPointer {
@@ -231,6 +232,45 @@ pub fn segment_list_rewrite(
     Ok(())
 }
 
+pub fn append_segments(
+    rel: pg_sys::Relation,
+    root_block: u32,
+    segs: &[Segment],
+    flush_threshold: usize,
+) {
+    if segs.is_empty() {
+        return;
+    }
+    let mut root = pgbuffer::BlockBuffer::aquire_mut(rel, root_block);
+    let rbl = root.as_struct_mut::<RootBlockList>(0).expect("root header");
+    let magic = rbl.magic;
+    let expected_magic = ROOT_MAGIC;
+    if magic != expected_magic {
+        error!(
+            "corrupt root page at block {} (bad magic {}, expected {})",
+            root_block, magic, expected_magic
+        );
+    }
+    segment_list_append(rel, rbl, segs)
+        .unwrap_or_else(|e| error!("failed to append segments: {e:#?}"));
+
+    const MAX_ACTIVE_SEGMENTS: u32 = 512;
+    const COMPACT_TARGET_SEGMENTS: usize = 64;
+    if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
+        let existing = segment_list_read(rel, rbl)
+            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+        let merged = merge(
+            rel,
+            &existing,
+            COMPACT_TARGET_SEGMENTS,
+            flush_threshold.saturating_mul(16).max(1024 * 1024),
+        )
+        .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
+        segment_list_rewrite(rel, rbl, &merged)
+            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    }
+}
+
 #[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct Segments {
@@ -277,29 +317,32 @@ pub struct IndexList {
     pub entries: [IndexEntry],
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
-#[repr(C, packed)]
-pub struct WALBuckets {
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct WALHeader {
     pub magic: u32,
-    pub buckets: [u32; 256],
+    pub bytes_used: u32,
+    pub head_block: u32,
+    pub tail_block: u32,
+    pub free_head: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout)]
-#[repr(C, packed)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
 pub struct WALBucket {
     pub magic: u16,
     pub free: u16,
     pub next_block: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout)]
-#[repr(C, packed)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
 pub struct WALTrigram {
     pub trigram: u32,
     pub num_entries: u32,
 }
 
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned)]
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
 #[repr(C, packed)]
 pub struct WALEntry {
     pub ctid: ItemPointer,
