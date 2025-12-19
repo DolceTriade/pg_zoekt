@@ -1,6 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use pgrx::prelude::*;
 
 use crate::storage::pgbuffer::BlockBuffer;
+
+mod parallel;
+
+static PARALLEL_BUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct BuildCallbackState {
@@ -137,6 +143,120 @@ unsafe extern "C-unwind" fn log_index_value_callback(
     }
 }
 
+fn run_serial_build(
+    heap_relation: pg_sys::Relation,
+    index_relation: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    flush_threshold: usize,
+) -> f64 {
+    let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
+    let mut callback_state = BuildCallbackState {
+        key_count,
+        seen: 0,
+        collector: crate::trgm::Collector::new(),
+        flush_threshold,
+    };
+    info!("Starting scan");
+    unsafe {
+        pg_sys::IndexBuildHeapScan(
+            heap_relation,
+            index_relation,
+            index_info,
+            Some(log_index_value_callback),
+            &mut callback_state,
+        );
+    }
+    callback_state.flush_segments(index_relation);
+    callback_state.seen as f64
+}
+
+fn finalize_segment_list(
+    index_relation: pg_sys::Relation,
+    root_block: u32,
+    flush_threshold: usize,
+) {
+    let mut root_buffer = BlockBuffer::aquire_mut(index_relation, root_block);
+    let rbl = root_buffer
+        .as_struct_mut::<crate::storage::RootBlockList>(0)
+        .expect("root header");
+    let existing = crate::storage::segment_list_read(index_relation, rbl)
+        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+    let total_size: u64 = existing.iter().map(|s| s.size).sum();
+    info!("Wrote {} segments ({} bytes)", existing.len(), total_size);
+    let tombstones = crate::storage::tombstone::Snapshot::default();
+    let merged = crate::storage::merge(
+        index_relation,
+        &existing,
+        crate::storage::TARGET_SEGMENTS,
+        flush_threshold,
+        &tombstones,
+    )
+    .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
+    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
+        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+}
+
+fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> Option<i32> {
+    if index_relation.is_null() {
+        return None;
+    }
+    let opts = unsafe { (*index_relation).rd_options as *const pg_sys::StdRdOptions };
+    if opts.is_null() {
+        return None;
+    }
+    let workers = unsafe { (*opts).parallel_workers };
+    if workers >= 0 {
+        Some(workers)
+    } else {
+        None
+    }
+}
+
+fn try_parallel_build(
+    heap_relation: pg_sys::Relation,
+    index_relation: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    root_block: u32,
+    flush_threshold: usize,
+) -> Option<f64> {
+    unsafe {
+        if (*index_info).ii_Concurrent {
+            return None;
+        }
+    }
+
+    let relopt = reloption_parallel_workers(index_relation);
+    let effective = relopt.unwrap_or_else(|| unsafe { (*index_info).ii_ParallelWorkers as i32 });
+    if effective <= 0 {
+        return None;
+    }
+
+    let original_workers = unsafe { (*index_info).ii_ParallelWorkers };
+    let clamped = effective.clamp(0, i32::MAX);
+    unsafe {
+        (*index_info).ii_ParallelWorkers = clamped;
+    }
+
+    let result = unsafe {
+        parallel::build_parallel(
+            heap_relation,
+            index_relation,
+            index_info,
+            root_block,
+            flush_threshold,
+        )
+    };
+
+    unsafe {
+        (*index_info).ii_ParallelWorkers = original_workers;
+    }
+
+    result.map(|count| {
+        PARALLEL_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+        count as f64
+    })
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn ambuild(
     heap_relation: pg_sys::Relation,
@@ -173,47 +293,26 @@ pub extern "C-unwind" fn ambuild(
         root_block
     };
     let flush_threshold = flush_threshold_bytes();
-    let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
-    let mut callback_state = BuildCallbackState {
-        key_count,
-        seen: 0,
-        collector: crate::trgm::Collector::new(),
-        flush_threshold,
-    };
-    info!("Starting scan");
-    unsafe {
-        pg_sys::IndexBuildHeapScan(
-            heap_relation,
-            index_relation,
-            index_info,
-            Some(log_index_value_callback),
-            &mut callback_state,
-        );
-    }
-
-    callback_state.flush_segments(index_relation);
-
-    // Final merge down to the target segment count and write back to the on-disk segment list.
-    let mut root_buffer = BlockBuffer::aquire_mut(index_relation, root_block);
-    let rbl = root_buffer
-        .as_struct_mut::<crate::storage::RootBlockList>(0)
-        .expect("root header");
-    let existing = crate::storage::segment_list_read(index_relation, rbl)
-        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-    let total_size: u64 = existing.iter().map(|s| s.size).sum();
-    info!("Wrote {} segments ({} bytes)", existing.len(), total_size);
-    let merged = crate::storage::merge(
+    let seen = try_parallel_build(
+        heap_relation,
         index_relation,
-        &existing,
-        crate::storage::TARGET_SEGMENTS,
-        callback_state.flush_threshold,
-        &crate::storage::tombstone::Snapshot::default(),
+        index_info,
+        root_block,
+        flush_threshold,
     )
-    .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
-    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
-        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    .unwrap_or_else(|| {
+        run_serial_build(heap_relation, index_relation, index_info, flush_threshold)
+    });
+
+    finalize_segment_list(index_relation, root_block, flush_threshold);
+
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
-    result.heap_tuples = callback_state.seen as f64;
-    result.index_tuples = callback_state.seen as f64;
+    result.heap_tuples = seen;
+    result.index_tuples = seen;
     result.into_pg()
+}
+
+#[pg_extern]
+fn pg_zoekt_parallel_builds() -> i64 {
+    PARALLEL_BUILD_COUNT.load(Ordering::Relaxed) as i64
 }

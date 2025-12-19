@@ -15,6 +15,24 @@ pub const SPECIAL_SIZE: usize = align_down(
     std::mem::size_of::<usize>(),
 );
 
+struct RelationExtensionLockGuard {
+    rel: pg_sys::Relation,
+    lockmode: pg_sys::LOCKMODE,
+}
+
+impl RelationExtensionLockGuard {
+    unsafe fn new(rel: pg_sys::Relation, lockmode: pg_sys::LOCKMODE) -> Self {
+        unsafe { pg_sys::LockRelationForExtension(rel, lockmode) };
+        Self { rel, lockmode }
+    }
+}
+
+impl Drop for RelationExtensionLockGuard {
+    fn drop(&mut self) {
+        unsafe { pg_sys::UnlockRelationForExtension(self.rel, self.lockmode) };
+    }
+}
+
 const fn align_down(val: usize, align: usize) -> usize {
     val & !(align - 1)
 }
@@ -48,7 +66,10 @@ impl BlockBuffer {
     }
 
     pub fn allocate(rel: pg_sys::Relation) -> Self {
+        let lock =
+            unsafe { RelationExtensionLockGuard::new(rel, pg_sys::ExclusiveLock as pg_sys::LOCKMODE) };
         let buffer = unsafe { pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber) };
+        drop(lock);
         unsafe {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
         }

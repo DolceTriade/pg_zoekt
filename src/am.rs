@@ -6,6 +6,8 @@ const AM_NAME: &str = "pg_zoekt";
 
 /// Helper to make the stubs noisy at runtime.
 pub fn not_implemented<T>() -> T {
+    let bt = std::backtrace::Backtrace::force_capture();
+    info!("{bt:?}");
     error!("index access method `{AM_NAME}` is not implemented yet")
 }
 
@@ -21,8 +23,36 @@ mod implementation {
 
     // --- Required callbacks -------------------------------------------------
 
-    unsafe extern "C-unwind" fn ambuildempty(_index_relation: pg_sys::Relation) {
-        not_implemented::<()>()
+    unsafe extern "C-unwind" fn ambuildempty(index_relation: pg_sys::Relation) {
+        let mut root_buffer = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
+        let root_block = root_buffer.block_number();
+        if root_block != 0 {
+            error!(
+                "expected root block 0 for empty index, got {}",
+                root_block
+            );
+        }
+        let rbl = root_buffer
+            .as_struct_mut::<crate::storage::RootBlockList>(0)
+            .expect("root header");
+        rbl.magic = crate::storage::ROOT_MAGIC;
+        rbl.version = crate::storage::VERSION;
+        rbl.num_segments = 0;
+        rbl.segment_list_head = pg_sys::InvalidBlockNumber;
+        rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_block = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_bytes = 0;
+
+        let mut wal_buffer = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
+        rbl.wal_block = wal_buffer.block_number();
+        let wal = wal_buffer
+            .as_struct_mut::<crate::storage::WALHeader>(0)
+            .expect("wal header");
+        wal.magic = crate::storage::WAL_MAGIC;
+        wal.bytes_used = 0;
+        wal.head_block = pg_sys::InvalidBlockNumber;
+        wal.tail_block = pg_sys::InvalidBlockNumber;
+        wal.free_head = pg_sys::InvalidBlockNumber;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -105,13 +135,14 @@ mod implementation {
     }
 
     // --- Optional callbacks -------------------------------------------------
-
+    #[pg_guard]
     unsafe extern "C-unwind" fn amoptions(
-        _reloptions: pg_sys::Datum,
-        _validate: bool,
+        reloptions: pg_sys::Datum,
+        validate: bool,
     ) -> *mut pg_sys::bytea {
-        info!("NOT IMPLEMENTED");
-        not_implemented()
+        unsafe {
+            pg_sys::default_reloptions(reloptions, validate, pg_sys::relopt_kind::RELOPT_KIND_HEAP)
+        }
     }
 
     unsafe extern "C-unwind" fn amvacuumcleanup(
@@ -216,7 +247,7 @@ mod implementation {
         routine.amclusterable = false;
         routine.ampredlocks = false;
         routine.amcanparallel = false;
-        routine.amcanbuildparallel = false;
+        routine.amcanbuildparallel = true;
         routine.amcaninclude = false;
         routine.amusemaintenanceworkmem = false;
         routine.amsummarizing = false;
@@ -307,6 +338,24 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_amoptions_accepts_vacuum_params() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE amopts_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX amopts_idx ON amopts_docs USING pg_zoekt (text) WITH (autovacuum_enabled = TRUE)",
+                None,
+                &[],
+            )?;
+            client.update("DROP TABLE amopts_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
     pub fn test_build() -> spi::Result<()> {
         let sql = "
             CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -329,7 +378,8 @@ mod tests {
             -- 3. Create the index
             -- CREATE INDEX idx_chunks_text_zoekt ON chunks USING pg_zoekt (text_content);
             -- CREATE INDEX idx_documents_text_trgm ON documents USING GIN (text gin_trgm_ops);
-            CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text);
+            SET log_error_verbosity = 'verbose';
+            CREATE INDEX idx_documents_text_zoekt ON documents USING pg_zoekt (text) WITH (autovacuum_enabled = TRUE);
         ";
         let explain_plan = Spi::connect_mut(|client| -> spi::Result<Vec<String>> {
             client.update(sql, None, &[])?;
@@ -574,6 +624,45 @@ mod tests {
             !explain.contains("zoekt"),
             "planner unexpectedly chose pg_zoekt: {explain}"
         );
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_parallel_build_reloption() -> spi::Result<()> {
+        let before = Spi::get_one::<i64>("SELECT pg_zoekt_parallel_builds()")?.unwrap_or(0);
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update("DROP TABLE IF EXISTS parallel_build_docs", None, &[])?;
+            client.update(
+                "CREATE TABLE parallel_build_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET max_parallel_maintenance_workers = 2", None, &[])?;
+            client.update(
+                "INSERT INTO parallel_build_docs (text) VALUES
+                 ('needle stays visible'),
+                 ('bourbon biscuits'),
+                 ('another needle is here')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_parallel_build_docs ON parallel_build_docs USING pg_zoekt (text) WITH (parallel_workers = 2)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        Spi::run("SET enable_seqscan = OFF")?;
+        let hits = Spi::get_one::<i64>(
+            "SELECT count(*) FROM parallel_build_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(hits, 2, "expected two rows containing needle");
+        Spi::run("RESET enable_seqscan")?;
+        let after = Spi::get_one::<i64>("SELECT pg_zoekt_parallel_builds()")?.unwrap_or(0);
+        assert_eq!(after, before + 1, "parallel build counter should increment");
+        Spi::run("DROP TABLE IF EXISTS parallel_build_docs")?;
         Ok(())
     }
 
