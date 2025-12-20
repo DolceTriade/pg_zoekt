@@ -92,6 +92,8 @@ struct SegmentPattern {
     trigrams: Vec<PatternTrgm>,
 }
 
+const LOSSY_FLAG: u8 = 0x80;
+
 pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
     let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0);
     let rbl = root
@@ -250,6 +252,12 @@ fn pattern_has_trigram(pattern: &str) -> bool {
     extract_pattern_segments(pattern)
         .into_iter()
         .any(|segment| !segment.trigrams.is_empty())
+}
+
+fn pattern_has_lossy_trigram(segments: &[SegmentPattern]) -> bool {
+    segments
+        .iter()
+        .any(|segment| segment.trigrams.iter().any(|pt| pt.flags & LOSSY_FLAG != 0))
 }
 
 fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
@@ -477,7 +485,7 @@ unsafe fn build_scan_state(
 
     if let Ok(index_segments) = unsafe { read_segments(index_relation) } {
         let mut state = ScanState::default();
-        state.lossy = has_single_char_wildcard;
+        state.lossy = has_single_char_wildcard || pattern_has_lossy_trigram(&segments);
         state.tombstones =
             crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
                 warning!("failed to load tombstones: {e:#}");

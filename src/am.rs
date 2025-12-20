@@ -743,4 +743,65 @@ mod tests {
             Ok(())
         })
     }
+
+    #[pg_test]
+    pub fn test_unicode_matches() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE unicode_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO unicode_docs (text) VALUES
+                 ('naïve café 東京 needle'),
+                 ('emoji 🦀 and ASCII tag'),
+                 ('plain ascii needle')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_unicode_docs_text_zoekt ON unicode_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+
+            let tokyo = client
+                .select(
+                    "SELECT count(*) FROM unicode_docs WHERE text LIKE '%東京 %'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(tokyo, 1, "expected 東京 match in unicode doc");
+
+            let cafe = client
+                .select(
+                    "SELECT count(*) FROM unicode_docs WHERE text LIKE '%café%'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(cafe, 1, "expected café match in unicode doc");
+
+            let needle = client
+                .select(
+                    "SELECT count(*) FROM unicode_docs WHERE text LIKE '%needle%'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(needle, 2, "expected ASCII match in unicode docs");
+
+            client.update("DROP TABLE unicode_docs", None, &[])?;
+            Ok(())
+        })
+    }
 }
