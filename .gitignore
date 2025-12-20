@@ -15,5 +15,4 @@ pg_trgm.txt
 pg_trgm/
 pgvectorscale/
 postgres/
-src/build/
 zoekt/
