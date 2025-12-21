@@ -1,5 +1,6 @@
 mod am;
 mod build;
+mod context;
 mod operators;
 mod query;
 mod storage;
