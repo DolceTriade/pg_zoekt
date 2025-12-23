@@ -408,7 +408,7 @@ impl SegmentCursor {
     }
 }
 
-fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<Vec<IndexEntry>> {
+pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<Vec<IndexEntry>> {
     let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
     let mut all_entries = Vec::new();
     for leaf_block in leaf_blocks {

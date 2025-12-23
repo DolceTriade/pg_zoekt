@@ -27,10 +27,7 @@ mod implementation {
         let mut root_buffer = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
         let root_block = root_buffer.block_number();
         if root_block != 0 {
-            error!(
-                "expected root block 0 for empty index, got {}",
-                root_block
-            );
+            error!("expected root block 0 for empty index, got {}", root_block);
         }
         let rbl = root_buffer
             .as_struct_mut::<crate::storage::RootBlockList>(0)
@@ -801,6 +798,70 @@ mod tests {
             assert_eq!(needle, 2, "expected ASCII match in unicode docs");
 
             client.update("DROP TABLE unicode_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
+    pub fn test_regex_matches() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE regex_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO regex_docs (text) VALUES
+                 ('foo 123 bar'),
+                 ('foobar'),
+                 ('FOO stuff BAR'),
+                 ('catfish'),
+                 ('dogfish'),
+                 ('nope')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_regex_docs_text_zoekt ON regex_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+
+            let count = client
+                .select(
+                    "SELECT count(*) FROM regex_docs WHERE text ~ 'foo.*bar'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(count, 2, "expected case-sensitive regex matches");
+
+            let count_ci = client
+                .select(
+                    "SELECT count(*) FROM regex_docs WHERE text ~* 'foo.*bar'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(count_ci, 3, "expected case-insensitive regex matches");
+
+            let count_alt = client
+                .select(
+                    "SELECT count(*) FROM regex_docs WHERE text ~ '(cat|dog)fish'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(count_alt, 2, "expected alternation regex matches");
+
+            client.update("DROP TABLE regex_docs", None, &[])?;
             Ok(())
         })
     }

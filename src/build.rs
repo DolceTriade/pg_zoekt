@@ -205,11 +205,7 @@ fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> Option<i32> {
         return None;
     }
     let workers = unsafe { (*opts).parallel_workers };
-    if workers >= 0 {
-        Some(workers)
-    } else {
-        None
-    }
+    if workers >= 0 { Some(workers) } else { None }
 }
 
 fn try_parallel_build(

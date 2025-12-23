@@ -108,17 +108,11 @@ mod tests {
             assert_eq!(results.len(), 2);
             assert_eq!(
                 results[0],
-                (
-                    2,
-                    "alpha\n<mark>needle</mark> here\nbeta".to_string()
-                )
+                (2, "alpha\n<mark>needle</mark> here\nbeta".to_string())
             );
             assert_eq!(
                 results[1],
-                (
-                    4,
-                    "beta\n<mark>needle</mark> again\nomega".to_string()
-                )
+                (4, "beta\n<mark>needle</mark> again\nomega".to_string())
             );
             Ok(())
         })

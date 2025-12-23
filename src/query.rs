@@ -164,6 +164,18 @@ fn is_case_sensitive(keys: pg_sys::ScanKey) -> bool {
     }
 }
 
+fn is_regex_strategy(keys: pg_sys::ScanKey) -> bool {
+    if keys.is_null() {
+        return false;
+    }
+    unsafe {
+        matches!(
+            (*keys).sk_strategy as u16,
+            crate::operators::STRATEGY_REGEX | crate::operators::STRATEGY_IREGEX
+        )
+    }
+}
+
 fn extract_literal_segments(pattern: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -194,6 +206,158 @@ fn extract_literal_segments(pattern: &str) -> Vec<String> {
         segments.push(current);
     }
     segments
+}
+
+fn has_short_literal_segment(pattern: &str) -> bool {
+    extract_literal_segments(pattern)
+        .into_iter()
+        .any(|seg| seg.chars().count() < 3)
+}
+
+fn quantifier_is_optional(spec: &str) -> bool {
+    let mut iter = spec.splitn(2, ',');
+    let min_str = iter.next().unwrap_or("");
+    let min = min_str.trim().parse::<u32>().ok();
+    match min {
+        Some(0) | None => true,
+        Some(_) => false,
+    }
+}
+
+fn regex_to_wildcard_pattern(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut current = String::new();
+    let mut chars = pattern.chars().peekable();
+
+    let flush_current = |out: &mut String, current: &mut String| {
+        if !current.is_empty() {
+            out.push_str(current);
+            current.clear();
+        }
+    };
+
+    let push_wildcard = |out: &mut String| {
+        if !out.ends_with('%') {
+            out.push('%');
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let Some(next) = chars.next() else {
+                    current.push('\\');
+                    break;
+                };
+                match next {
+                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                    | '\\' => {
+                        current.push(next);
+                    }
+                    'x' => {
+                        flush_current(&mut out, &mut current);
+                        push_wildcard(&mut out);
+                        for _ in 0..2 {
+                            if let Some(c) = chars.peek() {
+                                if c.is_ascii_hexdigit() {
+                                    _ = chars.next();
+                                }
+                            }
+                        }
+                    }
+                    'u' => {
+                        flush_current(&mut out, &mut current);
+                        push_wildcard(&mut out);
+                        if let Some('{') = chars.peek().copied() {
+                            _ = chars.next();
+                            while let Some(c) = chars.next() {
+                                if c == '}' {
+                                    break;
+                                }
+                            }
+                        } else {
+                            for _ in 0..4 {
+                                if let Some(c) = chars.peek() {
+                                    if c.is_ascii_hexdigit() {
+                                        _ = chars.next();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'b' | 'B' | 'A' | 'z' | 'Z' | 'p' | 'P'
+                    | 'Q' | 'E' | 'n' | 'r' | 't' | 'f' | 'v' => {
+                        flush_current(&mut out, &mut current);
+                        push_wildcard(&mut out);
+                    }
+                    c if c.is_ascii_digit() => {
+                        flush_current(&mut out, &mut current);
+                        push_wildcard(&mut out);
+                    }
+                    other => {
+                        current.push(other);
+                    }
+                }
+            }
+            '.' | '^' | '$' | '(' | ')' | '|' => {
+                flush_current(&mut out, &mut current);
+                push_wildcard(&mut out);
+            }
+            '[' => {
+                flush_current(&mut out, &mut current);
+                push_wildcard(&mut out);
+                let mut escaped = false;
+                while let Some(c) = chars.next() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if c == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if c == ']' {
+                        break;
+                    }
+                }
+            }
+            '*' | '?' => {
+                if !current.is_empty() {
+                    current.pop();
+                }
+                flush_current(&mut out, &mut current);
+                push_wildcard(&mut out);
+            }
+            '+' => {
+                flush_current(&mut out, &mut current);
+                push_wildcard(&mut out);
+            }
+            '{' => {
+                let mut spec = String::new();
+                let mut terminated = false;
+                while let Some(c) = chars.next() {
+                    if c == '}' {
+                        terminated = true;
+                        break;
+                    }
+                    spec.push(c);
+                }
+                if quantifier_is_optional(&spec) && !current.is_empty() {
+                    current.pop();
+                }
+                flush_current(&mut out, &mut current);
+                push_wildcard(&mut out);
+                if !terminated {
+                    break;
+                }
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        out.push_str(&current);
+    }
+    out
 }
 
 fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
@@ -250,6 +414,13 @@ fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
 
 fn pattern_has_trigram(pattern: &str) -> bool {
     extract_pattern_segments(pattern)
+        .into_iter()
+        .any(|segment| !segment.trigrams.is_empty())
+}
+
+fn regex_has_trigram(pattern: &str) -> bool {
+    let wildcard = regex_to_wildcard_pattern(pattern);
+    extract_pattern_segments(&wildcard)
         .into_iter()
         .any(|segment| !segment.trigrams.is_empty())
 }
@@ -477,20 +648,62 @@ unsafe fn build_scan_state(
     };
 
     let case_sensitive = is_case_sensitive(keys);
-    let segments = extract_pattern_segments(&pattern_str);
+    let is_regex = is_regex_strategy(keys);
+    let wildcard_pattern = if is_regex {
+        regex_to_wildcard_pattern(&pattern_str)
+    } else {
+        pattern_str.clone()
+    };
+    let segments = extract_pattern_segments(&wildcard_pattern);
     if segments.is_empty() {
+        if is_regex {
+            return build_full_regex_scan_state(index_relation);
+        }
         return ScanState::default();
     }
-    let (leading_wildcard, has_single_char_wildcard) = pattern_wildcard_info(&pattern_str);
+    let (leading_wildcard, has_single_char_wildcard) = if is_regex {
+        (true, true)
+    } else {
+        pattern_wildcard_info(&pattern_str)
+    };
 
     if let Ok(index_segments) = unsafe { read_segments(index_relation) } {
         let mut state = ScanState::default();
-        state.lossy = has_single_char_wildcard || pattern_has_lossy_trigram(&segments);
+        state.lossy = if is_regex {
+            true
+        } else {
+            has_single_char_wildcard
+                || pattern_has_lossy_trigram(&segments)
+                || has_short_literal_segment(&pattern_str)
+        };
         state.tombstones =
             crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
                 warning!("failed to load tombstones: {e:#}");
                 crate::storage::tombstone::Snapshot::default()
             });
+
+        if is_regex {
+            for seg_pattern in &segments {
+                match stream_segment_occurrences(
+                    index_relation,
+                    &index_segments,
+                    seg_pattern,
+                    case_sensitive,
+                ) {
+                    Ok(occs) => {
+                        for (tid, _) in occs {
+                            state.push_match(tid);
+                        }
+                    }
+                    Err(e) => {
+                        warning!("failed to stream segment postings: {e:#}");
+                        return state;
+                    }
+                }
+            }
+            state.sort_dedup();
+            return state;
+        }
 
         // Fast path: single literal segment with one trigram and anchored start (e.g. `xyz%`).
         if !leading_wildcard
@@ -582,6 +795,55 @@ unsafe fn build_scan_state(
     }
 }
 
+fn build_full_regex_scan_state(index_relation: pg_sys::Relation) -> ScanState {
+    let mut state = ScanState::default();
+    state.lossy = true;
+    state.tombstones =
+        crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
+            warning!("failed to load tombstones: {e:#}");
+            crate::storage::tombstone::Snapshot::default()
+        });
+
+    let Ok(index_segments) = (unsafe { read_segments(index_relation) }) else {
+        return state;
+    };
+
+    for seg in &index_segments {
+        let entries = match crate::storage::read_segment_entries(index_relation, seg) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warning!("failed to read segment entries: {e:#}");
+                continue;
+            }
+        };
+        for entry in &entries {
+            let mut cur = match unsafe { PostingCursor::new(index_relation, entry) } {
+                Ok(cur) => cur,
+                Err(e) => {
+                    warning!("failed to stream postings: {e:#}");
+                    continue;
+                }
+            };
+            loop {
+                match cur.advance() {
+                    Ok(true) => {
+                        if let Some(tid) = cur.current_tid() {
+                            state.push_match(tid);
+                        }
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        warning!("failed to stream postings: {e:#}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    state.sort_dedup();
+    state
+}
+
 pub unsafe extern "C-unwind" fn ambeginscan(
     index_relation: pg_sys::Relation,
     nkeys: std::os::raw::c_int,
@@ -639,7 +901,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if let Some(tid) = state.next() {
         unsafe {
             (*scan).xs_heaptid = tid;
-            (*scan).xs_recheck = state.lossy; // Only recheck when single-char wildcards made matching lossy.
+            (*scan).xs_recheck = state.lossy; // Recheck for regex and other lossy matches.
         }
         true
     } else {
@@ -744,12 +1006,30 @@ unsafe fn index_path_constant_trigram(path: *mut pg_sys::IndexPath) -> Option<bo
         let op = clause as *mut pg_sys::OpExpr;
         if let Some(pattern) = unsafe { const_pattern_from_op(op) } {
             saw_constant = true;
-            if pattern_has_trigram(&pattern) {
+            let has_trigram = if unsafe { op_is_regex(op) } {
+                regex_has_trigram(&pattern)
+            } else {
+                pattern_has_trigram(&pattern)
+            };
+            if has_trigram {
                 return Some(true);
             }
         }
     }
     if saw_constant { Some(false) } else { None }
+}
+
+unsafe fn op_is_regex(op: *mut pg_sys::OpExpr) -> bool {
+    if op.is_null() {
+        return false;
+    }
+    let opno = unsafe { (*op).opno };
+    let name = unsafe { pg_sys::get_opname(opno) };
+    if name.is_null() {
+        return false;
+    }
+    let cname = unsafe { std::ffi::CStr::from_ptr(name) };
+    matches!(cname.to_bytes(), b"~" | b"~*")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -873,5 +1153,30 @@ mod tests {
     fn test_extract_pattern_segments_too_short() {
         let segments = extract_pattern_segments("ab%cd");
         assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_has_short_literal_segment() {
+        assert!(has_short_literal_segment("a%shadow"));
+        assert!(has_short_literal_segment("ab%cd"));
+        assert!(!has_short_literal_segment("abc%def"));
+    }
+
+    #[test]
+    fn test_regex_to_wildcard_basic() {
+        let pat = regex_to_wildcard_pattern("foo.*bar");
+        assert_eq!(pat, "foo%bar");
+    }
+
+    #[test]
+    fn test_regex_to_wildcard_optional_quantifier() {
+        let pat = regex_to_wildcard_pattern("ab?c");
+        assert_eq!(pat, "a%c");
+    }
+
+    #[test]
+    fn test_regex_to_wildcard_char_class() {
+        let pat = regex_to_wildcard_pattern("[a-z]+_end");
+        assert_eq!(pat, "%_end");
     }
 }

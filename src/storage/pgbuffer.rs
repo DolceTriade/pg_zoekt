@@ -66,8 +66,9 @@ impl BlockBuffer {
     }
 
     pub fn allocate(rel: pg_sys::Relation) -> Self {
-        let lock =
-            unsafe { RelationExtensionLockGuard::new(rel, pg_sys::ExclusiveLock as pg_sys::LOCKMODE) };
+        let lock = unsafe {
+            RelationExtensionLockGuard::new(rel, pg_sys::ExclusiveLock as pg_sys::LOCKMODE)
+        };
         let buffer = unsafe { pg_sys::ReadBuffer(rel, pg_sys::InvalidBlockNumber) };
         drop(lock);
         unsafe {
