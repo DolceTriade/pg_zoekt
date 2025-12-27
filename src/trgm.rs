@@ -76,7 +76,8 @@ impl TryFrom<&str> for CompactTrgm {
                         .unwrap_or_else(|| {
                             let hashed =
                                 crc32fast::hash(chr.to_lowercase().to_string().as_bytes()) & 0xff;
-                            trgm | hashed << (idx * 8)
+                            let byte = if hashed == 0 { 1 } else { hashed };
+                            trgm | byte << (idx * 8)
                         }),
                     !chr.is_ascii() || lossy,
                 ))

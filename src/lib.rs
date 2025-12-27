@@ -1,8 +1,10 @@
 mod am;
 mod build;
 mod context;
+mod metrics;
 mod operators;
 mod query;
+mod seal;
 mod storage;
 mod trgm;
 

@@ -8,15 +8,16 @@ pub const TARGET_SEGMENTS: usize = 10;
 
 pub mod decode;
 pub mod encode;
+pub mod pending;
 pub mod pgbuffer;
 pub mod tombstone;
-pub mod wal;
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const ROOT_MAGIC: u32 = u32::from_ne_bytes(*b"pZKT");
 pub const BLOCK_MAGIC: u32 = u32::from_ne_bytes(*b"sZKT");
 pub const WAL_MAGIC: u32 = u32::from_ne_bytes(*b"wZKT");
-pub const WAL_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"WL");
+pub const PENDING_MAGIC: u32 = u32::from_ne_bytes(*b"pPLD");
+pub const PENDING_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"PL");
 pub const POSTING_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"oZKT");
 pub const SEGMENT_LIST_MAGIC: u32 = u32::from_ne_bytes(*b"lZKT");
 pub const TOMBSTONE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"tZKT");
@@ -32,6 +33,7 @@ pub struct RootBlockList {
     pub segment_list_tail: u32,
     pub tombstone_block: u32,
     pub tombstone_bytes: u32,
+    pub pending_block: u32,
     // Segments...
 }
 
@@ -246,50 +248,6 @@ pub fn segment_list_rewrite(
     Ok(())
 }
 
-pub fn append_segments(
-    rel: pg_sys::Relation,
-    root_block: u32,
-    segs: &[Segment],
-    flush_threshold: usize,
-) {
-    if segs.is_empty() {
-        return;
-    }
-    let mut root = pgbuffer::BlockBuffer::aquire_mut(rel, root_block);
-    let rbl = root.as_struct_mut::<RootBlockList>(0).expect("root header");
-    let magic = rbl.magic;
-    let expected_magic = ROOT_MAGIC;
-    if magic != expected_magic {
-        error!(
-            "corrupt root page at block {} (bad magic {}, expected {})",
-            root_block, magic, expected_magic
-        );
-    }
-    segment_list_append(rel, rbl, segs)
-        .unwrap_or_else(|e| error!("failed to append segments: {e:#?}"));
-
-    const MAX_ACTIVE_SEGMENTS: u32 = 512;
-    const COMPACT_TARGET_SEGMENTS: usize = 64;
-    if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-        let existing = segment_list_read(rel, rbl)
-            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-        let tombstones = tombstone::load_snapshot_for_root(rel, rbl).unwrap_or_else(|e| {
-            warning!("failed to load tombstones for merge: {e:#?}");
-            tombstone::Snapshot::default()
-        });
-        let merged = merge(
-            rel,
-            &existing,
-            COMPACT_TARGET_SEGMENTS,
-            flush_threshold.saturating_mul(16).max(1024 * 1024),
-            &tombstones,
-        )
-        .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-        segment_list_rewrite(rel, rbl, &merged)
-            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-    }
-}
-
 #[derive(TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct Segments {
@@ -344,28 +302,6 @@ pub struct WALHeader {
     pub head_block: u32,
     pub tail_block: u32,
     pub free_head: u32,
-}
-
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
-#[repr(C)]
-pub struct WALBucket {
-    pub magic: u16,
-    pub free: u16,
-    pub next_block: u32,
-}
-
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
-#[repr(C)]
-pub struct WALTrigram {
-    pub trigram: u32,
-    pub num_entries: u32,
-}
-
-#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
-#[repr(C, packed)]
-pub struct WALEntry {
-    pub ctid: ItemPointer,
-    pub num_positions: u32,
 }
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
