@@ -55,7 +55,12 @@ mod implementation {
         crate::storage::pending::init_pending(index_relation, pending_block_number)
             .unwrap_or_else(|e| error!("failed to init pending list: {e:#?}"));
 
-        let mut root_buffer = crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, 0);
+        let mut root_buffer = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, 0) {
+            Ok(root_buffer) => root_buffer,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
         let rbl = root_buffer
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");
@@ -136,7 +141,8 @@ mod implementation {
     }
 
     fn merge_segments(rel: pg_sys::Relation, flush_threshold: usize) -> AnyResult<()> {
-        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
+        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+            .map_err(|e| anyhow!("{e}"))?;
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
@@ -173,7 +179,12 @@ mod implementation {
         drop(trgms);
         match res {
             Ok(segs) => {
-                let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
+                let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0) {
+                    Ok(root) => root,
+                    Err(e) => {
+                        error!("failed to acquire root buffer: {e:#?}");
+                    }
+                };
                 let rbl = root
                     .as_struct_mut::<crate::storage::RootBlockList>(0)
                     .expect("root header");

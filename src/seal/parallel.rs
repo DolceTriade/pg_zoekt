@@ -212,7 +212,12 @@ pub(crate) unsafe fn seal_parallel(
             );
         }
 
-        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_rel, 0);
+        let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_rel, 0) {
+            Ok(root) => root,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");

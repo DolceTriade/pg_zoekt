@@ -42,7 +42,12 @@ fn flush_segments(
     drop(trgms);
     match res {
         Ok(segs) => {
-            let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0);
+            let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0) {
+                Ok(root) => root,
+                Err(e) => {
+                    error!("failed to acquire root buffer: {e:#?}");
+                }
+            };
             let rbl = root
                 .as_struct_mut::<crate::storage::RootBlockList>(0)
                 .expect("root header");
@@ -217,7 +222,12 @@ fn finalize_segment_list(
     root_block: u32,
     flush_threshold: usize,
 ) {
-    let mut root_buffer = BlockBuffer::aquire_mut(index_relation, root_block);
+    let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+        Ok(root_buffer) => root_buffer,
+        Err(e) => {
+            error!("failed to acquire root buffer: {e:#?}");
+        }
+    };
     let rbl = root_buffer
         .as_struct_mut::<crate::storage::RootBlockList>(0)
         .expect("root header");
@@ -347,7 +357,12 @@ pub extern "C-unwind" fn ambuild(
         .unwrap_or_else(|e| error!("failed to init pending list: {e:#?}"));
 
     {
-        let mut root_buffer = BlockBuffer::aquire_mut(index_relation, root_block);
+        let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+            Ok(root_buffer) => root_buffer,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
         let rbl = root_buffer
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");

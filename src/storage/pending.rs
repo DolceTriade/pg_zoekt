@@ -53,7 +53,7 @@ fn write_struct<T: Copy>(bytes: &mut [u8], value: T) {
 }
 
 pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
-    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block);
+    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -68,7 +68,7 @@ pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
 fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
     if *free_head != INVALID_BLOCK {
         let block = *free_head;
-        let mut page = BlockBuffer::aquire_mut(rel, block);
+        let mut page = BlockBuffer::aquire_mut(rel, block)?;
         let next = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -96,7 +96,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
 }
 
 fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
-    let mut root = BlockBuffer::aquire_mut(rel, root_block);
+    let mut root = BlockBuffer::aquire_mut(rel, root_block)?;
     let rbl = root
         .as_struct_mut::<RootBlockList>(0)
         .context("root header")?;
@@ -115,7 +115,7 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
 
 pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> Result<()> {
     let header_block = ensure_pending_list(rel, root_block)?;
-    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block);
+    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -136,7 +136,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         header.tail_block = new_block;
     }
 
-    let mut page = BlockBuffer::aquire_mut(rel, header.tail_block);
+    let mut page = BlockBuffer::aquire_mut(rel, header.tail_block)?;
     let free = {
         let header = page
             .as_struct::<PendingBucket>(0)
@@ -150,7 +150,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     if free < ENTRY_SIZE {
         drop(page);
         let new_block = allocate_page(rel, &mut header.free_head)?;
-        let mut old_tail = BlockBuffer::aquire_mut(rel, header.tail_block);
+        let mut old_tail = BlockBuffer::aquire_mut(rel, header.tail_block)?;
         let old_header = old_tail
             .as_struct_mut::<PendingBucket>(0)
             .context("pending page header")?;
@@ -158,7 +158,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         drop(old_tail);
 
         header.tail_block = new_block;
-        page = BlockBuffer::aquire_mut(rel, header.tail_block);
+        page = BlockBuffer::aquire_mut(rel, header.tail_block)?;
     }
 
     let used = {
@@ -187,7 +187,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
 
 pub fn detach_pending(rel: pg_sys::Relation, root_block: u32) -> Result<Option<u32>> {
     let header_block = ensure_pending_list(rel, root_block)?;
-    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block);
+    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -209,7 +209,7 @@ pub fn collect_blocks(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
     let mut blocks = Vec::new();
     let mut current_block = Some(head);
     while let Some(block) = current_block {
-        let page = BlockBuffer::acquire(rel, block);
+        let page = BlockBuffer::acquire(rel, block)?;
         let next = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -234,7 +234,7 @@ pub fn drain_block_entries<F>(rel: pg_sys::Relation, block: u32, mut on_tid: F) 
 where
     F: FnMut(ItemPointer),
 {
-    let page = BlockBuffer::acquire(rel, block);
+    let page = BlockBuffer::acquire(rel, block)?;
     let used = {
         let header = page
             .as_struct::<PendingBucket>(0)
@@ -270,7 +270,7 @@ where
     let mut count = 0usize;
 
     while let Some(block) = current_block {
-        let page = BlockBuffer::acquire(rel, block);
+        let page = BlockBuffer::acquire(rel, block)?;
         let (next, used) = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -305,15 +305,15 @@ where
 
     // Return pages to free list.
     if !freed_pages.is_empty() {
-        let root = BlockBuffer::acquire(rel, 0);
+        let root = BlockBuffer::acquire(rel, 0)?;
         let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
         if rbl.pending_block != INVALID_BLOCK {
-            let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block);
+            let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)?;
             let header = header_buf
                 .as_struct_mut::<PendingHeader>(0)
                 .context("pending header")?;
             for block in freed_pages {
-                let mut page = BlockBuffer::aquire_mut(rel, block);
+                let mut page = BlockBuffer::aquire_mut(rel, block)?;
                 let page_header = page
                     .as_struct_mut::<PendingBucket>(0)
                     .context("pending page header")?;
@@ -332,17 +332,17 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
     }
-    let root = BlockBuffer::acquire(rel, 0);
+    let root = BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.pending_block == INVALID_BLOCK {
         return Ok(());
     }
-    let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block);
+    let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
     for block in blocks {
-        let mut page = BlockBuffer::aquire_mut(rel, *block);
+        let mut page = BlockBuffer::aquire_mut(rel, *block)?;
         let page_header = page
             .as_struct_mut::<PendingBucket>(0)
             .context("pending page header")?;

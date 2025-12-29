@@ -151,7 +151,7 @@ pub fn segment_list_append(
 
     let mut remaining = segments;
     while !remaining.is_empty() {
-        let mut tail = pgbuffer::BlockBuffer::aquire_mut(rel, root.segment_list_tail);
+        let mut tail = pgbuffer::BlockBuffer::aquire_mut(rel, root.segment_list_tail)?;
         let (used, next_block) = {
             let hdr = tail
                 .as_struct_mut::<SegmentListPageHeader>(0)
@@ -218,7 +218,7 @@ pub fn segment_list_read(rel: pg_sys::Relation, root: &RootBlockList) -> Result<
     let mut out = Vec::with_capacity(root.num_segments as usize);
     let mut blk = root.segment_list_head;
     while blk != pg_sys::InvalidBlockNumber && out.len() < root.num_segments as usize {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, blk);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
         let hdr = buf
             .as_struct::<SegmentListPageHeader>(0)
             .context("segment list header")?;
@@ -348,7 +348,7 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
     let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
     let mut all_entries = Vec::new();
     for leaf_block in leaf_blocks {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic while merging");
@@ -374,7 +374,7 @@ pub fn resolve_leaf_for_trigram(
 ) -> Result<Option<u32>> {
     let mut block = root_block;
     loop {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic");
@@ -406,7 +406,7 @@ pub fn resolve_leaf_for_trigram(
 
 pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec<u32>> {
     fn collect(rel: pg_sys::Relation, block: u32, out: &mut Vec<u32>) -> Result<()> {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic");

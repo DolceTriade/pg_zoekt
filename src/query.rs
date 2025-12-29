@@ -95,7 +95,7 @@ struct SegmentPattern {
 const LOSSY_FLAG: u8 = 0x80;
 
 pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
-    let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0);
+    let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)?;
     let rbl = root
         .as_struct::<crate::storage::RootBlockList>(0)
         .context("root header")?;
@@ -128,7 +128,7 @@ unsafe fn find_entry_for_trigram(
     let Some(leaf_block) = crate::storage::resolve_leaf_for_trigram(rel, block, trigram)? else {
         return Ok(None);
     };
-    let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block);
+    let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
     let bh = buf
         .as_struct::<crate::storage::BlockHeader>(0)
         .context("block header")?;

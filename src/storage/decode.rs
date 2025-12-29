@@ -58,7 +58,18 @@ struct PostingReader {
 
 impl PostingReader {
     unsafe fn new(rel: pg_sys::Relation, entry: &IndexEntry) -> anyhow::Result<Self> {
-        let buf = BlockBuffer::acquire(rel, entry.block);
+        let (block, offset, data_length) = entry_fields(entry);
+        let nblocks = unsafe {
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+        };
+        if block == pg_sys::InvalidBlockNumber || block >= nblocks {
+            anyhow::bail!(
+                "posting block out of range: {} (nblocks={})",
+                block,
+                nblocks
+            );
+        }
+        let buf = BlockBuffer::acquire(rel, block)?;
         let header_copy = {
             let header = buf
                 .as_struct::<super::PostingPageHeader>(0)
@@ -68,7 +79,7 @@ impl PostingReader {
         if header_copy.magic != super::POSTING_PAGE_MAGIC {
             anyhow::bail!("invalid posting page magic");
         }
-        let start = entry.offset as usize;
+        let start = offset as usize;
         if start < header_copy.next_offset as usize || start > header_copy.free as usize {
             anyhow::bail!("offset out of bounds");
         }
@@ -78,7 +89,7 @@ impl PostingReader {
             header: header_copy,
             cursor: start,
             page_free: header_copy.free as usize,
-            remaining: entry.data_length as usize,
+            remaining: data_length as usize,
         })
     }
 
@@ -120,7 +131,17 @@ impl PostingReader {
         if next_block == pg_sys::InvalidBlockNumber {
             anyhow::bail!("posting chain truncated");
         }
-        let next_buf = BlockBuffer::acquire(self.rel, next_block);
+        let nblocks = unsafe {
+            pg_sys::RelationGetNumberOfBlocksInFork(self.rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+        };
+        if next_block >= nblocks {
+            anyhow::bail!(
+                "posting next block out of range: {} (nblocks={})",
+                next_block,
+                nblocks
+            );
+        }
+        let next_buf = BlockBuffer::acquire(self.rel, next_block)?;
         let header_copy = {
             let header = next_buf
                 .as_struct::<super::PostingPageHeader>(0)
@@ -135,6 +156,40 @@ impl PostingReader {
         self.cursor = header_copy.next_offset as usize;
         self.page_free = header_copy.free as usize;
         Ok(())
+    }
+}
+
+fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
+    let block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.block)) };
+    let offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.offset)) };
+    let data_length = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length)) };
+    (block, offset, data_length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entry_fields;
+    use crate::storage::IndexEntry;
+
+    #[test]
+    fn entry_fields_reads_unaligned() {
+        let entry = IndexEntry {
+            trigram: 0xdeadbeef,
+            block: 42,
+            offset: 17,
+            data_length: 99,
+            frequency: 0,
+        };
+        let mut buf = vec![0u8; std::mem::size_of::<IndexEntry>() + 1];
+        let ptr = unsafe { buf.as_mut_ptr().add(1) as *mut IndexEntry };
+        unsafe {
+            std::ptr::write_unaligned(ptr, entry);
+        }
+        let entry_ref = unsafe { &*ptr };
+        let (block, offset, data_length) = entry_fields(entry_ref);
+        assert_eq!(block, 42);
+        assert_eq!(offset, 17);
+        assert_eq!(data_length, 99);
     }
 }
 

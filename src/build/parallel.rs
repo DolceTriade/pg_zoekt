@@ -285,8 +285,15 @@ pub(super) unsafe fn build_parallel(
         }
 
         // Now append all collected segments to the main index at once
-        let mut root =
-            crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, root_block);
+        let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(
+            index_relation,
+            root_block,
+        ) {
+            Ok(root) => root,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");

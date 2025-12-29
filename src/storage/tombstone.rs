@@ -59,7 +59,7 @@ fn encode_tid(tid: ItemPointer) -> u64 {
 }
 
 pub fn load_snapshot(rel: pg_sys::Relation) -> Result<Snapshot> {
-    let root = BlockBuffer::acquire(rel, 0);
+    let root = BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     load_internal(rel, rbl)
 }
@@ -78,7 +78,7 @@ fn load_internal(rel: pg_sys::Relation, root: &RootBlockList) -> Result<Snapshot
     let mut bytes = Vec::with_capacity(remaining);
 
     while block != pg_sys::InvalidBlockNumber && remaining > 0 {
-        let page = BlockBuffer::acquire(rel, block);
+        let page = BlockBuffer::acquire(rel, block)?;
         let header = page
             .as_struct::<TombstonePageHeader>(0)
             .context("tombstone header")?;
@@ -112,7 +112,7 @@ pub fn apply_deletions<I>(rel: pg_sys::Relation, tids: I) -> Result<u64>
 where
     I: IntoIterator<Item = ItemPointer>,
 {
-    let mut root = BlockBuffer::aquire_mut(rel, 0);
+    let mut root = BlockBuffer::aquire_mut(rel, 0)?;
     let rbl = root
         .as_struct_mut::<RootBlockList>(0)
         .context("root header")?;
@@ -150,7 +150,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
         };
         let chunk_len = cursor.len().min(chunk_cap);
         {
-            let mut page = BlockBuffer::aquire_mut(rel, block);
+            let mut page = BlockBuffer::aquire_mut(rel, block)?;
             let header = page
                 .as_struct_mut::<TombstonePageHeader>(0)
                 .context("tombstone header")?;
@@ -170,7 +170,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
     }
 
     for window in used_blocks.windows(2) {
-        let mut page = BlockBuffer::aquire_mut(rel, window[0]);
+        let mut page = BlockBuffer::aquire_mut(rel, window[0])?;
         let header = page
             .as_struct_mut::<TombstonePageHeader>(0)
             .context("tombstone header")?;
@@ -189,7 +189,7 @@ fn collect_chain(rel: pg_sys::Relation, start: u32) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut block = start;
     while block != pg_sys::InvalidBlockNumber {
-        let page = BlockBuffer::acquire(rel, block);
+        let page = BlockBuffer::acquire(rel, block)?;
         let header = page
             .as_struct::<TombstonePageHeader>(0)
             .context("tombstone header")?;

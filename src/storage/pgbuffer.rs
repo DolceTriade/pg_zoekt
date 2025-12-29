@@ -1,4 +1,6 @@
+use anyhow::{anyhow, Result};
 use pgrx::prelude::*;
+use pgrx::pg_sys::PgTryBuilder;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 
 #[derive(Debug)]
@@ -6,6 +8,7 @@ pub struct BlockBuffer {
     buffer: pg_sys::Buffer,
     page: pg_sys::Page,
     wal: Option<GenericWAL>,
+    locked: bool,
 }
 
 pub const SPECIAL_SIZE: usize = align_down(
@@ -37,32 +40,59 @@ const fn align_down(val: usize, align: usize) -> usize {
     val & !(align - 1)
 }
 
+fn ensure_block_in_range(rel: pg_sys::Relation, num: u32) -> Result<()> {
+    if rel.is_null() {
+        return Err(anyhow!("attempted to read buffer with null relation"));
+    }
+    if num == pg_sys::InvalidBlockNumber {
+        return Err(anyhow!("attempted to read invalid block number"));
+    }
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    if num >= nblocks {
+        return Err(anyhow!(
+            "block number out of range: {} (nblocks={})",
+            num,
+            nblocks
+        ));
+    }
+    Ok(())
+}
+
+fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
+    PgTryBuilder::new(|| Ok(unsafe { pg_sys::ReadBuffer(rel, num) }))
+        .catch_others(|_| Err(anyhow!("ReadBuffer failed for block {}", num)))
+        .catch_rust_panic(|_| Err(anyhow!("ReadBuffer panicked for block {}", num)))
+        .execute()
+}
+
 impl BlockBuffer {
-    pub fn acquire(rel: pg_sys::Relation, num: u32) -> Self {
-        let buffer = unsafe { pg_sys::ReadBuffer(rel, num) };
-        unsafe {
-            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
-        }
+    pub fn acquire(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+        ensure_block_in_range(rel, num)?;
+        let buffer = read_buffer(rel, num)?;
         let page = unsafe { pg_sys::BufferGetPage(buffer) };
-        Self {
+        Ok(Self {
             buffer,
             page,
             wal: None,
-        }
+            locked: false,
+        })
     }
 
-    pub fn aquire_mut(rel: pg_sys::Relation, num: u32) -> Self {
-        let buffer = unsafe { pg_sys::ReadBuffer(rel, num) };
+    pub fn aquire_mut(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+        ensure_block_in_range(rel, num)?;
+        let buffer = read_buffer(rel, num)?;
         unsafe {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
         }
         let wal = GenericWAL::new(rel);
         let page = wal.track(buffer, false);
-        Self {
+        Ok(Self {
             buffer,
             page,
             wal: Some(wal),
-        }
+            locked: true,
+        })
     }
 
     pub fn allocate(rel: pg_sys::Relation) -> Self {
@@ -84,6 +114,7 @@ impl BlockBuffer {
             buffer,
             page,
             wal: Some(wal),
+            locked: true,
         }
     }
 
@@ -186,6 +217,10 @@ impl BlockBuffer {
 
 impl Drop for BlockBuffer {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Postgres cleans up buffer pins/locks during ERROR handling; avoid double release.
+            return;
+        }
         // Ensure generic WAL finishes before we release the buffer.
         if self.wal.is_some() {
             _ = self.wal.take();
@@ -194,7 +229,13 @@ impl Drop for BlockBuffer {
             }
         }
         unsafe {
-            pg_sys::UnlockReleaseBuffer(self.buffer);
+            if pg_sys::BufferIsValid(self.buffer) {
+                if self.locked {
+                    pg_sys::UnlockReleaseBuffer(self.buffer);
+                } else {
+                    pg_sys::ReleaseBuffer(self.buffer);
+                }
+            }
         }
     }
 }
@@ -284,7 +325,7 @@ mod tests {
         };
 
         {
-            let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno);
+            let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
             let h = unsafe { CString::from_raw(buff.as_ptr_mut()) };
             info!("CString {h:?}");
             _ = h.into_raw();
