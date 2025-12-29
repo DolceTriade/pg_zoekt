@@ -333,4 +333,35 @@ mod tests {
 
         Ok(())
     }
+
+    #[pg_test]
+    pub fn test_acquire_does_not_hold_buffer_lock() -> spi::Result<()> {
+        let sql = "
+            CREATE TABLE lock_probe (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
+        ";
+        Spi::run(sql)?;
+
+        let table = "public.lock_probe";
+        let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
+        let blkno = {
+            let mut buff = BlockBuffer::allocate(relation.as_ptr());
+            let block = buff.block_number();
+            let s = CString::new("probe").expect("string made");
+            unsafe {
+                std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
+            }
+            block
+        };
+
+        let buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
+        let buffer_id = buff.buffer;
+        unsafe {
+            // If acquire left a share lock, conditional exclusive lock would fail.
+            assert!(pg_sys::ConditionalLockBuffer(buffer_id));
+            pg_sys::LockBuffer(buffer_id, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+        }
+        drop(buff);
+
+        Ok(())
+    }
 }
