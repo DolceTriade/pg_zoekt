@@ -14,6 +14,8 @@ struct BuildCallbackState {
     seen: u64,
     collector: crate::trgm::Collector,
     flush_threshold: usize,
+    log_counter: u64,
+    log_every: u64,
 }
 
 impl BuildCallbackState {
@@ -25,6 +27,16 @@ impl BuildCallbackState {
 
     fn flush_segments(&mut self, rel: pg_sys::Relation) {
         flush_segments(rel, &mut self.collector, self.flush_threshold);
+    }
+
+    fn log_status(&self, reason: &str) {
+        info!(
+            "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={}",
+            reason,
+            self.collector.memory_usage(),
+            self.flush_threshold,
+            self.seen
+        );
     }
 }
 
@@ -194,6 +206,10 @@ unsafe extern "C-unwind" fn log_index_value_callback(
         },
     ) {
         state.seen += 1;
+        state.log_counter = state.log_counter.wrapping_add(1);
+        if state.log_counter % state.log_every == 0 {
+            state.log_status("periodic");
+        }
         pg_sys::check_for_interrupts!();
         state.flush_if_needed(index);
     }
@@ -211,6 +227,8 @@ fn run_serial_build(
         seen: 0,
         collector: crate::trgm::Collector::new(),
         flush_threshold,
+        log_counter: 0,
+        log_every: 128,
     };
     info!("Starting scan");
     unsafe {
@@ -284,15 +302,18 @@ fn try_parallel_build(
 ) -> Option<f64> {
     unsafe {
         if (*index_info).ii_Concurrent {
+            info!("Parallel build disabled for concurrent index build");
             return None;
         }
     }
 
     let Some(relopt) = reloption_parallel_workers(index_relation) else {
+        info!("Parallel build disabled: no parallel_workers reloption");
         return None;
     };
     let effective = relopt;
     if effective <= 0 {
+        info!("Parallel build disabled: parallel_workers <= 0");
         return None;
     }
 
@@ -321,7 +342,12 @@ fn try_parallel_build(
         (*index_info).ii_ParallelWorkers = original_workers;
     }
 
-    result.map(|count| {
+    let Some(count) = result else {
+        info!("Parallel build not used; falling back to serial build");
+        return None;
+    };
+
+    Some({
         PARALLEL_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
         count as f64
     })

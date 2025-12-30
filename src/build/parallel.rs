@@ -252,6 +252,11 @@ pub(super) unsafe fn build_parallel(
         }
 
         pg_sys::LaunchParallelWorkers(pcxt);
+        info!(
+            "Launched {} parallel workers (requested {}).",
+            (*pcxt).nworkers_launched,
+            workers
+        );
         if (*pcxt).nworkers_launched == 0 {
             cleanup_parallel_context(pcxt, snapshot);
             return None;
@@ -418,6 +423,10 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
             .worker_slot
             .fetch_add(1, Ordering::Acquire)
     };
+    info!(
+        "pg_zoekt worker start: slot={} flush_threshold={} per_worker_budget={} global_budget={}",
+        slot, params.flush_threshold, params.per_worker_budget, params.global_budget
+    );
     let file_name = spill_file_name(slot);
 
     // Create the spill file using the local copy
@@ -489,6 +498,8 @@ struct SpillState {
     index_relation: pg_sys::Relation,
     file: *mut pg_sys::BufFile,
     budget: BudgetTracker,
+    log_counter: u64,
+    log_every: u64,
     // Keep the local fileset alive as long as the file is open
     _fileset: SharedFileSetComplete,
 }
@@ -566,6 +577,13 @@ impl BudgetTracker {
             }
         }
     }
+
+    fn current_global_used(&self) -> usize {
+        if self.global_used.is_null() {
+            return 0;
+        }
+        unsafe { (*self.global_used).load(Ordering::Acquire) }
+    }
 }
 
 impl SpillState {
@@ -587,27 +605,44 @@ impl SpillState {
             index_relation,
             file,
             budget: BudgetTracker::new(global_used, global_budget, per_worker_budget),
+            log_counter: 0,
+            log_every: 64,
             _fileset: fileset,
         }
     }
 
     fn flush_if_needed(&mut self) {
         let current = self.collector.memory_usage();
+        self.log_counter = self.log_counter.wrapping_add(1);
+        if self.log_counter % self.log_every == 0 {
+            self.log_status("periodic", current);
+        }
         if current >= self.flush_threshold {
+            self.log_status("threshold", current);
             self.flush();
             return;
         }
         if !self.budget.update(current) {
+            self.log_status("budget", current);
             self.flush();
         }
     }
 
     fn flush(&mut self) {
+        let current = self.collector.memory_usage();
         let trgms = self.collector.take_trgms();
         self.budget.release_all();
         if trgms.is_empty() {
             return;
         }
+        info!(
+            "pg_zoekt build flush: mem_bytes={} trgms={} global_used={} per_worker_budget={} global_budget={}",
+            current,
+            trgms.len(),
+            self.budget.current_global_used(),
+            self.budget.local_budget,
+            self.budget.global_budget
+        );
 
         // Write the actual data pages to the index relation
         let segments = crate::storage::encode::Encoder::encode_trgms(self.index_relation, &trgms)
@@ -615,6 +650,19 @@ impl SpillState {
 
         // Write the segment metadata to the spill file so the leader can find them
         write_segment_batch(self.file, &segments);
+    }
+
+    fn log_status(&self, reason: &str, current: usize) {
+        info!(
+            "pg_zoekt build mem: reason={} mem_bytes={} flush_threshold={} per_worker_budget={} global_used={} global_budget={} accounted={}",
+            reason,
+            current,
+            self.flush_threshold,
+            self.budget.local_budget,
+            self.budget.current_global_used(),
+            self.budget.global_budget,
+            self.budget.accounted
+        );
     }
 }
 
