@@ -120,6 +120,13 @@ mod implementation {
         _info: *mut pg_sys::IndexVacuumInfo,
         stats: *mut pg_sys::IndexBulkDeleteResult,
     ) -> *mut pg_sys::IndexBulkDeleteResult {
+        if !_info.is_null() {
+            let index_rel = unsafe { (*_info).index };
+            if !index_rel.is_null() {
+                let index_oid = unsafe { (*index_rel).rd_id };
+                pg_zoekt_seal(index_oid);
+            }
+        }
         if !stats.is_null() {
             return stats;
         }

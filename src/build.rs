@@ -33,10 +33,16 @@ fn flush_segments(
     collector: &mut crate::trgm::Collector,
     flush_threshold: usize,
 ) {
+    let collector_bytes = collector.memory_usage();
     let trgms = collector.take_trgms();
     if trgms.is_empty() {
         return;
     }
+    info!(
+        "flush_segments: collector_bytes={} flush_threshold={}",
+        collector_bytes,
+        flush_threshold
+    );
     // Ensure large temporary maps are dropped promptly after encoding.
     let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);
     drop(trgms);
@@ -234,7 +240,13 @@ fn finalize_segment_list(
     let existing = crate::storage::segment_list_read(index_relation, rbl)
         .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
     let total_size: u64 = existing.iter().map(|s| s.size).sum();
-    info!("Wrote {} segments ({} bytes)", existing.len(), total_size);
+    info!(
+        "Wrote {} segments ({} bytes), flush_threshold={}, target_segments={}",
+        existing.len(),
+        total_size,
+        flush_threshold,
+        crate::storage::TARGET_SEGMENTS
+    );
     let tombstones = crate::storage::tombstone::Snapshot::default();
     let merged = crate::storage::merge(
         index_relation,

@@ -494,6 +494,14 @@ pub fn merge(
         .sum::<u64>()
         .min(usize::MAX as u64) as usize;
     let per_segment_target = std::cmp::max(1usize, total_bytes / target_segments);
+    info!(
+        "merge: segments={} target_segments={} total_bytes={} per_segment_target={} flush_threshold={}",
+        segments.len(),
+        target_segments,
+        total_bytes,
+        per_segment_target,
+        flush_threshold
+    );
 
     let mut cursors = Vec::new();
     for segment in segments {
@@ -511,6 +519,7 @@ pub fn merge(
     let mut bytes_since_flush = 0usize;
     let mut result = Vec::new();
     let mut interrupt_counter: u32 = 0;
+    let mut flush_count: u64 = 0;
 
     while let Some(trigram) = peek_next_trigram(&cursors) {
         interrupt_counter = interrupt_counter.wrapping_add(1);
@@ -538,7 +547,18 @@ pub fn merge(
             .map(|entry| entry.data_length as usize)
             .sum::<usize>();
         if collector.memory_usage() >= flush_threshold || bytes_since_flush >= per_segment_target {
+            let collector_bytes = collector.memory_usage();
             flush_collector(rel, &mut collector, &mut result)?;
+            flush_count = flush_count.saturating_add(1);
+            if (flush_count & 0x3f) == 0 {
+                info!(
+                    "merge flush: count={} collector_bytes={} bytes_since_flush={} result_segments={}",
+                    flush_count,
+                    collector_bytes,
+                    bytes_since_flush,
+                    result.len()
+                );
+            }
             bytes_since_flush = 0;
         }
     }
