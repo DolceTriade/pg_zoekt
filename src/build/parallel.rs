@@ -21,6 +21,8 @@ struct ParallelSharedParams {
     is_concurrent: bool,
     worker_count: usize,
     flush_threshold: usize,
+    per_worker_budget: usize,
+    global_budget: usize,
 }
 
 /// Shared build state for parallel index builds.
@@ -28,6 +30,7 @@ struct ParallelSharedParams {
 struct ParallelBuildState {
     worker_slot: AtomicUsize,
     ntuples: AtomicUsize,
+    global_used_bytes: AtomicUsize,
 }
 
 /// Status data for parallel index builds, shared among all parallel workers.
@@ -144,9 +147,14 @@ pub(super) unsafe fn build_parallel(
     index_info: *mut pg_sys::IndexInfo,
     root_block: u32,
     flush_threshold: usize,
+    per_worker_budget: usize,
+    global_budget: usize,
 ) -> Option<usize> {
     let workers = unsafe { (*index_info).ii_ParallelWorkers as usize };
-    info!("Building with {workers} parallel workers.");
+    info!(
+        "Building with {workers} parallel workers (flush_threshold={}, per_worker_budget={}, global_budget={}).",
+        flush_threshold, per_worker_budget, global_budget
+    );
     if workers == 0 {
         return None;
     }
@@ -194,10 +202,13 @@ pub(super) unsafe fn build_parallel(
                 is_concurrent,
                 worker_count: workers,
                 flush_threshold,
+                per_worker_budget,
+                global_budget,
             },
             build_state: ParallelBuildState {
                 worker_slot: AtomicUsize::new(0),
                 ntuples: AtomicUsize::new(0),
+                global_used_bytes: AtomicUsize::new(0),
             },
         });
 
@@ -367,6 +378,9 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
     };
 
     let params = unsafe { (*parallel_shared).params };
+    let global_used = unsafe {
+        &(*parallel_shared).build_state.global_used_bytes as *const AtomicUsize as *mut AtomicUsize
+    };
 
     // Attach to the shared fileset to increment refcnt. This will also write
     // the 'segment' pointer into the shared struct.
@@ -424,6 +438,9 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
         indexrel,
         spill_file,
         local_fileset, // Pass the local copy to SpillState
+        global_used,
+        params.global_budget,
+        params.per_worker_budget,
     );
     unsafe {
         IndexBuildHeapScanParallel(
@@ -471,8 +488,84 @@ struct SpillState {
     flush_threshold: usize,
     index_relation: pg_sys::Relation,
     file: *mut pg_sys::BufFile,
+    budget: BudgetTracker,
     // Keep the local fileset alive as long as the file is open
     _fileset: SharedFileSetComplete,
+}
+
+const ACCOUNTING_OVERHEAD_NUM: usize = 3;
+const ACCOUNTING_OVERHEAD_DEN: usize = 2;
+
+fn accounted_bytes(raw: usize) -> usize {
+    raw.saturating_mul(ACCOUNTING_OVERHEAD_NUM) / ACCOUNTING_OVERHEAD_DEN
+}
+
+struct BudgetTracker {
+    global_used: *mut AtomicUsize,
+    global_budget: usize,
+    local_budget: usize,
+    accounted: usize,
+}
+
+impl BudgetTracker {
+    fn new(global_used: *mut AtomicUsize, global_budget: usize, local_budget: usize) -> Self {
+        Self {
+            global_used,
+            global_budget,
+            local_budget,
+            accounted: 0,
+        }
+    }
+
+    fn update(&mut self, raw_current: usize) -> bool {
+        let current = accounted_bytes(raw_current);
+        if current > self.local_budget {
+            return false;
+        }
+        if current <= self.accounted {
+            return true;
+        }
+        let delta = current - self.accounted;
+        if !self.try_reserve(delta) {
+            return false;
+        }
+        self.accounted = current;
+        true
+    }
+
+    fn release_all(&mut self) {
+        if self.accounted == 0 {
+            return;
+        }
+        if self.global_used.is_null() {
+            self.accounted = 0;
+            return;
+        }
+        unsafe {
+            (*self.global_used).fetch_sub(self.accounted, Ordering::AcqRel);
+        }
+        self.accounted = 0;
+    }
+
+    fn try_reserve(&self, delta: usize) -> bool {
+        if self.global_used.is_null() {
+            return true;
+        }
+        loop {
+            let current = unsafe { (*self.global_used).load(Ordering::Acquire) };
+            if current.saturating_add(delta) > self.global_budget {
+                return false;
+            }
+            let next = current.saturating_add(delta);
+            if unsafe {
+                (*self.global_used)
+                    .compare_exchange(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            } {
+                return true;
+            }
+        }
+    }
 }
 
 impl SpillState {
@@ -482,6 +575,9 @@ impl SpillState {
         index_relation: pg_sys::Relation,
         file: *mut pg_sys::BufFile,
         fileset: SharedFileSetComplete,
+        global_used: *mut AtomicUsize,
+        global_budget: usize,
+        per_worker_budget: usize,
     ) -> Self {
         Self {
             key_count,
@@ -490,18 +586,25 @@ impl SpillState {
             flush_threshold,
             index_relation,
             file,
+            budget: BudgetTracker::new(global_used, global_budget, per_worker_budget),
             _fileset: fileset,
         }
     }
 
     fn flush_if_needed(&mut self) {
-        if self.collector.memory_usage() >= self.flush_threshold {
+        let current = self.collector.memory_usage();
+        if current >= self.flush_threshold {
+            self.flush();
+            return;
+        }
+        if !self.budget.update(current) {
             self.flush();
         }
     }
 
     fn flush(&mut self) {
         let trgms = self.collector.take_trgms();
+        self.budget.release_all();
         if trgms.is_empty() {
             return;
         }

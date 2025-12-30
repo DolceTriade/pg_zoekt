@@ -92,15 +92,18 @@ pub(crate) fn maintenance_work_mem_bytes() -> usize {
     kb * 1024
 }
 
-pub(crate) fn flush_threshold_bytes() -> usize {
-    let mem_bytes = maintenance_work_mem_bytes();
-    // Aim lower than `maintenance_work_mem` because our estimate is conservative and
+pub(crate) fn flush_threshold_for_budget(budget_bytes: usize) -> usize {
+    // Aim lower than budget because our estimate is conservative and
     // Rust allocations aren't accounted in Postgres' memory accounting.
-    let mut flush_threshold = mem_bytes.saturating_mul(7) / 10;
+    let mut flush_threshold = budget_bytes.saturating_mul(7) / 10;
     if flush_threshold == 0 {
-        flush_threshold = mem_bytes;
+        flush_threshold = budget_bytes;
     }
     flush_threshold
+}
+
+pub(crate) fn flush_threshold_bytes() -> usize {
+    flush_threshold_for_budget(maintenance_work_mem_bytes())
 }
 
 pub(crate) fn collect_trigrams_from_values<F>(
@@ -277,7 +280,7 @@ fn try_parallel_build(
     index_relation: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
     root_block: u32,
-    flush_threshold: usize,
+    maintenance_budget_bytes: usize,
 ) -> Option<f64> {
     unsafe {
         if (*index_info).ii_Concurrent {
@@ -299,6 +302,9 @@ fn try_parallel_build(
         (*index_info).ii_ParallelWorkers = clamped;
     }
 
+    let workers = clamped.max(1) as usize;
+    let per_worker_budget = maintenance_budget_bytes.saturating_div(workers);
+    let flush_threshold = flush_threshold_for_budget(per_worker_budget);
     let result = unsafe {
         parallel::build_parallel(
             heap_relation,
@@ -306,6 +312,8 @@ fn try_parallel_build(
             index_info,
             root_block,
             flush_threshold,
+            per_worker_budget,
+            maintenance_budget_bytes,
         )
     };
 
@@ -382,15 +390,17 @@ pub extern "C-unwind" fn ambuild(
         rbl.pending_block = pending_block_number;
     }
     let flush_threshold = flush_threshold_bytes();
+    let maintenance_budget_bytes = maintenance_work_mem_bytes();
     let seen = try_parallel_build(
         heap_relation,
         index_relation,
         index_info,
         root_block,
-        flush_threshold,
+        maintenance_budget_bytes,
     )
     .unwrap_or_else(|| {
-        run_serial_build(heap_relation, index_relation, index_info, flush_threshold)
+        let serial_threshold = flush_threshold_for_budget(maintenance_budget_bytes);
+        run_serial_build(heap_relation, index_relation, index_info, serial_threshold)
     });
 
     finalize_segment_list(index_relation, root_block, flush_threshold);
