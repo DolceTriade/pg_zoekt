@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use pgrx::prelude::*;
 /// Storing stuff
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub const TARGET_SEGMENTS: usize = 10;
@@ -9,6 +10,7 @@ pub const TARGET_SEGMENTS: usize = 10;
 pub mod decode;
 pub mod encode;
 pub mod pending;
+mod parallel_merge;
 pub mod pgbuffer;
 pub mod tombstone;
 
@@ -365,12 +367,52 @@ pub fn merge_with_workers(
     tombstones: &tombstone::Snapshot,
     workers: usize,
 ) -> Result<Vec<Segment>> {
+    let workers = if workers == 0 {
+        reloption_parallel_workers(rel)
+    } else {
+        workers
+    };
     if workers <= 1 || segments.len() <= target_segments {
         return merge(rel, segments, target_segments, flush_threshold, tombstones);
     }
+    let mut current = segments.to_vec();
+    let mut rounds = 0usize;
+    while current.len() > target_segments {
+        let Some(interim) = (unsafe {
+            parallel_merge::merge_parallel(
+                rel,
+                &current,
+                target_segments,
+                flush_threshold,
+                tombstones.is_empty(),
+                workers,
+            )
+        }) else {
+            break;
+        };
+        rounds = rounds.saturating_add(1);
+        if interim.len() >= current.len() {
+            info!(
+                "merge_parallel: no progress (rounds={}, segments_before={}, segments_after={})",
+                rounds,
+                current.len(),
+                interim.len()
+            );
+            break;
+        }
+        current = interim;
+        if current.len() <= target_segments {
+            info!(
+                "merge_parallel: completed in {} rounds (segments={})",
+                rounds,
+                current.len()
+            );
+            return Ok(current);
+        }
+    }
     let group_count = workers.max(1);
     let mut groups: Vec<Vec<Segment>> = vec![Vec::new(); group_count];
-    for (idx, seg) in segments.iter().enumerate() {
+    for (idx, seg) in current.iter().enumerate() {
         groups[idx % group_count].push(*seg);
     }
     let mut interim = Vec::new();
@@ -385,6 +427,16 @@ pub fn merge_with_workers(
         return Ok(interim);
     }
     merge(rel, &interim, target_segments, flush_threshold, tombstones)
+}
+
+#[cfg(feature = "pg_test")]
+pub fn test_parallel_merge_reset() {
+    parallel_merge::test_parallel_merge_reset();
+}
+
+#[cfg(feature = "pg_test")]
+pub fn test_parallel_merge_count() -> usize {
+    parallel_merge::test_parallel_merge_count()
 }
 
 fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
@@ -868,13 +920,6 @@ pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec
     Ok(out)
 }
 
-fn peek_next_trigram(cursors: &[SegmentCursor]) -> Option<u32> {
-    cursors
-        .iter()
-        .filter_map(|c| c.current_entry().map(|entry| entry.trigram))
-        .min()
-}
-
 fn merge_entry_postings_stream(
     rel: pg_sys::Relation,
     entries: &[IndexEntry],
@@ -889,35 +934,41 @@ fn merge_entry_postings_stream(
         }
     }
 
-    while !cursors.is_empty() {
-        let mut min_tid: Option<ItemPointer> = None;
-        for cursor in cursors.iter() {
-            if let Some(tid) = cursor.current_tid() {
-                min_tid = Some(match min_tid {
-                    Some(cur) => cur.min(tid),
-                    None => tid,
-                });
-            }
+    let mut heap: BinaryHeap<Reverse<(ItemPointer, usize)>> = BinaryHeap::new();
+    for (idx, cursor) in cursors.iter().enumerate() {
+        if let Some(tid) = cursor.current_tid() {
+            heap.push(Reverse((tid, idx)));
         }
-        let Some(target) = min_tid else {
-            break;
-        };
+    }
+
+    let mut occs: Vec<crate::trgm::Occurance> = Vec::new();
+    let mut cursor_indices: Vec<usize> = Vec::new();
+    while let Some(Reverse((target, idx))) = heap.pop() {
+        cursor_indices.clear();
+        cursor_indices.push(idx);
+        while let Some(Reverse((next_tid, next_idx))) = heap.peek().cloned() {
+            if next_tid != target {
+                break;
+            }
+            heap.pop();
+            cursor_indices.push(next_idx);
+        }
 
         if tombstones.contains(target) {
-            for cursor in cursors.iter_mut() {
-                if cursor.current_tid() == Some(target) {
-                    cursor.advance()?;
+            for idx in cursor_indices.iter().copied() {
+                let cursor = &mut cursors[idx];
+                if cursor.advance()? {
+                    if let Some(next_tid) = cursor.current_tid() {
+                        heap.push(Reverse((next_tid, idx)));
+                    }
                 }
             }
-            cursors.retain(|c| c.current_tid().is_some());
             continue;
         }
 
-        let mut occs: Vec<crate::trgm::Occurance> = Vec::new();
-        for cursor in cursors.iter_mut() {
-            if cursor.current_tid() != Some(target) {
-                continue;
-            }
+        occs.clear();
+        for idx in cursor_indices.iter().copied() {
+            let cursor = &mut cursors[idx];
             if let Some(doc) = cursor.current() {
                 occs.reserve(doc.positions.len());
                 for (position, flags) in doc.positions.iter() {
@@ -926,9 +977,12 @@ fn merge_entry_postings_stream(
                     occs.push(occ);
                 }
             }
-            cursor.advance()?;
+            if cursor.advance()? {
+                if let Some(next_tid) = cursor.current_tid() {
+                    heap.push(Reverse((next_tid, idx)));
+                }
+            }
         }
-        cursors.retain(|c| c.current_tid().is_some());
 
         if !occs.is_empty() {
             occs.sort_unstable_by_key(|occ| occ.position());
@@ -999,13 +1053,33 @@ pub fn merge(
     let mut interrupt_counter: u32 = 0;
     let mut flush_count: u64 = 0;
 
-    while let Some(trigram) = peek_next_trigram(&cursors) {
+    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+    for (idx, cursor) in cursors.iter().enumerate() {
+        if let Some(entry) = cursor.current_entry() {
+            heap.push(Reverse((entry.trigram, idx)));
+        }
+    }
+
+    let mut group_entries: Vec<IndexEntry> = Vec::new();
+    let mut cursor_indices: Vec<usize> = Vec::new();
+    while let Some(Reverse((trigram, idx))) = heap.pop() {
         interrupt_counter = interrupt_counter.wrapping_add(1);
         if (interrupt_counter & 0x3ff) == 0 {
             pg_sys::check_for_interrupts!();
         }
-        let mut group_entries = Vec::new();
-        for cursor in cursors.iter_mut() {
+        cursor_indices.clear();
+        cursor_indices.push(idx);
+        while let Some(Reverse((next_trigram, next_idx))) = heap.peek().cloned() {
+            if next_trigram != trigram {
+                break;
+            }
+            heap.pop();
+            cursor_indices.push(next_idx);
+        }
+
+        group_entries.clear();
+        for idx in cursor_indices.iter().copied() {
+            let cursor = &mut cursors[idx];
             while let Some(entry) = cursor.current_entry() {
                 if entry.trigram != trigram {
                     break;
@@ -1013,7 +1087,11 @@ pub fn merge(
                 group_entries.push(*entry);
                 cursor.advance();
             }
+            if let Some(entry) = cursor.current_entry() {
+                heap.push(Reverse((entry.trigram, idx)));
+            }
         }
+
         merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
             collector.add_occurrences(trigram, doc, occs);
             Ok(())

@@ -1,6 +1,7 @@
 mod am;
 mod build;
 mod context;
+mod introspect;
 mod metrics;
 mod operators;
 mod query;

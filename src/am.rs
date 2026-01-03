@@ -823,6 +823,135 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_merge_parallel_workers_used() -> spi::Result<()> {
+        let max_workers = Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+            .unwrap_or(0);
+        if max_workers <= 0 {
+            info!("skipping parallel merge test: max_parallel_workers=0");
+            return Ok(());
+        }
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE merge_parallel_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO merge_parallel_docs (text)
+                 SELECT repeat(md5(gs::text), 20) FROM generate_series(1, 4096) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_merge_parallel_docs_text_zoekt
+                 ON merge_parallel_docs USING pg_zoekt (text)
+                 WITH (parallel_workers = 2)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_merge_parallel_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            assert!(
+                segments.len() > 1,
+                "expected multiple segments before merge"
+            );
+            crate::storage::test_parallel_merge_reset();
+            let merged = crate::storage::merge_with_workers(
+                rel,
+                &segments,
+                1,
+                1024 * 1024 * 1024,
+                &crate::storage::tombstone::Snapshot::default(),
+                2,
+            )
+            .expect("merge failed");
+            assert_eq!(merged.len(), 1);
+            let count = crate::storage::test_parallel_merge_count();
+            assert!(count > 0, "expected parallel merge to run");
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
+        Spi::run("DROP TABLE IF EXISTS merge_parallel_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_introspection_helpers() -> spi::Result<()> {
+        use crate::trgm::CompactTrgm;
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE introspect_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO introspect_docs (text) VALUES ('abcd'), ('zzzz')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_introspect_docs_text_zoekt ON introspect_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_introspect_docs_text_zoekt'::regclass)")?;
+
+        let segment_idx = Spi::get_one::<i32>(
+            "SELECT segment_idx FROM pg_zoekt_index_segments('idx_introspect_docs_text_zoekt'::regclass) ORDER BY segment_idx LIMIT 1",
+        )?
+        .unwrap_or(0);
+        assert!(segment_idx > 0, "expected at least one segment");
+
+        let trigram = CompactTrgm::try_from("abc").expect("valid trigram").0 as i64;
+        let entry_count = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT count(*) FROM pg_zoekt_segment_entries('idx_introspect_docs_text_zoekt'::regclass, $1) WHERE trigram = $2",
+                None,
+                &[segment_idx.into(), trigram.into()],
+            )?;
+            let row = rows.next().expect("count row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+        assert!(entry_count > 0, "expected trigram entry");
+
+        let postings_count = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT count(*) FROM pg_zoekt_postings_preview('idx_introspect_docs_text_zoekt'::regclass, $1, $2, 10)",
+                None,
+                &[segment_idx.into(), trigram.into()],
+            )?;
+            let row = rows.next().expect("count row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+        assert!(postings_count > 0, "expected posting preview rows");
+
+        Spi::run("DROP TABLE IF EXISTS introspect_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_seal_does_not_include_late_inserts() -> spi::Result<()> {
         use crate::am::implementation::seal_serial;
 
