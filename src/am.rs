@@ -261,7 +261,7 @@ mod implementation {
         if workers >= 0 { Some(workers) } else { None }
     }
 
-    fn seal_serial(index: pg_sys::Oid, pending_head: u32) {
+    pub(super) fn seal_serial(index: pg_sys::Oid, pending_head: u32) {
         unsafe {
             info!(
                 "seal_serial: index_oid={} pending_head={}",
@@ -282,6 +282,7 @@ mod implementation {
             info!("seal_serial: snapshot registered");
 
             let mut seen = 0u64;
+            let mut requeued = 0u64;
             pg_sys::PushActiveSnapshot(snapshot);
             let res = crate::storage::pending::drain_detached(index_rel, pending_head, |tid| {
                 let mut item = pg_sys::ItemPointerData {
@@ -295,6 +296,37 @@ mod implementation {
                 let fetched =
                     pg_sys::table_tuple_fetch_row_version(heap_rel, tid_ptr, snapshot, slot);
                 if !fetched {
+                    let any_fetched = pg_sys::table_tuple_fetch_row_version(
+                        heap_rel,
+                        tid_ptr,
+                        &raw mut pg_sys::SnapshotAnyData,
+                        slot,
+                    );
+                    if any_fetched {
+                        let mut should_free = false;
+                        let htup = pg_sys::ExecFetchSlotHeapTuple(slot, true, &mut should_free);
+                        let mut should_requeue = false;
+                        if !htup.is_null() {
+                            let header = (*htup).t_data;
+                            if !header.is_null() {
+                                let xmin = pg_sys::htup::HeapTupleHeaderGetXmin(header);
+                                if pg_sys::TransactionIdIsInProgress(xmin)
+                                    || pg_sys::TransactionIdDidCommit(xmin)
+                                {
+                                    should_requeue = true;
+                                }
+                            }
+                        }
+                        if should_free && !htup.is_null() {
+                            pg_sys::heap_freetuple(htup);
+                        }
+                        if should_requeue {
+                            crate::storage::pending::append_tid(index_rel, 0, tid).unwrap_or_else(
+                                |err| error!("failed to requeue pending tid: {err:#?}"),
+                            );
+                            requeued = requeued.saturating_add(1);
+                        }
+                    }
                     pg_sys::ExecClearTuple(slot);
                     return;
                 }
@@ -346,7 +378,10 @@ mod implementation {
             pg_sys::FreeExecutorState(estate);
             pg_sys::relation_close(heap_rel, pg_sys::AccessShareLock as i32);
             pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
-            info!("sealed {} pending tuples", seen);
+            info!(
+                "sealed {} pending tuples (requeued {})",
+                seen, requeued
+            );
         }
     }
 
@@ -376,6 +411,7 @@ mod implementation {
             };
 
             let workers = reloption_parallel_workers(rel).unwrap_or(0).max(0) as usize;
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
 
             if workers > 0 {
                 let flush_threshold = crate::build::flush_threshold_bytes();
@@ -387,20 +423,47 @@ mod implementation {
                 ) {
                     info!("sealed {} pending tuples (parallel)", seen);
                     drop(lock);
-                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
                     return;
                 }
             }
 
             seal_serial(index, pending_head);
             drop(lock);
-            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
         }
     }
 
     #[pg_extern]
     fn pg_zoekt_seal(index: pg_sys::Oid) {
         seal_index(index, crate::storage::MaintenanceLockMode::Block);
+    }
+
+    #[cfg(feature = "pg_test")]
+    #[pg_extern]
+    fn pg_zoekt_test_seal_sleep(index: pg_sys::Oid, sleep_seconds: f64) {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
+            let pending_head = match crate::storage::pending::detach_pending(rel, 0) {
+                Ok(head) => head,
+                Err(e) => {
+                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+                    error!("failed to detach pending list: {e:#?}");
+                }
+            };
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+
+            let Some(pending_head) = pending_head else {
+                return;
+            };
+
+            if sleep_seconds > 0.0 {
+                let sql = format!("SELECT pg_sleep({})", sleep_seconds);
+                if let Err(e) = Spi::run(&sql) {
+                    error!("failed to sleep during test seal: {e:#?}");
+                }
+            }
+
+            seal_serial(index, pending_head);
+        }
     }
 
     #[pg_extern]
@@ -756,6 +819,84 @@ mod tests {
 
         Spi::run("RESET enable_seqscan")?;
         Spi::run("DROP TABLE IF EXISTS merge_stream_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_seal_does_not_include_late_inserts() -> spi::Result<()> {
+        use crate::am::implementation::seal_serial;
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE seal_late_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_seal_late_docs_text_zoekt ON seal_late_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO seal_late_docs (text) SELECT 'early-' || gs FROM generate_series(1, 100) gs",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_seal_late_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        let pending_head = unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::ShareUpdateExclusiveLock as i32);
+            let head = crate::storage::pending::detach_pending(rel, 0)
+                .expect("detach pending")
+                .expect("expected pending head");
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+            head
+        };
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "INSERT INTO seal_late_docs (text) SELECT 'late-' || gs FROM generate_series(1, 50) gs",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        seal_serial(index_oid, pending_head);
+
+        Spi::run("SET enable_seqscan = OFF")?;
+        let late_hits_before = Spi::get_one::<i64>(
+            "SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(
+            late_hits_before, 0,
+            "late inserts should not be indexed by the in-flight seal"
+        );
+
+        Spi::run("SELECT pg_zoekt_seal('idx_seal_late_docs_text_zoekt'::regclass)")?;
+
+        let late_hits_after = Spi::get_one::<i64>(
+            "SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(late_hits_after, 50, "late inserts should be indexed after next seal");
+
+        Spi::run("RESET enable_seqscan")?;
+        Spi::run("DROP TABLE IF EXISTS seal_late_docs")?;
         Ok(())
     }
 
