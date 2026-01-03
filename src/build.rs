@@ -16,6 +16,7 @@ struct BuildCallbackState {
     flush_threshold: usize,
     log_counter: u64,
     log_every: u64,
+    total_est_tuples: Option<u64>,
 }
 
 impl BuildCallbackState {
@@ -30,13 +31,25 @@ impl BuildCallbackState {
     }
 
     fn log_status(&self, reason: &str) {
-        info!(
-            "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={}",
-            reason,
-            self.collector.memory_usage(),
-            self.flush_threshold,
-            self.seen
-        );
+        if let Some(total) = self.total_est_tuples {
+            let pct = (self.seen as f64 / total.max(1) as f64) * 100.0;
+            info!(
+                "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={} progress_pct={:.1}",
+                reason,
+                self.collector.memory_usage(),
+                self.flush_threshold,
+                self.seen,
+                pct
+            );
+        } else {
+            info!(
+                "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={}",
+                reason,
+                self.collector.memory_usage(),
+                self.flush_threshold,
+                self.seen
+            );
+        }
     }
 }
 
@@ -76,23 +89,25 @@ fn flush_segments(
             const MAX_ACTIVE_SEGMENTS: u32 = 512;
             const COMPACT_TARGET_SEGMENTS: usize = 64;
             if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-                let existing = crate::storage::segment_list_read(rel, rbl)
-                    .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                let merged = crate::storage::merge(
-                    rel,
-                    &existing,
-                    COMPACT_TARGET_SEGMENTS,
-                    flush_threshold.saturating_mul(16).max(1024 * 1024),
-                    &crate::storage::tombstone::Snapshot::default(),
-                )
-                .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-                crate::storage::segment_list_rewrite(rel, rbl, &merged)
-                    .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-                if merged != existing {
-                    crate::storage::free_segments(rel, &existing)
-                        .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                    crate::storage::maybe_truncate_relation(rel, rbl, &merged)
-                        .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+                if let Some(_lock) = crate::storage::maintenance_lock_try(rel) {
+                    let existing = crate::storage::segment_list_read(rel, rbl)
+                        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+                    let merged = crate::storage::merge(
+                        rel,
+                        &existing,
+                        COMPACT_TARGET_SEGMENTS,
+                        flush_threshold.saturating_mul(16).max(1024 * 1024),
+                        &crate::storage::tombstone::Snapshot::default(),
+                    )
+                    .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
+                    crate::storage::segment_list_rewrite(rel, rbl, &merged)
+                        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+                    if merged != existing {
+                        crate::storage::free_segments(rel, &existing)
+                            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+                        crate::storage::maybe_truncate_relation(rel, rbl, &merged)
+                            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+                    }
                 }
             }
         }
@@ -227,6 +242,24 @@ fn run_serial_build(
     index_info: *mut pg_sys::IndexInfo,
     flush_threshold: usize,
 ) -> f64 {
+    let total_est_tuples = unsafe {
+        let mut pages: pg_sys::BlockNumber = 0;
+        let mut tuples: f64 = 0.0;
+        let mut allvisfrac: f64 = 0.0;
+        pg_sys::table_relation_estimate_size(
+            heap_relation,
+            std::ptr::null_mut(),
+            &mut pages,
+            &mut tuples,
+            &mut allvisfrac,
+        );
+        if tuples > 0.0 {
+            Some(tuples.max(0.0) as u64)
+        } else {
+            None
+        }
+    };
+
     let key_count = unsafe { (*index_info).ii_NumIndexAttrs as usize };
     let mut callback_state = BuildCallbackState {
         key_count,
@@ -234,7 +267,8 @@ fn run_serial_build(
         collector: crate::trgm::Collector::new(),
         flush_threshold,
         log_counter: 0,
-        log_every: 4096,
+        log_every: 32768,
+        total_est_tuples,
     };
     info!("Starting scan");
     unsafe {
@@ -275,21 +309,23 @@ fn finalize_segment_list(
         crate::storage::TARGET_SEGMENTS
     );
     let tombstones = crate::storage::tombstone::Snapshot::default();
-    let merged = crate::storage::merge(
-        index_relation,
-        &existing,
-        crate::storage::TARGET_SEGMENTS,
-        flush_threshold,
-        &tombstones,
-    )
-    .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
-    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
-        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-    if merged != existing {
-        crate::storage::free_segments(index_relation, &existing)
-            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-        crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
-            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+    if let Some(_lock) = crate::storage::maintenance_lock_try(index_relation) {
+        let merged = crate::storage::merge(
+            index_relation,
+            &existing,
+            crate::storage::TARGET_SEGMENTS,
+            flush_threshold,
+            &tombstones,
+        )
+        .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
+        crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
+            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+        if merged != existing {
+            crate::storage::free_segments(index_relation, &existing)
+                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+            crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
+                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+        }
     }
 }
 

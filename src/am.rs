@@ -124,7 +124,7 @@ mod implementation {
             let index_rel = unsafe { (*_info).index };
             if !index_rel.is_null() {
                 let index_oid = unsafe { (*index_rel).rd_id };
-                pg_zoekt_seal(index_oid);
+                seal_index(index_oid, crate::storage::MaintenanceLockMode::Try);
             }
         }
         if !stats.is_null() {
@@ -147,7 +147,18 @@ mod implementation {
         stats.into_pg()
     }
 
-    fn merge_segments(rel: pg_sys::Relation, flush_threshold: usize) -> AnyResult<()> {
+    fn merge_segments(
+        rel: pg_sys::Relation,
+        flush_threshold: usize,
+        lock_mode: crate::storage::MaintenanceLockMode,
+    ) -> AnyResult<()> {
+        let _lock = match crate::storage::maintenance_lock(rel, lock_mode) {
+            Some(lock) => lock,
+            None => {
+                info!("merge skipped: maintenance lock busy");
+                return Ok(());
+            }
+        };
         let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
             .map_err(|e| anyhow!("{e}"))?;
         let rbl = root
@@ -208,23 +219,25 @@ mod implementation {
                 const MAX_ACTIVE_SEGMENTS: u32 = 512;
                 const COMPACT_TARGET_SEGMENTS: usize = 64;
                 if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-                    let existing = crate::storage::segment_list_read(rel, rbl)
-                        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                    let merged = crate::storage::merge(
-                        rel,
-                        &existing,
-                        COMPACT_TARGET_SEGMENTS,
-                        flush_threshold.saturating_mul(16).max(1024 * 1024),
-                        &crate::storage::tombstone::Snapshot::default(),
-                    )
-                    .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-                    crate::storage::segment_list_rewrite(rel, rbl, &merged)
-                        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-                    if merged != existing {
-                        crate::storage::free_segments(rel, &existing)
-                            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                        crate::storage::maybe_truncate_relation(rel, rbl, &merged)
-                            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+                    if let Some(_lock) = crate::storage::maintenance_lock_blocking(rel) {
+                        let existing = crate::storage::segment_list_read(rel, rbl)
+                            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+                        let merged = crate::storage::merge(
+                            rel,
+                            &existing,
+                            COMPACT_TARGET_SEGMENTS,
+                            flush_threshold.saturating_mul(16).max(1024 * 1024),
+                            &crate::storage::tombstone::Snapshot::default(),
+                        )
+                        .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
+                        crate::storage::segment_list_rewrite(rel, rbl, &merged)
+                            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+                        if merged != existing {
+                            crate::storage::free_segments(rel, &existing)
+                                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+                            crate::storage::maybe_truncate_relation(rel, rbl, &merged)
+                                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+                        }
                     }
                 }
             }
@@ -319,7 +332,11 @@ mod implementation {
 
             flush_collector(index_rel, &mut collector, flush_threshold);
 
-            if let Err(e) = merge_segments(index_rel, flush_threshold) {
+            if let Err(e) = merge_segments(
+                index_rel,
+                flush_threshold,
+                crate::storage::MaintenanceLockMode::Block,
+            ) {
                 warning!("failed to merge segments: {e:#?}");
             }
 
@@ -331,26 +348,32 @@ mod implementation {
         }
     }
 
-    #[pg_extern]
-    fn pg_zoekt_seal(index: pg_sys::Oid) {
+    fn seal_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
+            let lock = match crate::storage::maintenance_lock(rel, lock_mode) {
+                Some(lock) => lock,
+                None => {
+                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+                    return;
+                }
+            };
             let pending_head = match crate::storage::pending::detach_pending(rel, 0) {
                 Ok(head) => head,
                 Err(e) => {
+                    drop(lock);
                     pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
                     error!("failed to detach pending list: {e:#?}");
                 }
             };
-            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
 
             let Some(pending_head) = pending_head else {
+                drop(lock);
+                pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
                 return;
             };
 
-            let index_rel = pg_sys::relation_open(index, pg_sys::RowExclusiveLock as i32);
-            let workers = reloption_parallel_workers(index_rel).unwrap_or(0).max(0) as usize;
-            pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
+            let workers = reloption_parallel_workers(rel).unwrap_or(0).max(0) as usize;
 
             if workers > 0 {
                 let flush_threshold = crate::build::flush_threshold_bytes();
@@ -361,12 +384,21 @@ mod implementation {
                     flush_threshold,
                 ) {
                     info!("sealed {} pending tuples (parallel)", seen);
+                    drop(lock);
+                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
                     return;
                 }
             }
 
             seal_serial(index, pending_head);
+            drop(lock);
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
         }
+    }
+
+    #[pg_extern]
+    fn pg_zoekt_seal(index: pg_sys::Oid) {
+        seal_index(index, crate::storage::MaintenanceLockMode::Block);
     }
 
     #[pg_extern]

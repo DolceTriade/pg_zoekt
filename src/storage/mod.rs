@@ -38,6 +38,80 @@ pub struct RootBlockList {
     // Segments...
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum MaintenanceLockMode {
+    Try,
+    Block,
+}
+
+pub struct MaintenanceLockGuard {
+    locktag: pg_sys::LOCKTAG,
+    lockmode: pg_sys::LOCKMODE,
+    acquired: bool,
+}
+
+impl Drop for MaintenanceLockGuard {
+    fn drop(&mut self) {
+        if !self.acquired {
+            return;
+        }
+        unsafe {
+            pg_sys::LockRelease(&self.locktag, self.lockmode, false);
+        }
+    }
+}
+
+fn maintenance_locktag(rel: pg_sys::Relation) -> Option<pg_sys::LOCKTAG> {
+    if rel.is_null() {
+        return None;
+    }
+    let relid = u64::from(u32::from(unsafe { (*rel).rd_id }));
+    let dbid = u32::from(unsafe { pg_sys::MyDatabaseId });
+    let key = (0x5A4B54u64 << 32) | (relid & 0xffff_ffff);
+    let key1 = (key >> 32) as u32;
+    let key2 = (key & 0xffff_ffff) as u32;
+    Some(pg_sys::LOCKTAG {
+        locktag_field1: dbid,
+        locktag_field2: key1,
+        locktag_field3: key2,
+        locktag_field4: 1,
+        locktag_type: pg_sys::LockTagType::LOCKTAG_ADVISORY as u8,
+        locktag_lockmethodid: pg_sys::DEFAULT_LOCKMETHOD as u8,
+    })
+}
+
+pub fn maintenance_lock(
+    rel: pg_sys::Relation,
+    mode: MaintenanceLockMode,
+) -> Option<MaintenanceLockGuard> {
+    let locktag = maintenance_locktag(rel)?;
+    let lockmode = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
+    let acquired = unsafe {
+        let dont_wait = matches!(mode, MaintenanceLockMode::Try);
+        match pg_sys::LockAcquire(&locktag, lockmode, false, dont_wait) {
+            pg_sys::LockAcquireResult::LOCKACQUIRE_OK
+            | pg_sys::LockAcquireResult::LOCKACQUIRE_ALREADY_HELD => true,
+            _ => false,
+        }
+    };
+    if !acquired {
+        return None;
+    }
+    Some(MaintenanceLockGuard {
+        locktag,
+        lockmode,
+        acquired: true,
+    })
+}
+
+pub fn maintenance_lock_try(rel: pg_sys::Relation) -> Option<MaintenanceLockGuard> {
+    maintenance_lock(rel, MaintenanceLockMode::Try)
+}
+
+pub fn maintenance_lock_blocking(rel: pg_sys::Relation) -> Option<MaintenanceLockGuard> {
+    maintenance_lock(rel, MaintenanceLockMode::Block)
+}
+
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
 pub struct RootBlockListV1 {
@@ -836,6 +910,7 @@ pub fn merge(
 
     let mut collector = crate::trgm::Collector::new();
     let mut bytes_since_flush = 0usize;
+    let mut processed_bytes: u64 = 0;
     let mut result = Vec::new();
     let mut interrupt_counter: u32 = 0;
     let mut flush_count: u64 = 0;
@@ -861,21 +936,29 @@ pub fn merge(
             collector.add_occurrences(trigram, *doc, occs);
         }
         drop(postings);
-        bytes_since_flush += group_entries
+        let group_bytes = group_entries
             .iter()
             .map(|entry| entry.data_length as usize)
             .sum::<usize>();
+        bytes_since_flush += group_bytes;
+        processed_bytes = processed_bytes.saturating_add(group_bytes as u64);
         if collector.memory_usage() >= flush_threshold || bytes_since_flush >= per_segment_target {
             let collector_bytes = collector.memory_usage();
             flush_collector(rel, &mut collector, &mut result)?;
             flush_count = flush_count.saturating_add(1);
             if (flush_count & 0x3f) == 0 {
+                let pct = if total_bytes == 0 {
+                    0.0
+                } else {
+                    (processed_bytes as f64 / total_bytes as f64) * 100.0
+                };
                 info!(
-                    "merge flush: count={} collector_bytes={} bytes_since_flush={} result_segments={}",
+                    "merge flush: count={} collector_bytes={} bytes_since_flush={} result_segments={} progress_pct={:.1}",
                     flush_count,
                     collector_bytes,
                     bytes_since_flush,
-                    result.len()
+                    result.len(),
+                    pct
                 );
             }
             bytes_since_flush = 0;
