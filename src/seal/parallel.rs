@@ -230,12 +230,13 @@ pub(crate) unsafe fn seal_parallel(
         if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
             let existing = crate::storage::segment_list_read(index_rel, rbl)
                 .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-            let merged = crate::storage::merge(
+            let merged = crate::storage::merge_with_workers(
                 index_rel,
                 &existing,
                 COMPACT_TARGET_SEGMENTS,
                 flush_threshold.saturating_mul(16).max(1024 * 1024),
                 &crate::storage::tombstone::Snapshot::default(),
+                crate::storage::reloption_parallel_workers(index_rel),
             )
             .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
             crate::storage::segment_list_rewrite(index_rel, rbl, &merged)

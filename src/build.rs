@@ -92,12 +92,13 @@ fn flush_segments(
                 if let Some(_lock) = crate::storage::maintenance_lock_try(rel) {
                     let existing = crate::storage::segment_list_read(rel, rbl)
                         .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                    let merged = crate::storage::merge(
+                    let merged = crate::storage::merge_with_workers(
                         rel,
                         &existing,
                         COMPACT_TARGET_SEGMENTS,
                         flush_threshold.saturating_mul(16).max(1024 * 1024),
                         &crate::storage::tombstone::Snapshot::default(),
+                        crate::storage::reloption_parallel_workers(rel),
                     )
                     .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                     crate::storage::segment_list_rewrite(rel, rbl, &merged)
@@ -310,12 +311,13 @@ fn finalize_segment_list(
     );
     let tombstones = crate::storage::tombstone::Snapshot::default();
     if let Some(_lock) = crate::storage::maintenance_lock_try(index_relation) {
-        let merged = crate::storage::merge(
+        let merged = crate::storage::merge_with_workers(
             index_relation,
             &existing,
             crate::storage::TARGET_SEGMENTS,
             flush_threshold,
             &tombstones,
+            crate::storage::reloption_parallel_workers(index_relation),
         )
         .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
         crate::storage::segment_list_rewrite(index_relation, rbl, &merged)

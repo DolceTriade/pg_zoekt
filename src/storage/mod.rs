@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pgrx::prelude::*;
 /// Storing stuff
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub const TARGET_SEGMENTS: usize = 10;
@@ -343,6 +343,48 @@ pub fn segment_list_rewrite(
         free_blocks(rel, &old_pages)?;
     }
     Ok(())
+}
+
+pub fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> usize {
+    if index_relation.is_null() {
+        return 0;
+    }
+    let opts = unsafe { (*index_relation).rd_options as *const pg_sys::StdRdOptions };
+    if opts.is_null() {
+        return 0;
+    }
+    let workers = unsafe { (*opts).parallel_workers };
+    if workers > 0 { workers as usize } else { 0 }
+}
+
+pub fn merge_with_workers(
+    rel: pg_sys::Relation,
+    segments: &[Segment],
+    target_segments: usize,
+    flush_threshold: usize,
+    tombstones: &tombstone::Snapshot,
+    workers: usize,
+) -> Result<Vec<Segment>> {
+    if workers <= 1 || segments.len() <= target_segments {
+        return merge(rel, segments, target_segments, flush_threshold, tombstones);
+    }
+    let group_count = workers.max(1);
+    let mut groups: Vec<Vec<Segment>> = vec![Vec::new(); group_count];
+    for (idx, seg) in segments.iter().enumerate() {
+        groups[idx % group_count].push(*seg);
+    }
+    let mut interim = Vec::new();
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+        let mut merged = merge(rel, &group, target_segments, flush_threshold, tombstones)?;
+        interim.append(&mut merged);
+    }
+    if interim.len() <= target_segments {
+        return Ok(interim);
+    }
+    merge(rel, &interim, target_segments, flush_threshold, tombstones)
 }
 
 fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
@@ -833,26 +875,68 @@ fn peek_next_trigram(cursors: &[SegmentCursor]) -> Option<u32> {
         .min()
 }
 
-fn merge_entry_postings(
+fn merge_entry_postings_stream(
     rel: pg_sys::Relation,
     entries: &[IndexEntry],
     tombstones: &tombstone::Snapshot,
-) -> Result<BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>>> {
-    let mut docs: BTreeMap<ItemPointer, Vec<crate::trgm::Occurance>> = BTreeMap::new();
+    mut on_doc: impl FnMut(ItemPointer, &[crate::trgm::Occurance]) -> Result<()>,
+) -> Result<()> {
+    let mut cursors = Vec::new();
     for entry in entries {
-        for posting in unsafe { crate::storage::decode::decode_postings(rel, entry)? } {
-            if tombstones.contains(posting.tid) {
-                continue;
-            }
-            let list = docs.entry(posting.tid).or_insert_with(Vec::new);
-            for (position, flags) in posting.positions {
-                let mut occ = crate::trgm::Occurance(position);
-                occ.set_flags(flags);
-                list.push(occ);
-            }
+        let mut cursor = unsafe { crate::storage::decode::PostingCursor::new(rel, entry)? };
+        if cursor.advance()? {
+            cursors.push(cursor);
         }
     }
-    Ok(docs)
+
+    while !cursors.is_empty() {
+        let mut min_tid: Option<ItemPointer> = None;
+        for cursor in cursors.iter() {
+            if let Some(tid) = cursor.current_tid() {
+                min_tid = Some(match min_tid {
+                    Some(cur) => cur.min(tid),
+                    None => tid,
+                });
+            }
+        }
+        let Some(target) = min_tid else {
+            break;
+        };
+
+        if tombstones.contains(target) {
+            for cursor in cursors.iter_mut() {
+                if cursor.current_tid() == Some(target) {
+                    cursor.advance()?;
+                }
+            }
+            cursors.retain(|c| c.current_tid().is_some());
+            continue;
+        }
+
+        let mut occs: Vec<crate::trgm::Occurance> = Vec::new();
+        for cursor in cursors.iter_mut() {
+            if cursor.current_tid() != Some(target) {
+                continue;
+            }
+            if let Some(doc) = cursor.current() {
+                occs.reserve(doc.positions.len());
+                for (position, flags) in doc.positions.iter() {
+                    let mut occ = crate::trgm::Occurance(*position);
+                    occ.set_flags(*flags);
+                    occs.push(occ);
+                }
+            }
+            cursor.advance()?;
+        }
+        cursors.retain(|c| c.current_tid().is_some());
+
+        if !occs.is_empty() {
+            occs.sort_unstable_by_key(|occ| occ.position());
+            on_doc(target, &occs)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn flush_collector(
@@ -930,12 +1014,10 @@ pub fn merge(
                 cursor.advance();
             }
         }
-        let mut postings = merge_entry_postings(rel, &group_entries, tombstones)?;
-        for (doc, occs) in postings.iter_mut() {
-            occs.sort_unstable_by_key(|occ| occ.position());
-            collector.add_occurrences(trigram, *doc, occs);
-        }
-        drop(postings);
+        merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
+            collector.add_occurrences(trigram, doc, occs);
+            Ok(())
+        })?;
         let group_bytes = group_entries
             .iter()
             .map(|entry| entry.data_length as usize)

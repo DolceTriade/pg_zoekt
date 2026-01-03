@@ -173,12 +173,13 @@ mod implementation {
                 warning!("failed to load tombstones during merge: {e:#?}");
                 crate::storage::tombstone::Snapshot::default()
             });
-        let merged = crate::storage::merge(
+        let merged = crate::storage::merge_with_workers(
             rel,
             &existing,
             crate::storage::TARGET_SEGMENTS,
             flush_threshold,
             &tombstones,
+            crate::storage::reloption_parallel_workers(rel),
         )?;
         crate::storage::segment_list_rewrite(rel, rbl, &merged)?;
         if merged != existing {
@@ -222,12 +223,13 @@ mod implementation {
                     if let Some(_lock) = crate::storage::maintenance_lock_blocking(rel) {
                         let existing = crate::storage::segment_list_read(rel, rbl)
                             .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                        let merged = crate::storage::merge(
+                        let merged = crate::storage::merge_with_workers(
                             rel,
                             &existing,
                             COMPACT_TARGET_SEGMENTS,
                             flush_threshold.saturating_mul(16).max(1024 * 1024),
                             &crate::storage::tombstone::Snapshot::default(),
+                            crate::storage::reloption_parallel_workers(rel),
                         )
                         .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                         crate::storage::segment_list_rewrite(rel, rbl, &merged)
@@ -677,6 +679,83 @@ mod tests {
 
         explain_plan.iter().for_each(|s| info!("{}", s));
         //assert!(false);
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_merge_streaming_keeps_results() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE merge_stream_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO merge_stream_docs (text)
+                 SELECT CASE
+                    WHEN gs % 10 = 0 THEN 'needle-' || repeat(md5(gs::text), 50)
+                    ELSE repeat(md5(gs::text), 50)
+                 END
+                 FROM generate_series(1, 1024) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_merge_stream_docs_text_zoekt ON merge_stream_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_merge_stream_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        let before_segments = unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            let count = segments.len();
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            count
+        };
+
+        Spi::run("SET enable_seqscan = OFF")?;
+        let hits_before = Spi::get_one::<i64>(
+            "SELECT count(*) FROM merge_stream_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+
+        Spi::run("SELECT pg_zoekt_seal('idx_merge_stream_docs_text_zoekt'::regclass)")?;
+
+        let hits_after = Spi::get_one::<i64>(
+            "SELECT count(*) FROM merge_stream_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(hits_before, hits_after, "merge should preserve results");
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            assert!(!segments.is_empty(), "expected segments after merge");
+            assert!(
+                segments.len() <= before_segments,
+                "expected merge to not increase segment count"
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
+        Spi::run("RESET enable_seqscan")?;
+        Spi::run("DROP TABLE IF EXISTS merge_stream_docs")?;
         Ok(())
     }
 

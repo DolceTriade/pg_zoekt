@@ -352,12 +352,13 @@ pub(super) unsafe fn build_parallel(
             let existing = crate::storage::segment_list_read(index_relation, rbl)
                 .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
             let tombstones = crate::storage::tombstone::Snapshot::default();
-            let merged = crate::storage::merge(
+            let merged = crate::storage::merge_with_workers(
                 index_relation,
                 &existing,
                 COMPACT_TARGET_SEGMENTS,
                 flush_threshold.saturating_mul(16).max(1024 * 1024),
                 &tombstones,
+                crate::storage::reloption_parallel_workers(index_relation),
             )
             .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
             crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
