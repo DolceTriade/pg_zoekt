@@ -170,6 +170,12 @@ mod implementation {
             &tombstones,
         )?;
         crate::storage::segment_list_rewrite(rel, rbl, &merged)?;
+        if merged != existing {
+            crate::storage::free_segments(rel, &existing)
+                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+            crate::storage::maybe_truncate_relation(rel, rbl, &merged)
+                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+        }
         Ok(())
     }
 
@@ -214,6 +220,12 @@ mod implementation {
                     .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                     crate::storage::segment_list_rewrite(rel, rbl, &merged)
                         .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+                    if merged != existing {
+                        crate::storage::free_segments(rel, &existing)
+                            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+                        crate::storage::maybe_truncate_relation(rel, rbl, &merged)
+                            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+                    }
                 }
             }
             Err(e) => {
@@ -669,6 +681,94 @@ mod tests {
                 .map(|row| Ok(row.get::<String>(1)?.unwrap_or_default()))
                 .collect()
         })?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_truncate_reclaims_tail_blocks() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update("CREATE TABLE reclaim_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)", None, &[])?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO reclaim_docs (text) SELECT repeat(md5(i::text), 10) FROM generate_series(1, 512) s(i)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_reclaim_docs_text_zoekt ON reclaim_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_reclaim_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)
+                .expect("root buffer");
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+
+            // Clear free list to force extension on allocate_block.
+            if rbl.wal_block != pg_sys::InvalidBlockNumber {
+                let mut wal_buf = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
+                    .expect("wal buffer");
+                let wal = wal_buf
+                    .as_struct_mut::<crate::storage::WALHeader>(0)
+                    .expect("wal header");
+                wal.free_head = pg_sys::InvalidBlockNumber;
+            }
+
+            let nblocks_before = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+
+            let mut extra = Vec::new();
+            for _ in 0..8 {
+                let page = crate::storage::allocate_block(rel);
+                extra.push(page.block_number());
+            }
+
+            let nblocks_after_alloc = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            assert!(
+                nblocks_after_alloc > nblocks_before,
+                "expected relation to grow after allocation"
+            );
+
+            crate::storage::free_blocks(rel, &extra)
+                .expect("failed to free extra blocks");
+            crate::storage::maybe_truncate_relation(rel, rbl, &segments)
+                .expect("failed to truncate relation");
+
+            let nblocks_after_truncate = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            assert_eq!(
+                nblocks_after_truncate, nblocks_before,
+                "expected relation to shrink back to original size"
+            );
+
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+        }
         Ok(())
     }
 

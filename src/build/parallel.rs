@@ -343,6 +343,12 @@ pub(super) unsafe fn build_parallel(
             .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
             crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
                 .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+            if merged != existing {
+                crate::storage::free_segments(index_relation, &existing)
+                    .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+                crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
+                    .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+            }
         }
 
         let ntuples = (*parallel_shared)
@@ -606,7 +612,7 @@ impl SpillState {
             file,
             budget: BudgetTracker::new(global_used, global_budget, per_worker_budget),
             log_counter: 0,
-            log_every: 64,
+            log_every: 4096,
             _fileset: fileset,
         }
     }

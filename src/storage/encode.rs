@@ -34,7 +34,7 @@ impl Encoder {
             if (interrupt_counter & 0x3ff) == 0 {
                 pg_sys::check_for_interrupts!();
             }
-            let mut leaf = BlockBuffer::allocate(rel);
+            let mut leaf = super::allocate_block(rel);
             let leaf_block = leaf.block_number();
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
             let bh = leaf
@@ -192,7 +192,7 @@ fn build_segment_root(
     while current.len() > 1 {
         let mut next = Vec::new();
         for chunk in current.chunks(per_page) {
-            let mut page = BlockBuffer::allocate(rel);
+            let mut page = super::allocate_block(rel);
             let block_no = page.block_number();
             let bh = page
                 .as_struct_mut::<super::BlockHeader>(0)
@@ -504,7 +504,7 @@ impl PageWriter {
     }
 
     fn allocate_page(&mut self) {
-        let mut page = BlockBuffer::allocate(self.rel);
+        let mut page = super::allocate_block(self.rel);
         let header = page
             .as_struct_mut::<super::PostingPageHeader>(0)
             .expect("header should fit");
@@ -517,7 +517,7 @@ impl PageWriter {
     }
 
     fn allocate_next_page(&mut self) {
-        let mut next_page = BlockBuffer::allocate(self.rel);
+        let mut next_page = super::allocate_block(self.rel);
         let next_block = next_page.block_number();
         if let Some(mut old) = self.buff.take() {
             let header = old

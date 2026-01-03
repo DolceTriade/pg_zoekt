@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pgrx::prelude::*;
 /// Storing stuff
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub const TARGET_SEGMENTS: usize = 10;
@@ -21,6 +21,7 @@ pub const PENDING_BUCKET_MAGIC: u16 = u16::from_ne_bytes(*b"PL");
 pub const POSTING_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"oZKT");
 pub const SEGMENT_LIST_MAGIC: u32 = u32::from_ne_bytes(*b"lZKT");
 pub const TOMBSTONE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"tZKT");
+pub const FREE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"fZKT");
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]
@@ -95,7 +96,7 @@ impl From<pg_sys::ItemPointerData> for ItemPointer {
     }
 }
 
-#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]
+#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct Segment {
     pub block: u32,
@@ -117,7 +118,7 @@ fn segment_list_capacity() -> usize {
 }
 
 fn segment_list_init_page(rel: pg_sys::Relation) -> Result<pgbuffer::BlockBuffer> {
-    let mut page = pgbuffer::BlockBuffer::allocate(rel);
+    let mut page = allocate_block(rel);
     let hdr = page
         .as_struct_mut::<SegmentListPageHeader>(0)
         .context("segment list header")?;
@@ -236,15 +237,326 @@ pub fn segment_list_read(rel: pg_sys::Relation, root: &RootBlockList) -> Result<
     Ok(out)
 }
 
+fn collect_segment_list_pages(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
+    let mut pages = Vec::new();
+    let mut blk = head;
+    while blk != pg_sys::InvalidBlockNumber {
+        pages.push(blk);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let hdr = buf
+            .as_struct::<SegmentListPageHeader>(0)
+            .context("segment list header")?;
+        if hdr.magic != SEGMENT_LIST_MAGIC {
+            anyhow::bail!("bad segment list magic");
+        }
+        blk = hdr.next_block;
+    }
+    Ok(pages)
+}
+
 pub fn segment_list_rewrite(
     rel: pg_sys::Relation,
     root: &mut RootBlockList,
     segments: &[Segment],
 ) -> Result<()> {
+    let old_head = root.segment_list_head;
     root.num_segments = 0;
     root.segment_list_head = pg_sys::InvalidBlockNumber;
     root.segment_list_tail = pg_sys::InvalidBlockNumber;
     segment_list_append(rel, root, segments)?;
+    if old_head != pg_sys::InvalidBlockNumber {
+        let old_pages = collect_segment_list_pages(rel, old_head)?;
+        free_blocks(rel, &old_pages)?;
+    }
+    Ok(())
+}
+
+fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
+    let block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.block)) };
+    let offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.offset)) };
+    let data_length = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length)) };
+    (block, offset, data_length)
+}
+
+fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
+    let root = match pgbuffer::BlockBuffer::acquire(rel, 0) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
+    if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+        return Ok(None);
+    }
+
+    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+    if wal.free_head == pg_sys::InvalidBlockNumber {
+        return Ok(None);
+    }
+    let head = wal.free_head;
+    let free_buf = pgbuffer::BlockBuffer::acquire(rel, head)?;
+    let free_hdr = free_buf
+        .as_struct::<FreePageHeader>(0)
+        .context("free page header")?;
+    let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(free_hdr.magic)) };
+    if magic != FREE_PAGE_MAGIC {
+        warning!(
+            "free list corruption: block {} has magic {}, expected {}",
+            head, magic, FREE_PAGE_MAGIC
+        );
+        wal.free_head = pg_sys::InvalidBlockNumber;
+        return Ok(None);
+    }
+    wal.free_head = free_hdr.next_block;
+    Ok(Some(head))
+}
+
+pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
+    match pop_free_block(rel) {
+        Ok(Some(block)) => {
+            let mut page = match pgbuffer::BlockBuffer::aquire_mut(rel, block) {
+                Ok(page) => page,
+                Err(_) => return pgbuffer::BlockBuffer::allocate(rel),
+            };
+            page.init_page();
+            page
+        }
+        _ => pgbuffer::BlockBuffer::allocate(rel),
+    }
+}
+
+pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+
+    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
+    let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
+    if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+        return Ok(());
+    }
+
+    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+    let mut head = wal.free_head;
+
+    for block in blocks {
+        if *block == 0
+            || *block == rbl.wal_block
+            || *block == rbl.pending_block
+            || *block == rbl.tombstone_block
+        {
+            continue;
+        }
+        let mut page = pgbuffer::BlockBuffer::aquire_mut(rel, *block)?;
+        let header = page
+            .as_struct_mut::<FreePageHeader>(0)
+            .context("free page header")?;
+        header.magic = FREE_PAGE_MAGIC;
+        header.next_block = head;
+        head = *block;
+    }
+    wal.free_head = head;
+    Ok(())
+}
+
+fn collect_segment_tree_blocks(
+    rel: pg_sys::Relation,
+    block: u32,
+    out: &mut HashSet<u32>,
+) -> Result<()> {
+    if !out.insert(block) {
+        return Ok(());
+    }
+    let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+    let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+    if header.magic != BLOCK_MAGIC {
+        anyhow::bail!("invalid block magic while freeing segment");
+    }
+    if header.level == 0 {
+        return Ok(());
+    }
+    let pointers = buf
+        .as_struct_with_elems::<BlockPointerList>(
+            std::mem::size_of::<BlockHeader>(),
+            header.num_entries as usize,
+        )
+        .context("block pointers")?;
+    let slice = &pointers.entries[..header.num_entries as usize];
+    for p in slice {
+        collect_segment_tree_blocks(rel, p.block, out)?;
+    }
+    Ok(())
+}
+
+fn collect_posting_blocks(
+    rel: pg_sys::Relation,
+    entry: &IndexEntry,
+    out: &mut HashSet<u32>,
+) -> Result<()> {
+    let (mut block, _offset, data_length) = entry_fields(entry);
+    if data_length == 0 || block == pg_sys::InvalidBlockNumber {
+        return Ok(());
+    }
+    loop {
+        if !out.insert(block) {
+            break;
+        }
+        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let header = buf
+            .as_struct::<PostingPageHeader>(0)
+            .context("posting page header")?;
+        if header.magic != POSTING_PAGE_MAGIC {
+            anyhow::bail!("invalid posting page magic while freeing segment");
+        }
+        if header.next_block == pg_sys::InvalidBlockNumber {
+            break;
+        }
+        block = header.next_block;
+    }
+    Ok(())
+}
+
+pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> {
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let mut blocks: HashSet<u32> = HashSet::new();
+    for seg in segments {
+        collect_segment_tree_blocks(rel, seg.block, &mut blocks)?;
+        let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
+        for leaf in leaf_blocks {
+            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+            if header.magic != BLOCK_MAGIC {
+                anyhow::bail!("invalid block magic while freeing segment");
+            }
+            let entries = buf
+                .as_struct_with_elems::<IndexList>(
+                    std::mem::size_of::<BlockHeader>(),
+                    header.num_entries as usize,
+                )
+                .context("index entries")?;
+            let slice = &entries.entries[..header.num_entries as usize];
+            for entry in slice {
+                collect_posting_blocks(rel, entry, &mut blocks)?;
+            }
+        }
+    }
+    let mut list: Vec<u32> = blocks.into_iter().collect();
+    list.sort_unstable();
+    free_blocks(rel, &list)
+}
+
+fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) -> Result<Vec<u32>> {
+    if wal_block == pg_sys::InvalidBlockNumber {
+        return Ok(Vec::new());
+    }
+    let wal_buf = pgbuffer::BlockBuffer::acquire(rel, wal_block)?;
+    let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
+    let mut out = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut blk = wal.free_head;
+    while blk != pg_sys::InvalidBlockNumber {
+        if !seen.insert(blk) {
+            warning!("free list cycle detected at block {}", blk);
+            break;
+        }
+        out.push(blk);
+        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let hdr = buf
+            .as_struct::<FreePageHeader>(0)
+            .context("free page header")?;
+        let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(hdr.magic)) };
+        if magic != FREE_PAGE_MAGIC {
+            warning!(
+                "free list corruption: block {} has magic {}, expected {}",
+                blk, magic, FREE_PAGE_MAGIC
+            );
+            break;
+        }
+        blk = hdr.next_block;
+    }
+    Ok(out)
+}
+
+pub fn maybe_truncate_relation(
+    rel: pg_sys::Relation,
+    rbl: &RootBlockList,
+    segments: &[Segment],
+) -> Result<()> {
+    let mut used: HashSet<u32> = HashSet::new();
+    used.insert(0);
+    if rbl.wal_block != pg_sys::InvalidBlockNumber {
+        used.insert(rbl.wal_block);
+    }
+    if rbl.pending_block != pg_sys::InvalidBlockNumber {
+        used.insert(rbl.pending_block);
+    }
+    if rbl.tombstone_block != pg_sys::InvalidBlockNumber {
+        used.insert(rbl.tombstone_block);
+    }
+
+    if rbl.segment_list_head != pg_sys::InvalidBlockNumber {
+        let pages = collect_segment_list_pages(rel, rbl.segment_list_head)?;
+        used.extend(pages);
+    }
+
+    for seg in segments {
+        collect_segment_tree_blocks(rel, seg.block, &mut used)?;
+        let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
+        for leaf in leaf_blocks {
+            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+            if header.magic != BLOCK_MAGIC {
+                anyhow::bail!("invalid block magic while truncating");
+            }
+            let entries = buf
+                .as_struct_with_elems::<IndexList>(
+                    std::mem::size_of::<BlockHeader>(),
+                    header.num_entries as usize,
+                )
+                .context("index entries")?;
+            let slice = &entries.entries[..header.num_entries as usize];
+            for entry in slice {
+                collect_posting_blocks(rel, entry, &mut used)?;
+            }
+        }
+    }
+
+    let max_used = *used.iter().max().unwrap_or(&0);
+    let new_nblocks = max_used.saturating_add(1);
+    let nblocks = unsafe {
+        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+    };
+    if new_nblocks >= nblocks {
+        return Ok(());
+    }
+
+    let keep = collect_free_list_blocks(rel, rbl.wal_block)?
+        .into_iter()
+        .filter(|b| *b < new_nblocks)
+        .collect::<Vec<u32>>();
+
+    if rbl.wal_block != pg_sys::InvalidBlockNumber {
+        let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+        let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+        let mut head = pg_sys::InvalidBlockNumber;
+        for block in keep {
+            let mut page = pgbuffer::BlockBuffer::aquire_mut(rel, block)?;
+            let header = page
+                .as_struct_mut::<FreePageHeader>(0)
+                .context("free page header")?;
+            header.magic = FREE_PAGE_MAGIC;
+            header.next_block = head;
+            head = block;
+        }
+        wal.free_head = head;
+    }
+
+    unsafe {
+        pg_sys::RelationTruncate(rel, new_nblocks);
+    }
     Ok(())
 }
 
@@ -311,6 +623,13 @@ pub struct PostingPageHeader {
     pub next_block: u32,
     pub next_offset: u16,
     pub free: u16,
+}
+
+#[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C, packed)]
+pub struct FreePageHeader {
+    pub magic: u32,
+    pub next_block: u32,
 }
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy)]

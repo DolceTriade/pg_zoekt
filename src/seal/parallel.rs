@@ -240,6 +240,12 @@ pub(crate) unsafe fn seal_parallel(
             .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
             crate::storage::segment_list_rewrite(index_rel, rbl, &merged)
                 .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+            if merged != existing {
+                crate::storage::free_segments(index_rel, &existing)
+                    .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+                crate::storage::maybe_truncate_relation(index_rel, rbl, &merged)
+                    .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+            }
         }
 
         drop(root);

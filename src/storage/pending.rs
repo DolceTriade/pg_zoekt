@@ -85,7 +85,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
         return Ok(block);
     }
 
-    let mut page = BlockBuffer::allocate(rel);
+    let mut page = super::allocate_block(rel);
     let header = page
         .as_struct_mut::<PendingBucket>(0)
         .context("pending page header")?;
@@ -104,7 +104,7 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
         return Ok(rbl.pending_block);
     }
 
-    let header_block = BlockBuffer::allocate(rel).block_number();
+    let header_block = super::allocate_block(rel).block_number();
     init_pending(rel, header_block)?;
     rbl.pending_block = header_block;
     if rbl.version < super::VERSION {

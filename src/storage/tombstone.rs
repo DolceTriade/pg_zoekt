@@ -146,7 +146,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
         let block = if let Some(blk) = existing.pop() {
             blk
         } else {
-            BlockBuffer::allocate(rel).block_number()
+            super::allocate_block(rel).block_number()
         };
         let chunk_len = cursor.len().min(chunk_cap);
         {

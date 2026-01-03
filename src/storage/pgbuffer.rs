@@ -122,6 +122,12 @@ impl BlockBuffer {
         unsafe { pg_sys::BufferGetBlockNumber(self.buffer) }
     }
 
+    pub fn init_page(&mut self) {
+        unsafe {
+            pg_sys::PageInit(self.page, pg_sys::BLCKSZ as usize, SPECIAL_SIZE);
+        }
+    }
+
     pub fn as_struct<'a, T>(&'a self, offset: usize) -> anyhow::Result<&'a T>
     where
         T: TryFromBytes + KnownLayout + Immutable,
