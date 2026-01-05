@@ -180,7 +180,7 @@ mod implementation {
             crate::storage::TARGET_SEGMENTS,
             flush_threshold,
             &tombstones,
-            crate::storage::reloption_parallel_workers(rel),
+            None,
         )?;
         crate::storage::segment_list_rewrite(rel, rbl, &merged)?;
         if merged != existing {
@@ -230,7 +230,7 @@ mod implementation {
                             COMPACT_TARGET_SEGMENTS,
                             flush_threshold.saturating_mul(16).max(1024 * 1024),
                             &crate::storage::tombstone::Snapshot::default(),
-                            crate::storage::reloption_parallel_workers(rel),
+                            None,
                         )
                         .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                         crate::storage::segment_list_rewrite(rel, rbl, &merged)
@@ -879,7 +879,7 @@ mod tests {
                 1,
                 1024 * 1024 * 1024,
                 &crate::storage::tombstone::Snapshot::default(),
-                2,
+                Some(2),
             )
             .expect("merge failed");
             assert_eq!(merged.len(), 1);
@@ -1092,7 +1092,11 @@ mod tests {
         );
 
         Spi::run("DROP TABLE IF EXISTS overhead_ratio_docs")?;
-        assert!(false);
+        assert!(
+            corpus_ratio >= 0.5,
+            "expected index size within 2x corpus (corpus_per_index={:.4})",
+            corpus_ratio
+        );
         Ok(())
     }
 

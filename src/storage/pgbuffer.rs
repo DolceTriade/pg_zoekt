@@ -305,7 +305,7 @@ impl Drop for GenericWAL {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
 
     use super::*;
     use pgrx::{Spi, spi};
@@ -325,16 +325,20 @@ mod tests {
             let block = buff.block_number();
             let s = CString::new("hello").expect("string made");
             unsafe {
-                std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
+                let bytes = s.as_bytes_with_nul();
+                std::ptr::copy(bytes.as_ptr().cast(), buff.as_ptr_mut(), bytes.len());
             }
             block
         };
 
         {
-            let mut buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
-            let h = unsafe { CString::from_raw(buff.as_ptr_mut()) };
-            info!("CString {h:?}");
-            _ = h.into_raw();
+            let buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
+            let cstr = unsafe { CStr::from_ptr(buff.as_ptr()) };
+            assert_eq!(
+                cstr.to_str().expect("valid utf8"),
+                "hello",
+                "expected string contents"
+            );
         }
 
         Ok(())

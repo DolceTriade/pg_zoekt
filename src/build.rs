@@ -97,7 +97,7 @@ fn flush_segments(
                         COMPACT_TARGET_SEGMENTS,
                         flush_threshold.saturating_mul(16).max(1024 * 1024),
                         &crate::storage::tombstone::Snapshot::default(),
-                        crate::storage::reloption_parallel_workers(rel),
+                        None,
                     )
                     .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
                     crate::storage::segment_list_rewrite(rel, rbl, &merged)
@@ -302,7 +302,7 @@ fn finalize_segment_list(
         .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
     let total_size: u64 = existing.iter().map(|s| s.size).sum();
     info!(
-        "Wrote {} segments ({} bytes), flush_threshold={}, target_segments={}",
+        "Finalizing segment build: Wrote {} segments ({} bytes), flush_threshold={}, target_segments={}",
         existing.len(),
         total_size,
         flush_threshold,
@@ -316,7 +316,7 @@ fn finalize_segment_list(
             crate::storage::TARGET_SEGMENTS,
             flush_threshold,
             &tombstones,
-            crate::storage::reloption_parallel_workers(index_relation),
+            None,
         )
         .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
         crate::storage::segment_list_rewrite(index_relation, rbl, &merged)

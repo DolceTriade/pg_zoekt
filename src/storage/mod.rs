@@ -367,14 +367,11 @@ pub fn merge_with_workers(
     target_segments: usize,
     flush_threshold: usize,
     tombstones: &tombstone::Snapshot,
-    workers: usize,
+    workers: Option<usize>,
 ) -> Result<Vec<Segment>> {
-    let workers = if workers == 0 {
-        reloption_parallel_workers(rel)
-    } else {
-        workers
-    };
+    let workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
     if workers <= 1 || segments.len() <= target_segments {
+        info!("Serial merge...");
         return merge(rel, segments, target_segments, flush_threshold, tombstones);
     }
     let mut current = segments.to_vec();
@@ -827,18 +824,152 @@ pub struct CompressedBlockHeader {
     pub flags_len: u16,
 }
 
+struct InternalFrame {
+    block: u32,
+    next_idx: usize,
+    count: usize,
+}
+
 struct SegmentCursor {
-    entries: Vec<IndexEntry>,
-    idx: usize,
+    rel: pg_sys::Relation,
+    stack: Vec<InternalFrame>,
+    leaf: Option<pgbuffer::BlockBuffer>,
+    leaf_entry_idx: usize,
+    leaf_entry_count: usize,
+    current: Option<IndexEntry>,
 }
 
 impl SegmentCursor {
-    fn current_entry(&self) -> Option<&IndexEntry> {
-        self.entries.get(self.idx)
+    fn new(rel: pg_sys::Relation, segment: &Segment) -> Result<Self> {
+        let mut cursor = Self {
+            rel,
+            stack: Vec::new(),
+            leaf: None,
+            leaf_entry_idx: 0,
+            leaf_entry_count: 0,
+            current: None,
+        };
+        cursor.descend_leftmost(segment.block)?;
+        cursor.advance()?;
+        Ok(cursor)
     }
 
-    fn advance(&mut self) {
-        self.idx += 1;
+    fn current_entry(&self) -> Option<&IndexEntry> {
+        self.current.as_ref()
+    }
+
+    fn read_child_block(&self, block: u32, idx: usize) -> Result<u32> {
+        let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        if header.magic != BLOCK_MAGIC {
+            anyhow::bail!("invalid block magic while merging");
+        }
+        let pointers = buf
+            .as_struct_with_elems::<BlockPointerList>(
+                std::mem::size_of::<BlockHeader>(),
+                header.num_entries as usize,
+            )
+            .context("block pointers")?;
+        let entry = pointers
+            .entries
+            .get(idx)
+            .context("block pointer index")?;
+        Ok(entry.block)
+    }
+
+    fn descend_leftmost(&mut self, mut block: u32) -> Result<()> {
+        loop {
+            let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+            let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+            if header.magic != BLOCK_MAGIC {
+                anyhow::bail!("invalid block magic while merging");
+            }
+            if header.level == 0 {
+                self.leaf_entry_idx = 0;
+                self.leaf_entry_count = header.num_entries as usize;
+                self.leaf = Some(buf);
+                return Ok(());
+            }
+            let count = header.num_entries as usize;
+            if count == 0 {
+                self.leaf = None;
+                self.leaf_entry_count = 0;
+                return Ok(());
+            }
+            let child = {
+                let pointers = buf
+                    .as_struct_with_elems::<BlockPointerList>(
+                        std::mem::size_of::<BlockHeader>(),
+                        count,
+                    )
+                    .context("block pointers")?;
+                pointers
+                    .entries
+                    .get(0)
+                    .context("block pointer")?
+                    .block
+            };
+            self.stack.push(InternalFrame {
+                block,
+                next_idx: 1,
+                count,
+            });
+            block = child;
+        }
+    }
+
+    fn advance_leaf(&mut self) -> Result<bool> {
+        self.leaf = None;
+        self.leaf_entry_idx = 0;
+        self.leaf_entry_count = 0;
+        while let Some(mut frame) = self.stack.pop() {
+            if frame.next_idx < frame.count {
+                let child = self.read_child_block(frame.block, frame.next_idx)?;
+                frame.next_idx += 1;
+                self.stack.push(frame);
+                self.descend_leftmost(child)?;
+                if self.leaf_entry_count > 0 {
+                    return Ok(true);
+                }
+                continue;
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_current_entry(&mut self) -> Result<bool> {
+        let Some(leaf) = self.leaf.as_ref() else {
+            return Ok(false);
+        };
+        if self.leaf_entry_idx >= self.leaf_entry_count {
+            return Ok(false);
+        }
+        let entries = leaf
+            .as_struct_with_elems::<IndexList>(
+                std::mem::size_of::<BlockHeader>(),
+                self.leaf_entry_count,
+            )
+            .context("index entries")?;
+        let entry = *entries
+            .entries
+            .get(self.leaf_entry_idx)
+            .context("index entry")?;
+        self.leaf_entry_idx += 1;
+        self.current = Some(entry);
+        Ok(true)
+    }
+
+    fn advance(&mut self) -> Result<bool> {
+        if self.load_current_entry()? {
+            return Ok(true);
+        }
+        while self.advance_leaf()? {
+            if self.load_current_entry()? {
+                return Ok(true);
+            }
+        }
+        self.current = None;
+        Ok(false)
     }
 }
 
@@ -1046,9 +1177,9 @@ pub fn merge(
 
     let mut cursors = Vec::new();
     for segment in segments {
-        let entries = read_segment_entries(rel, segment)?;
-        if !entries.is_empty() {
-            cursors.push(SegmentCursor { entries, idx: 0 });
+        let cursor = SegmentCursor::new(rel, segment)?;
+        if cursor.current_entry().is_some() {
+            cursors.push(cursor);
         }
     }
 
@@ -1095,7 +1226,7 @@ pub fn merge(
                     break;
                 }
                 group_entries.push(*entry);
-                cursor.advance();
+                cursor.advance()?;
             }
             if let Some(entry) = cursor.current_entry() {
                 heap.push(Reverse((entry.trigram, idx)));
