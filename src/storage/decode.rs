@@ -193,7 +193,6 @@ mod tests {
     }
 }
 
-
 impl PostingCursor {
     #[inline]
     fn decode_var_u64(buf: &[u8], offset: &mut usize) -> anyhow::Result<u64> {

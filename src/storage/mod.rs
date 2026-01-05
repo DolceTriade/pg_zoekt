@@ -9,8 +9,8 @@ pub const TARGET_SEGMENTS: usize = 10;
 
 pub mod decode;
 pub mod encode;
-pub mod pending;
 mod parallel_merge;
+pub mod pending;
 pub mod pgbuffer;
 pub mod tombstone;
 
@@ -172,7 +172,9 @@ impl From<pg_sys::ItemPointerData> for ItemPointer {
     }
 }
 
-#[derive(Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable, Clone, Copy, PartialEq, Eq,
+)]
 #[repr(C, packed)]
 pub struct Segment {
     pub block: u32,
@@ -187,7 +189,7 @@ pub struct SegmentListPageHeader {
     pub count: u16,
 }
 
-fn segment_list_capacity() -> usize {
+const fn segment_list_capacity() -> usize {
     let header = std::mem::size_of::<SegmentListPageHeader>();
     let seg = std::mem::size_of::<Segment>();
     (pgbuffer::SPECIAL_SIZE - header) / seg
@@ -457,7 +459,9 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     }
 
     let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
-    let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+    let wal = wal_buf
+        .as_struct_mut::<WALHeader>(0)
+        .context("wal header")?;
     if wal.free_head == pg_sys::InvalidBlockNumber {
         return Ok(None);
     }
@@ -470,7 +474,9 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     if magic != FREE_PAGE_MAGIC {
         warning!(
             "free list corruption: block {} has magic {}, expected {}",
-            head, magic, FREE_PAGE_MAGIC
+            head,
+            magic,
+            FREE_PAGE_MAGIC
         );
         wal.free_head = pg_sys::InvalidBlockNumber;
         return Ok(None);
@@ -505,7 +511,9 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     }
 
     let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
-    let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+    let wal = wal_buf
+        .as_struct_mut::<WALHeader>(0)
+        .context("wal header")?;
     let mut head = wal.free_head;
 
     for block in blocks {
@@ -639,7 +647,9 @@ fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) -> Result<Vec
         if magic != FREE_PAGE_MAGIC {
             warning!(
                 "free list corruption: block {} has magic {}, expected {}",
-                blk, magic, FREE_PAGE_MAGIC
+                blk,
+                magic,
+                FREE_PAGE_MAGIC
             );
             break;
         }
@@ -694,9 +704,8 @@ pub fn maybe_truncate_relation(
 
     let max_used = *used.iter().max().unwrap_or(&0);
     let new_nblocks = max_used.saturating_add(1);
-    let nblocks = unsafe {
-        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
-    };
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
     if new_nblocks >= nblocks {
         return Ok(());
     }
@@ -708,7 +717,9 @@ pub fn maybe_truncate_relation(
 
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
         let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
-        let wal = wal_buf.as_struct_mut::<WALHeader>(0).context("wal header")?;
+        let wal = wal_buf
+            .as_struct_mut::<WALHeader>(0)
+            .context("wal header")?;
         let mut head = pg_sys::InvalidBlockNumber;
         for block in keep {
             let mut page = pgbuffer::BlockBuffer::aquire_mut(rel, block)?;
@@ -1021,9 +1032,8 @@ pub fn merge(
 
     let total_bytes = segments
         .iter()
-        .map(|segment| segment.size)
-        .sum::<u64>()
-        .min(usize::MAX as u64) as usize;
+        .map(|segment| segment.size as usize)
+        .sum::<usize>();
     let per_segment_target = std::cmp::max(1usize, total_bytes / target_segments);
     info!(
         "merge: segments={} target_segments={} total_bytes={} per_segment_target={} flush_threshold={}",

@@ -65,8 +65,7 @@ fn flush_segments(
     }
     info!(
         "flush_segments: collector_bytes={} flush_threshold={}",
-        collector_bytes,
-        flush_threshold
+        collector_bytes, flush_threshold
     );
     // Ensure large temporary maps are dropped promptly after encoding.
     let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);

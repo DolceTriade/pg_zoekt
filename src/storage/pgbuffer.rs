@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
-use pgrx::prelude::*;
+use anyhow::{Result, anyhow};
 use pgrx::pg_sys::PgTryBuilder;
+use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 
 #[derive(Debug)]

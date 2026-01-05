@@ -55,12 +55,13 @@ mod implementation {
         crate::storage::pending::init_pending(index_relation, pending_block_number)
             .unwrap_or_else(|e| error!("failed to init pending list: {e:#?}"));
 
-        let mut root_buffer = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, 0) {
-            Ok(root_buffer) => root_buffer,
-            Err(e) => {
-                error!("failed to acquire root buffer: {e:#?}");
-            }
-        };
+        let mut root_buffer =
+            match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, 0) {
+                Ok(root_buffer) => root_buffer,
+                Err(e) => {
+                    error!("failed to acquire root buffer: {e:#?}");
+                }
+            };
         let rbl = root_buffer
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");
@@ -378,10 +379,7 @@ mod implementation {
             pg_sys::FreeExecutorState(estate);
             pg_sys::relation_close(heap_rel, pg_sys::AccessShareLock as i32);
             pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
-            info!(
-                "sealed {} pending tuples (requeued {})",
-                seen, requeued
-            );
+            info!("sealed {} pending tuples (requeued {})", seen, requeued);
         }
     }
 
@@ -824,8 +822,9 @@ mod tests {
 
     #[pg_test]
     pub fn test_merge_parallel_workers_used() -> spi::Result<()> {
-        let max_workers = Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
-            .unwrap_or(0);
+        let max_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+                .unwrap_or(0);
         if max_workers <= 0 {
             info!("skipping parallel merge test: max_parallel_workers=0");
             return Ok(());
@@ -952,6 +951,152 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_index_overhead_totals() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE overhead_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO overhead_docs (text) SELECT repeat(md5(gs::text), 10) FROM generate_series(1, 512) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_overhead_docs_text_zoekt ON overhead_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_overhead_docs_text_zoekt'::regclass)")?;
+
+        let bytes_total: i64 = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT sum(bytes_total)::bigint FROM pg_zoekt_index_overhead('idx_overhead_docs_text_zoekt'::regclass)",
+                None,
+                &[],
+            )?;
+            let row = rows.next().expect("sum row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+        let rel_size = Spi::get_one::<i64>(
+            "SELECT pg_relation_size('idx_overhead_docs_text_zoekt'::regclass)",
+        )?
+        .unwrap_or(0);
+        assert_eq!(
+            bytes_total, rel_size,
+            "overhead totals should match relation size"
+        );
+
+        let accounted: i64 = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT sum(bytes_pg_header + bytes_header + bytes_payload + bytes_free + bytes_unknown)::bigint \
+                 FROM pg_zoekt_index_overhead('idx_overhead_docs_text_zoekt'::regclass)",
+                None,
+                &[],
+            )?;
+            let row = rows.next().expect("sum row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+        assert_eq!(accounted, rel_size, "overhead accounting should balance");
+
+        Spi::run("DROP TABLE IF EXISTS overhead_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_index_overhead_ratio_synthetic() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE overhead_ratio_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO overhead_ratio_docs (text)
+                 SELECT 'doc-' || gs || ' ' || repeat(md5(gs::text), 50)
+                 FROM generate_series(1, 2048) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_overhead_ratio_docs_text_zoekt
+                 ON overhead_ratio_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_overhead_ratio_docs_text_zoekt'::regclass)")?;
+
+        let corpus_bytes: i64 = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT sum(octet_length(text))::bigint FROM overhead_ratio_docs",
+                None,
+                &[],
+            )?;
+            let row = rows.next().expect("sum row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+
+        let index_bytes = Spi::get_one::<i64>(
+            "SELECT pg_relation_size('idx_overhead_ratio_docs_text_zoekt'::regclass)",
+        )?
+        .unwrap_or(0);
+
+        let (payload_bytes, overhead_bytes): (i64, i64) =
+            Spi::connect_mut(|client| -> spi::Result<(i64, i64)> {
+                let mut rows = client.select(
+                    "SELECT \
+                        sum(bytes_payload)::bigint, \
+                        sum(bytes_pg_header + bytes_header + bytes_free + bytes_unknown)::bigint \
+                     FROM pg_zoekt_index_overhead('idx_overhead_ratio_docs_text_zoekt'::regclass)",
+                    None,
+                    &[],
+                )?;
+                let row = rows.next().expect("sum row");
+                let payload = row.get::<i64>(1)?.unwrap_or(0);
+                let overhead = row.get::<i64>(2)?.unwrap_or(0);
+                Ok((payload, overhead))
+            })?;
+
+        let corpus_ratio = if index_bytes > 0 {
+            (corpus_bytes as f64) / (index_bytes as f64)
+        } else {
+            0.0
+        };
+        let overhead_ratio = if index_bytes > 0 {
+            (overhead_bytes as f64) / (index_bytes as f64)
+        } else {
+            0.0
+        };
+        let payload_ratio = if index_bytes > 0 {
+            (payload_bytes as f64) / (index_bytes as f64)
+        } else {
+            0.0
+        };
+
+        info!(
+            "overhead ratio synthetic: corpus_bytes={} index_bytes={} corpus_per_index={:.4} payload_bytes={} overhead_bytes={} payload_ratio={:.4} overhead_ratio={:.4}",
+            corpus_bytes,
+            index_bytes,
+            corpus_ratio,
+            payload_bytes,
+            overhead_bytes,
+            payload_ratio,
+            overhead_ratio
+        );
+
+        Spi::run("DROP TABLE IF EXISTS overhead_ratio_docs")?;
+        assert!(false);
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_seal_does_not_include_late_inserts() -> spi::Result<()> {
         use crate::am::implementation::seal_serial;
 
@@ -1007,10 +1152,9 @@ mod tests {
         seal_serial(index_oid, pending_head);
 
         Spi::run("SET enable_seqscan = OFF")?;
-        let late_hits_before = Spi::get_one::<i64>(
-            "SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'",
-        )?
-        .unwrap_or(0);
+        let late_hits_before =
+            Spi::get_one::<i64>("SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'")?
+                .unwrap_or(0);
         assert_eq!(
             late_hits_before, 0,
             "late inserts should not be indexed by the in-flight seal"
@@ -1018,11 +1162,13 @@ mod tests {
 
         Spi::run("SELECT pg_zoekt_seal('idx_seal_late_docs_text_zoekt'::regclass)")?;
 
-        let late_hits_after = Spi::get_one::<i64>(
-            "SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'",
-        )?
-        .unwrap_or(0);
-        assert_eq!(late_hits_after, 50, "late inserts should be indexed after next seal");
+        let late_hits_after =
+            Spi::get_one::<i64>("SELECT count(*) FROM seal_late_docs WHERE text LIKE 'late-%'")?
+                .unwrap_or(0);
+        assert_eq!(
+            late_hits_after, 50,
+            "late inserts should be indexed after next seal"
+        );
 
         Spi::run("RESET enable_seqscan")?;
         Spi::run("DROP TABLE IF EXISTS seal_late_docs")?;
@@ -1068,7 +1214,11 @@ mod tests {
     #[pg_test]
     pub fn test_truncate_reclaims_tail_blocks() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
-            client.update("CREATE TABLE reclaim_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)", None, &[])?;
+            client.update(
+                "CREATE TABLE reclaim_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
             client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
             client.update(
                 "INSERT INTO reclaim_docs (text) SELECT repeat(md5(i::text), 10) FROM generate_series(1, 512) s(i)",
@@ -1098,26 +1248,24 @@ mod tests {
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
             let segments = crate::query::read_segments(rel).expect("failed to read segments");
-            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)
-                .expect("root buffer");
+            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
 
             // Clear free list to force extension on allocate_block.
             if rbl.wal_block != pg_sys::InvalidBlockNumber {
-                let mut wal_buf = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
-                    .expect("wal buffer");
+                let mut wal_buf =
+                    crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
+                        .expect("wal buffer");
                 let wal = wal_buf
                     .as_struct_mut::<crate::storage::WALHeader>(0)
                     .expect("wal header");
                 wal.free_head = pg_sys::InvalidBlockNumber;
             }
 
-            let nblocks_before = pg_sys::RelationGetNumberOfBlocksInFork(
-                rel,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-            );
+            let nblocks_before =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
 
             let mut extra = Vec::new();
             for _ in 0..8 {
@@ -1125,24 +1273,19 @@ mod tests {
                 extra.push(page.block_number());
             }
 
-            let nblocks_after_alloc = pg_sys::RelationGetNumberOfBlocksInFork(
-                rel,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-            );
+            let nblocks_after_alloc =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
             assert!(
                 nblocks_after_alloc > nblocks_before,
                 "expected relation to grow after allocation"
             );
 
-            crate::storage::free_blocks(rel, &extra)
-                .expect("failed to free extra blocks");
+            crate::storage::free_blocks(rel, &extra).expect("failed to free extra blocks");
             crate::storage::maybe_truncate_relation(rel, rbl, &segments)
                 .expect("failed to truncate relation");
 
-            let nblocks_after_truncate = pg_sys::RelationGetNumberOfBlocksInFork(
-                rel,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-            );
+            let nblocks_after_truncate =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
             assert_eq!(
                 nblocks_after_truncate, nblocks_before,
                 "expected relation to shrink back to original size"

@@ -98,11 +98,7 @@ pub(crate) unsafe fn merge_parallel(
         let group_count = workers.max(1);
         info!(
             "merge_parallel: workers={} target_segments={} flush_threshold={} group_count={} tombstones_empty={}",
-            workers,
-            target_segments,
-            flush_threshold,
-            group_count,
-            tombstones_empty
+            workers, target_segments, flush_threshold, group_count, tombstones_empty
         );
         let mut groups: Vec<Vec<Segment>> = vec![Vec::new(); group_count];
         for (idx, seg) in segments.iter().enumerate() {
@@ -337,8 +333,7 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
         }
         info!(
             "merge_parallel worker: groups={} segments={}",
-            local_groups,
-            local_segments
+            local_groups, local_segments
         );
 
         pg_sys::BufFileExportFileSet(spill_file);
