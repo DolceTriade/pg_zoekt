@@ -1,5 +1,4 @@
 use anyhow::Context;
-use delta_encoding::DeltaDecoderExt;
 use pgrx::prelude::*;
 use zerocopy::TryFromBytes;
 
@@ -35,6 +34,10 @@ pub struct PostingCursor {
     chunk_tids: Vec<ItemPointer>,
     chunk_counts: Vec<u32>,
     chunk_doc_idx: usize,
+
+    blk_nums_buf: Vec<u32>,
+    offs_buf: Vec<u32>,
+    counts_buf: Vec<u32>,
 
     pos_storage: Vec<u8>,
     flag_storage: Vec<u8>,
@@ -196,7 +199,7 @@ pub(crate) unsafe fn copy_posting_bytes<W: Write>(
     len: usize,
     out: &mut W,
 ) -> anyhow::Result<()> {
-    let mut reader = PostingReader::new(rel, entry)?;
+    let mut reader = unsafe { PostingReader::new(rel, entry) }?;
     reader.copy_to(len, out)
 }
 
@@ -297,6 +300,9 @@ impl PostingCursor {
             chunk_tids: Vec::new(),
             chunk_counts: Vec::new(),
             chunk_doc_idx: 0,
+            blk_nums_buf: Vec::new(),
+            offs_buf: Vec::new(),
+            counts_buf: Vec::new(),
             pos_storage: Vec::new(),
             flag_storage: Vec::new(),
             pos_cursor,
@@ -333,31 +339,54 @@ impl PostingCursor {
         let hdr = *CompressedBlockHeader::try_ref_from_bytes(header_bytes)
             .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
         let num_docs = hdr.num_docs as usize;
+        self.chunk_tids.reserve(num_docs);
+        self.chunk_counts.reserve(num_docs);
 
         let blk_bytes = self.reader.take_slice(hdr.docs_blk_len as usize)?;
-        let mut blk_nums = vec![0u32; num_docs];
+        self.blk_nums_buf.clear();
+        self.blk_nums_buf.resize(num_docs, 0u32);
         stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
             blk_bytes,
             num_docs,
-            &mut blk_nums,
+            &mut self.blk_nums_buf,
         );
-        let blk_nums = blk_nums.into_iter().original().collect::<Vec<u32>>();
+        let mut acc = 0u32;
+        for blk in self.blk_nums_buf.iter_mut() {
+            acc = acc.wrapping_add(*blk);
+            *blk = acc;
+        }
 
         let off_bytes = self.reader.take_slice(hdr.docs_off_len as usize)?;
-        let mut offs = vec![0u32; num_docs];
-        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(off_bytes, num_docs, &mut offs);
+        self.offs_buf.clear();
+        self.offs_buf.resize(num_docs, 0u32);
+        stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
+            off_bytes,
+            num_docs,
+            &mut self.offs_buf,
+        );
 
         let count_bytes = self.reader.take_slice(hdr.counts_len as usize)?;
-        let mut counts = vec![0u32; num_docs];
+        self.counts_buf.clear();
+        self.counts_buf.resize(num_docs, 0u32);
         stream_vbyte::decode::decode::<stream_vbyte::x86::Ssse3>(
             count_bytes,
             num_docs,
-            &mut counts,
+            &mut self.counts_buf,
         );
-        let total_positions = counts.iter().copied().map(|c| c as usize).sum::<usize>();
+        let total_positions = self
+            .counts_buf
+            .iter()
+            .copied()
+            .map(|c| c as usize)
+            .sum::<usize>();
 
-        self.chunk_counts.extend(counts.iter().copied());
-        for (blk, off) in blk_nums.into_iter().zip(offs.into_iter()) {
+        self.chunk_counts.extend(self.counts_buf.iter().copied());
+        for (blk, off) in self
+            .blk_nums_buf
+            .iter()
+            .copied()
+            .zip(self.offs_buf.iter().copied())
+        {
             self.chunk_tids.push(ItemPointer {
                 block_number: blk,
                 offset: off as u16,

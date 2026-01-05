@@ -863,7 +863,6 @@ mod tests {
         }
 
         Spi::run("DROP TABLE IF EXISTS merge_parallel_docs")?;
-        assert!(false);
         Ok(())
     }
 

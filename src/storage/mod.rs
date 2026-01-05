@@ -107,10 +107,6 @@ pub fn maintenance_lock(
     })
 }
 
-pub fn maintenance_lock_try(rel: pg_sys::Relation) -> Option<MaintenanceLockGuard> {
-    maintenance_lock(rel, MaintenanceLockMode::Try)
-}
-
 pub fn maintenance_lock_blocking(rel: pg_sys::Relation) -> Option<MaintenanceLockGuard> {
     maintenance_lock(rel, MaintenanceLockMode::Block)
 }
@@ -847,6 +843,59 @@ struct SegmentCursor {
 }
 
 impl SegmentCursor {
+    fn read_block_header(buf: &pgbuffer::BlockBuffer) -> Result<BlockHeader> {
+        let bytes = buf.as_ref();
+        let size = std::mem::size_of::<BlockHeader>();
+        if size > pgbuffer::SPECIAL_SIZE {
+            anyhow::bail!("block header size exceeds page");
+        }
+        let header =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const BlockHeader) };
+        Ok(header)
+    }
+
+    fn read_block_pointer(
+        buf: &pgbuffer::BlockBuffer,
+        idx: usize,
+        count: usize,
+    ) -> Result<BlockPointer> {
+        if idx >= count {
+            anyhow::bail!("block pointer index out of range");
+        }
+        let size = std::mem::size_of::<BlockPointer>();
+        let base = std::mem::size_of::<BlockHeader>();
+        let offset = base
+            .checked_add(idx.saturating_mul(size))
+            .context("block pointer offset overflow")?;
+        if offset + size > pgbuffer::SPECIAL_SIZE {
+            anyhow::bail!("block pointer offset out of bounds");
+        }
+        let bytes = buf.as_ref();
+        let ptr = unsafe { bytes.as_ptr().add(offset) as *const BlockPointer };
+        Ok(unsafe { std::ptr::read_unaligned(ptr) })
+    }
+
+    fn read_index_entry(
+        buf: &pgbuffer::BlockBuffer,
+        idx: usize,
+        count: usize,
+    ) -> Result<IndexEntry> {
+        if idx >= count {
+            anyhow::bail!("index entry out of range");
+        }
+        let size = std::mem::size_of::<IndexEntry>();
+        let base = std::mem::size_of::<BlockHeader>();
+        let offset = base
+            .checked_add(idx.saturating_mul(size))
+            .context("index entry offset overflow")?;
+        if offset + size > pgbuffer::SPECIAL_SIZE {
+            anyhow::bail!("index entry offset out of bounds");
+        }
+        let bytes = buf.as_ref();
+        let ptr = unsafe { bytes.as_ptr().add(offset) as *const IndexEntry };
+        Ok(unsafe { std::ptr::read_unaligned(ptr) })
+    }
+
     fn new(rel: pg_sys::Relation, segment: &Segment) -> Result<Self> {
         let mut cursor = Self {
             rel,
@@ -867,27 +916,18 @@ impl SegmentCursor {
 
     fn read_child_block(&self, block: u32, idx: usize) -> Result<u32> {
         let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
-        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        let header = Self::read_block_header(&buf)?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic while merging");
         }
-        let pointers = buf
-            .as_struct_with_elems::<BlockPointerList>(
-                std::mem::size_of::<BlockHeader>(),
-                header.num_entries as usize,
-            )
-            .context("block pointers")?;
-        let entry = pointers
-            .entries
-            .get(idx)
-            .context("block pointer index")?;
+        let entry = Self::read_block_pointer(&buf, idx, header.num_entries as usize)?;
         Ok(entry.block)
     }
 
     fn descend_leftmost(&mut self, mut block: u32) -> Result<()> {
         loop {
             let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
-            let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+            let header = Self::read_block_header(&buf)?;
             if header.magic != BLOCK_MAGIC {
                 anyhow::bail!("invalid block magic while merging");
             }
@@ -903,19 +943,7 @@ impl SegmentCursor {
                 self.leaf_entry_count = 0;
                 return Ok(());
             }
-            let child = {
-                let pointers = buf
-                    .as_struct_with_elems::<BlockPointerList>(
-                        std::mem::size_of::<BlockHeader>(),
-                        count,
-                    )
-                    .context("block pointers")?;
-                pointers
-                    .entries
-                    .get(0)
-                    .context("block pointer")?
-                    .block
-            };
+            let child = Self::read_block_pointer(&buf, 0, count)?.block;
             self.stack.push(InternalFrame {
                 block,
                 next_idx: 1,
@@ -951,16 +979,7 @@ impl SegmentCursor {
         if self.leaf_entry_idx >= self.leaf_entry_count {
             return Ok(false);
         }
-        let entries = leaf
-            .as_struct_with_elems::<IndexList>(
-                std::mem::size_of::<BlockHeader>(),
-                self.leaf_entry_count,
-            )
-            .context("index entries")?;
-        let entry = *entries
-            .entries
-            .get(self.leaf_entry_idx)
-            .context("index entry")?;
+        let entry = Self::read_index_entry(leaf, self.leaf_entry_idx, self.leaf_entry_count)?;
         self.leaf_entry_idx += 1;
         self.current = Some(entry);
         Ok(true)
