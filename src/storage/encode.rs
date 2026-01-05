@@ -169,7 +169,7 @@ impl Encoder {
     }
 }
 
-fn build_segment_root(
+pub(crate) fn build_segment_root(
     rel: pg_sys::Relation,
     leaves: &[super::BlockPointer],
 ) -> anyhow::Result<u32> {

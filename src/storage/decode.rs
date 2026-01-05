@@ -3,6 +3,8 @@ use delta_encoding::DeltaDecoderExt;
 use pgrx::prelude::*;
 use zerocopy::TryFromBytes;
 
+use std::io::Write;
+
 use super::{CompressedBlockHeader, IndexEntry, ItemPointer};
 use crate::storage::pgbuffer::BlockBuffer;
 
@@ -157,6 +159,28 @@ impl PostingReader {
         self.page_free = header_copy.free as usize;
         Ok(())
     }
+
+    fn copy_to<W: Write>(&mut self, mut len: usize, out: &mut W) -> anyhow::Result<()> {
+        if len > self.remaining {
+            anyhow::bail!("posting copy exceeds declared length");
+        }
+        while len > 0 {
+            let available = self.page_free.saturating_sub(self.cursor);
+            if available == 0 {
+                self.advance_page()?;
+                continue;
+            }
+            let take = available.min(len);
+            let page = self.buf.as_ref();
+            let end = self.cursor + take;
+            out.write_all(&page[self.cursor..end])
+                .context("write posting bytes")?;
+            self.cursor = end;
+            self.remaining -= take;
+            len -= take;
+        }
+        Ok(())
+    }
 }
 
 fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
@@ -164,6 +188,16 @@ fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
     let offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.offset)) };
     let data_length = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length)) };
     (block, offset, data_length)
+}
+
+pub(crate) unsafe fn copy_posting_bytes<W: Write>(
+    rel: pg_sys::Relation,
+    entry: &IndexEntry,
+    len: usize,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let mut reader = PostingReader::new(rel, entry)?;
+    reader.copy_to(len, out)
 }
 
 #[cfg(test)]

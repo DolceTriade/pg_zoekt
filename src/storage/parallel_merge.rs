@@ -23,7 +23,6 @@ static PARALLEL_MERGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 struct ParallelMergeParams {
     indexrelid: Oid,
     group_count: usize,
-    target_segments: usize,
     flush_threshold: usize,
     segments_len: usize,
     offsets_len: usize,
@@ -85,7 +84,7 @@ unsafe fn cleanup_parallel_context(pcxt: *mut pg_sys::ParallelContext) {
 pub(crate) unsafe fn merge_parallel(
     rel: pg_sys::Relation,
     segments: &[Segment],
-    target_segments: usize,
+    offsets: &[u32],
     flush_threshold: usize,
     tombstones_empty: bool,
     workers: usize,
@@ -95,23 +94,12 @@ pub(crate) unsafe fn merge_parallel(
             return None;
         }
 
-        let group_count = workers.max(1);
+        let group_count = offsets.len().saturating_sub(1);
         info!(
-            "merge_parallel: workers={} target_segments={} flush_threshold={} group_count={} tombstones_empty={}",
-            workers, target_segments, flush_threshold, group_count, tombstones_empty
+            "merge_parallel: workers={} group_count={} tombstones_empty={}",
+            workers, group_count, tombstones_empty
         );
-        let mut groups: Vec<Vec<Segment>> = vec![Vec::new(); group_count];
-        for (idx, seg) in segments.iter().enumerate() {
-            groups[idx % group_count].push(*seg);
-        }
-        let mut offsets: Vec<u32> = Vec::with_capacity(group_count + 1);
-        offsets.push(0);
-        let mut flat: Vec<Segment> = Vec::with_capacity(segments.len());
-        for group in groups.iter() {
-            flat.extend_from_slice(group);
-            offsets.push(flat.len() as u32);
-        }
-        if flat.is_empty() {
+        if group_count == 0 {
             return Some(Vec::new());
         }
 
@@ -127,9 +115,8 @@ pub(crate) unsafe fn merge_parallel(
         let params = ParallelMergeParams {
             indexrelid: index_oid,
             group_count,
-            target_segments,
             flush_threshold,
-            segments_len: flat.len(),
+            segments_len: segments.len(),
             offsets_len: offsets.len(),
             tombstones_empty,
         };
@@ -137,7 +124,7 @@ pub(crate) unsafe fn merge_parallel(
         toc_estimate_single_chunk(pcxt, size_of::<ParallelMergeShared>());
         let shared_fileset_size = size_of::<SharedFileSetComplete>();
         toc_estimate_single_chunk(pcxt, shared_fileset_size);
-        toc_estimate_single_chunk(pcxt, flat.len() * size_of::<Segment>());
+        toc_estimate_single_chunk(pcxt, segments.len() * size_of::<Segment>());
         toc_estimate_single_chunk(pcxt, offsets.len() * size_of::<u32>());
 
         pg_sys::InitializeParallelDSM(pcxt);
@@ -170,12 +157,12 @@ pub(crate) unsafe fn merge_parallel(
         );
         (*shared_fileset_ptr_complete).segment = (*pcxt).seg;
 
-        let segments_ptr = pg_sys::shm_toc_allocate((*pcxt).toc, flat.len() * size_of::<Segment>())
+        let segments_ptr = pg_sys::shm_toc_allocate((*pcxt).toc, segments.len() * size_of::<Segment>())
             .cast::<Segment>();
         if segments_ptr.is_null() {
             pgrx::error!("failed to allocate merge segments");
         }
-        std::ptr::copy_nonoverlapping(flat.as_ptr(), segments_ptr, flat.len());
+        std::ptr::copy_nonoverlapping(segments.as_ptr(), segments_ptr, segments.len());
 
         let offsets_ptr =
             pg_sys::shm_toc_allocate((*pcxt).toc, offsets.len() * size_of::<u32>()).cast::<u32>();
@@ -321,18 +308,17 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
             let merged = crate::storage::merge(
                 indexrel,
                 slice,
-                params.target_segments,
                 params.flush_threshold,
                 &tombstones,
             )
             .unwrap_or_else(|e| error!("failed to merge group segments: {e:#?}"));
             pg_sys::check_for_interrupts!();
-            write_segment_batch(spill_file, &merged);
+            write_segment_batch(spill_file, std::slice::from_ref(&merged));
             local_groups = local_groups.saturating_add(1);
-            local_segments = local_segments.saturating_add(merged.len());
+            local_segments = local_segments.saturating_add(1);
         }
         info!(
-            "merge_parallel worker: groups={} segments={}",
+            "merge_parallel worker: groups={} merged_segments={}",
             local_groups, local_segments
         );
 

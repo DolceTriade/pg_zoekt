@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 /// Storing stuff
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::io::Write;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub const TARGET_SEGMENTS: usize = 10;
@@ -370,62 +371,68 @@ pub fn merge_with_workers(
     workers: Option<usize>,
 ) -> Result<Vec<Segment>> {
     let workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
-    if workers <= 1 || segments.len() <= target_segments {
-        info!("Serial merge...");
-        return merge(rel, segments, target_segments, flush_threshold, tombstones);
+    let target_segments = target_segments.max(1);
+    if segments.len() <= target_segments {
+        return Ok(segments.to_vec());
     }
-    let mut current = segments.to_vec();
-    let mut rounds = 0usize;
-    while current.len() > target_segments {
-        let Some(interim) = (unsafe {
+    info!(
+        "merge_with_workers: segments={} target_segments={} workers={}",
+        segments.len(),
+        target_segments,
+        workers
+    );
+
+    // Partition segments into `target_segments` groups by total size.
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|seg| std::cmp::Reverse(seg.size));
+    let mut groups: Vec<(u64, Vec<Segment>)> = (0..target_segments)
+        .map(|_| (0u64, Vec::new()))
+        .collect();
+    for seg in sorted {
+        if let Some((total, bucket)) = groups.iter_mut().min_by_key(|g| g.0) {
+            *total = total.saturating_add(seg.size);
+            bucket.push(seg);
+        }
+    }
+    let mut flat = Vec::new();
+    let mut offsets = Vec::with_capacity(groups.len() + 1);
+    offsets.push(0u32);
+    for (_, group) in groups.iter() {
+        flat.extend_from_slice(group);
+        offsets.push(flat.len() as u32);
+    }
+    info!(
+        "merge_with_workers: group_count={} total_input_segments={}",
+        offsets.len().saturating_sub(1),
+        flat.len()
+    );
+
+    if workers > 1 {
+        if let Some(merged) = unsafe {
             parallel_merge::merge_parallel(
                 rel,
-                &current,
-                target_segments,
+                &flat,
+                &offsets,
                 flush_threshold,
                 tombstones.is_empty(),
                 workers,
             )
-        }) else {
-            break;
-        };
-        rounds = rounds.saturating_add(1);
-        if interim.len() >= current.len() {
-            info!(
-                "merge_parallel: no progress (rounds={}, segments_before={}, segments_after={})",
-                rounds,
-                current.len(),
-                interim.len()
-            );
-            break;
-        }
-        current = interim;
-        if current.len() <= target_segments {
-            info!(
-                "merge_parallel: completed in {} rounds (segments={})",
-                rounds,
-                current.len()
-            );
-            return Ok(current);
+        } {
+            return Ok(merged);
         }
     }
-    let group_count = workers.max(1);
-    let mut groups: Vec<Vec<Segment>> = vec![Vec::new(); group_count];
-    for (idx, seg) in current.iter().enumerate() {
-        groups[idx % group_count].push(*seg);
-    }
-    let mut interim = Vec::new();
-    for group in groups {
-        if group.is_empty() {
+
+    let mut merged = Vec::new();
+    for window in offsets.windows(2) {
+        let start = window[0] as usize;
+        let end = window[1] as usize;
+        if start >= end {
             continue;
         }
-        let mut merged = merge(rel, &group, target_segments, flush_threshold, tombstones)?;
-        interim.append(&mut merged);
+        let segs = &flat[start..end];
+        merged.push(merge(rel, segs, flush_threshold, tombstones)?);
     }
-    if interim.len() <= target_segments {
-        return Ok(interim);
-    }
-    merge(rel, &interim, target_segments, flush_threshold, tombstones)
+    Ok(merged)
 }
 
 #[cfg(feature = "pg_test")]
@@ -1107,6 +1114,7 @@ fn merge_entry_postings_stream(
             }
             continue;
         }
+        let needs_sort = cursor_indices.len() > 1;
 
         occs.clear();
         for idx in cursor_indices.iter().copied() {
@@ -1127,7 +1135,9 @@ fn merge_entry_postings_stream(
         }
 
         if !occs.is_empty() {
-            occs.sort_unstable_by_key(|occ| occ.position());
+            if needs_sort {
+                occs.sort_unstable_by_key(|occ| occ.position());
+            }
             on_doc(target, &occs)?;
         }
     }
@@ -1135,45 +1145,17 @@ fn merge_entry_postings_stream(
     Ok(())
 }
 
-fn flush_collector(
-    rel: pg_sys::Relation,
-    collector: &mut crate::trgm::Collector,
-    target: &mut Vec<Segment>,
-) -> Result<()> {
-    let trgms = collector.take_trgms();
-    if trgms.is_empty() {
-        return Ok(());
-    }
-    let mut segments = encode::Encoder::encode_trgms(rel, &trgms)?;
-    target.append(&mut segments);
-    Ok(())
-}
-
 pub fn merge(
     rel: pg_sys::Relation,
     segments: &[Segment],
-    target_segments: usize,
-    flush_threshold: usize,
+    _flush_threshold: usize,
     tombstones: &tombstone::Snapshot,
-) -> Result<Vec<Segment>> {
-    let target_segments = target_segments.max(1);
-    if segments.len() <= target_segments {
-        return Ok(segments.to_vec());
-    }
-
+) -> Result<Segment> {
     let total_bytes = segments
         .iter()
         .map(|segment| segment.size as usize)
         .sum::<usize>();
-    let per_segment_target = std::cmp::max(1usize, total_bytes / target_segments);
-    info!(
-        "merge: segments={} target_segments={} total_bytes={} per_segment_target={} flush_threshold={}",
-        segments.len(),
-        target_segments,
-        total_bytes,
-        per_segment_target,
-        flush_threshold
-    );
+    info!("merge: segments={} total_bytes={}", segments.len(), total_bytes);
 
     let mut cursors = Vec::new();
     for segment in segments {
@@ -1184,16 +1166,13 @@ pub fn merge(
     }
 
     if cursors.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Segment {
+            block: pg_sys::InvalidBlockNumber,
+            size: 0,
+        });
     }
 
-    let mut collector = crate::trgm::Collector::new();
-    let mut bytes_since_flush = 0usize;
-    let mut processed_bytes: u64 = 0;
-    let mut result = Vec::new();
-    let mut interrupt_counter: u32 = 0;
-    let mut flush_count: u64 = 0;
-
+    // Heap of (trigram, cursor_idx) for k-way merge across segments.
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
     for (idx, cursor) in cursors.iter().enumerate() {
         if let Some(entry) = cursor.current_entry() {
@@ -1201,13 +1180,68 @@ pub fn merge(
         }
     }
 
+    // Stream postings directly into pages while building leaf index entries.
+    let mut writer = crate::storage::encode::PageWriter::new(rel, pgbuffer::SPECIAL_SIZE);
+    let mut leaf: Option<pgbuffer::BlockBuffer> = None;
+    let mut leaf_block = pg_sys::InvalidBlockNumber;
+    let mut leaf_min_trigram: Option<u32> = None;
+    let mut leaf_entries_written: usize = 0;
+    let mut leaf_pointers: Vec<BlockPointer> = Vec::new();
+    const BH_SIZE: usize = std::mem::size_of::<BlockHeader>();
+    const ENTRY_SIZE: usize = std::mem::size_of::<IndexEntry>();
+    let leaf_entry_cap = (pgbuffer::SPECIAL_SIZE - BH_SIZE) / ENTRY_SIZE;
+
+    let mut byte_count: u64 = 0;
+    let mut doc_count: u64 = 0;
+    let mut occ_count: u64 = 0;
+    let mut occ_count_known = true;
+    let max_chunk_size =
+        pgbuffer::SPECIAL_SIZE - std::mem::size_of::<PostingPageHeader>();
+
+    fn start_leaf(
+        rel: pg_sys::Relation,
+        leaf: &mut Option<pgbuffer::BlockBuffer>,
+        leaf_block: &mut u32,
+        leaf_entries_written: &mut usize,
+        leaf_min_trigram: &mut Option<u32>,
+    ) -> Result<()> {
+        let mut page = allocate_block(rel);
+        *leaf_block = page.block_number();
+        let header = page
+            .as_struct_mut::<BlockHeader>(0)
+            .context("block header")?;
+        header.magic = BLOCK_MAGIC;
+        header.level = 0;
+        header.num_entries = 0;
+        *leaf_entries_written = 0;
+        *leaf_min_trigram = None;
+        *leaf = Some(page);
+        Ok(())
+    }
+
+    fn finalize_leaf(
+        leaf: &mut Option<pgbuffer::BlockBuffer>,
+        leaf_entries_written: usize,
+        leaf_min_trigram: &Option<u32>,
+        leaf_block: u32,
+        leaf_pointers: &mut Vec<BlockPointer>,
+    ) -> Result<()> {
+        if leaf_entries_written == 0 {
+            *leaf = None;
+            return Ok(());
+        }
+        let min_trigram = leaf_min_trigram.context("leaf missing min trigram")?;
+        leaf_pointers.push(BlockPointer {
+            min_trigram,
+            block: leaf_block,
+        });
+        *leaf = None;
+        Ok(())
+    }
+
     let mut group_entries: Vec<IndexEntry> = Vec::new();
     let mut cursor_indices: Vec<usize> = Vec::new();
     while let Some(Reverse((trigram, idx))) = heap.pop() {
-        interrupt_counter = interrupt_counter.wrapping_add(1);
-        if (interrupt_counter & 0x3ff) == 0 {
-            pg_sys::check_for_interrupts!();
-        }
         cursor_indices.clear();
         cursor_indices.push(idx);
         while let Some(Reverse((next_trigram, next_idx))) = heap.peek().cloned() {
@@ -1218,57 +1252,188 @@ pub fn merge(
             cursor_indices.push(next_idx);
         }
 
+        // Collect all segment entries for this trigram and advance those cursors.
         group_entries.clear();
         for idx in cursor_indices.iter().copied() {
             let cursor = &mut cursors[idx];
-            while let Some(entry) = cursor.current_entry() {
-                if entry.trigram != trigram {
-                    break;
-                }
-                group_entries.push(*entry);
-                cursor.advance()?;
+            let Some(entry) = cursor.current_entry() else {
+                continue;
+            };
+            if entry.trigram != trigram {
+                continue;
             }
-            if let Some(entry) = cursor.current_entry() {
-                heap.push(Reverse((entry.trigram, idx)));
+            group_entries.push(*entry);
+            cursor.advance()?;
+            if let Some(next) = cursor.current_entry() {
+                heap.push(Reverse((next.trigram, idx)));
             }
         }
 
-        merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
-            collector.add_occurrences(trigram, doc, occs);
-            Ok(())
-        })?;
-        let group_bytes = group_entries
-            .iter()
-            .map(|entry| entry.data_length as usize)
-            .sum::<usize>();
-        bytes_since_flush += group_bytes;
-        processed_bytes = processed_bytes.saturating_add(group_bytes as u64);
-        if collector.memory_usage() >= flush_threshold || bytes_since_flush >= per_segment_target {
-            let collector_bytes = collector.memory_usage();
-            flush_collector(rel, &mut collector, &mut result)?;
-            flush_count = flush_count.saturating_add(1);
-            if (flush_count & 0x3f) == 0 {
-                let pct = if total_bytes == 0 {
-                    0.0
-                } else {
-                    (processed_bytes as f64 / total_bytes as f64) * 100.0
-                };
-                info!(
-                    "merge flush: count={} collector_bytes={} bytes_since_flush={} result_segments={} progress_pct={:.1}",
-                    flush_count,
-                    collector_bytes,
-                    bytes_since_flush,
-                    result.len(),
-                    pct
+        if leaf.is_none() {
+            start_leaf(
+                rel,
+                &mut leaf,
+                &mut leaf_block,
+                &mut leaf_entries_written,
+                &mut leaf_min_trigram,
+            )?;
+        }
+        if leaf_entries_written >= leaf_entry_cap {
+            finalize_leaf(
+                &mut leaf,
+                leaf_entries_written,
+                &leaf_min_trigram,
+                leaf_block,
+                &mut leaf_pointers,
+            )?;
+            start_leaf(
+                rel,
+                &mut leaf,
+                &mut leaf_block,
+                &mut leaf_entries_written,
+                &mut leaf_min_trigram,
+            )?;
+        }
+
+        // Encode postings for this trigram into posting pages.
+        let mut idx_entry = IndexEntry {
+            trigram,
+            block: 0,
+            offset: 0,
+            data_length: 0,
+            frequency: 0,
+        };
+        let mut trgm_docs: u32 = 0;
+        let mut builder = encode::CompressedBatchBuilder::new();
+        let mut compressed = Vec::new();
+        let mut first_chunk = false;
+
+        let mut flush_chunk = |builder: &mut encode::CompressedBatchBuilder,
+                               idx: &mut IndexEntry,
+                               first_chunk: &mut bool|
+         -> Result<()> {
+            if builder.num_docs() == 0 {
+                return Ok(());
+            }
+            builder.compress_into(&mut compressed);
+            if compressed.len() > max_chunk_size {
+                anyhow::bail!(
+                    "chunk size {} exceeds page capacity {}",
+                    compressed.len(),
+                    max_chunk_size
                 );
             }
-            bytes_since_flush = 0;
+            let loc = writer.start_chunk(compressed.len());
+            writer
+                .write_all(&compressed)
+                .expect("posting write succeeds");
+            if !*first_chunk {
+                idx.block = loc.block_number;
+                idx.offset = loc.offset as u16;
+                *first_chunk = true;
+            }
+            idx.data_length = idx
+                .data_length
+                .checked_add(compressed.len() as u32)
+                .expect("overflow on data length");
+            byte_count = byte_count.saturating_add(compressed.len() as u64);
+            builder.reset();
+            Ok(())
+        };
+
+        if group_entries.len() == 1 && tombstones.is_empty() {
+            let entry = &group_entries[0];
+            let (_, _, data_length) = entry_fields(entry);
+            let frequency =
+                unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.frequency)) };
+            idx_entry.data_length = data_length;
+            idx_entry.frequency = frequency;
+            if data_length > 0 {
+                let first_len = (data_length as usize).min(max_chunk_size);
+                let loc = writer.start_chunk(first_len);
+                idx_entry.block = loc.block_number;
+                idx_entry.offset = loc.offset as u16;
+                unsafe {
+                    crate::storage::decode::copy_posting_bytes(
+                        rel,
+                        entry,
+                        data_length as usize,
+                        &mut writer,
+                    )?;
+                }
+                byte_count = byte_count.saturating_add(data_length as u64);
+            }
+            doc_count = doc_count.saturating_add(frequency as u64);
+            occ_count_known = false;
+        } else {
+            merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
+                trgm_docs = trgm_docs.saturating_add(1);
+                doc_count = doc_count.saturating_add(1);
+                occ_count = occ_count.saturating_add(occs.len() as u64);
+                if occs.is_empty() {
+                    return Ok(());
+                }
+                let mut start = 0usize;
+                while start < occs.len() {
+                    if builder.num_docs() >= u8::MAX as usize {
+                        flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+                        continue;
+                    }
+
+                    let remaining = occs.len() - start;
+                    let can_take = builder.max_positions_fit(max_chunk_size).min(remaining);
+                    if can_take == 0 {
+                        if builder.num_docs() == 0 {
+                            anyhow::bail!(
+                                "single doc chunk size {} exceeds page capacity {}",
+                                occs.len(),
+                                max_chunk_size
+                            );
+                        }
+                        flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+                        continue;
+                    }
+                    builder.add(doc, &occs[start..start + can_take]);
+                    start += can_take;
+                }
+                Ok(())
+            })?;
+            flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+            idx_entry.frequency = trgm_docs;
         }
+
+        let leaf_ref = leaf.as_mut().context("leaf buffer")?;
+        let header = leaf_ref
+            .as_struct_mut::<BlockHeader>(0)
+            .context("block header")?;
+        header.num_entries = (leaf_entries_written + 1) as u32;
+        let entries = leaf_ref
+            .as_struct_with_elems_mut::<IndexList>(BH_SIZE, leaf_entry_cap)
+            .context("index entries")?;
+        entries.entries[leaf_entries_written] = idx_entry;
+        if leaf_min_trigram.is_none() {
+            leaf_min_trigram = Some(trigram);
+        }
+        leaf_entries_written += 1;
     }
 
-    if collector.memory_usage() > 0 {
-        flush_collector(rel, &mut collector, &mut result)?;
+    finalize_leaf(
+        &mut leaf,
+        leaf_entries_written,
+        &leaf_min_trigram,
+        leaf_block,
+        &mut leaf_pointers,
+    )?;
+    if occ_count_known {
+        info!(
+            "Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes"
+        );
+    } else {
+        info!("Encoded {doc_count} docs and {byte_count} bytes (occs elided)");
     }
-
-    Ok(result)
+    let segment = Segment {
+        block: crate::storage::encode::build_segment_root(rel, &leaf_pointers)?,
+        size: byte_count,
+    };
+    Ok(segment)
 }

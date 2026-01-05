@@ -85,31 +85,6 @@ fn flush_segments(
                 error!("failed to append segments: {e:#?}");
             }
 
-            const MAX_ACTIVE_SEGMENTS: u32 = 512;
-            const COMPACT_TARGET_SEGMENTS: usize = 64;
-            if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-                if let Some(_lock) = crate::storage::maintenance_lock_try(rel) {
-                    let existing = crate::storage::segment_list_read(rel, rbl)
-                        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                    let merged = crate::storage::merge_with_workers(
-                        rel,
-                        &existing,
-                        COMPACT_TARGET_SEGMENTS,
-                        flush_threshold.saturating_mul(16).max(1024 * 1024),
-                        &crate::storage::tombstone::Snapshot::default(),
-                        None,
-                    )
-                    .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-                    crate::storage::segment_list_rewrite(rel, rbl, &merged)
-                        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-                    if merged != existing {
-                        crate::storage::free_segments(rel, &existing)
-                            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                        crate::storage::maybe_truncate_relation(rel, rbl, &merged)
-                            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
-                    }
-                }
-            }
         }
         Err(e) => {
             error!("failed to flush segment: {e:#?}");
@@ -309,24 +284,24 @@ fn finalize_segment_list(
         crate::storage::TARGET_SEGMENTS
     );
     let tombstones = crate::storage::tombstone::Snapshot::default();
-    if let Some(_lock) = crate::storage::maintenance_lock_try(index_relation) {
-        let merged = crate::storage::merge_with_workers(
-            index_relation,
-            &existing,
-            crate::storage::TARGET_SEGMENTS,
-            flush_threshold,
-            &tombstones,
-            None,
-        )
-        .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
-        crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
-            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-        if merged != existing {
-            crate::storage::free_segments(index_relation, &existing)
-                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-            crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
-                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
-        }
+    let _lock = crate::storage::maintenance_lock_blocking(index_relation)
+        .unwrap_or_else(|| error!("failed to acquire maintenance lock"));
+    let merged = crate::storage::merge_with_workers(
+        index_relation,
+        &existing,
+        crate::storage::TARGET_SEGMENTS,
+        flush_threshold,
+        &tombstones,
+        None,
+    )
+    .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
+    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
+        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    if merged != existing {
+        crate::storage::free_segments(index_relation, &existing)
+            .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+        crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
+            .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
     }
 }
 

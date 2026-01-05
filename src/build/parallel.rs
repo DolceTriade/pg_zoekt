@@ -343,32 +343,6 @@ pub(super) unsafe fn build_parallel(
         crate::storage::segment_list_append(index_relation, rbl, &all_segments)
             .unwrap_or_else(|e| error!("failed to append segments: {e:#?}"));
 
-        // Perform final merge if we have too many segments
-        const MAX_ACTIVE_SEGMENTS: u32 = 512;
-        const COMPACT_TARGET_SEGMENTS: usize = 64;
-        if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-            let existing = crate::storage::segment_list_read(index_relation, rbl)
-                .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-            let tombstones = crate::storage::tombstone::Snapshot::default();
-            let merged = crate::storage::merge_with_workers(
-                index_relation,
-                &existing,
-                COMPACT_TARGET_SEGMENTS,
-                flush_threshold.saturating_mul(16).max(1024 * 1024),
-                &tombstones,
-                None,
-            )
-            .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-            crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
-                .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-            if merged != existing {
-                crate::storage::free_segments(index_relation, &existing)
-                    .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
-                    .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
-            }
-        }
-
         let ntuples = (*parallel_shared)
             .build_state
             .ntuples

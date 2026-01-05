@@ -192,11 +192,7 @@ mod implementation {
         Ok(())
     }
 
-    fn flush_collector(
-        rel: pg_sys::Relation,
-        collector: &mut crate::trgm::Collector,
-        flush_threshold: usize,
-    ) {
+    fn flush_collector(rel: pg_sys::Relation, collector: &mut crate::trgm::Collector) {
         let trgms = collector.take_trgms();
         if trgms.is_empty() {
             return;
@@ -216,32 +212,6 @@ mod implementation {
                     .expect("root header");
                 if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
                     error!("failed to append segments: {e:#?}");
-                }
-
-                const MAX_ACTIVE_SEGMENTS: u32 = 512;
-                const COMPACT_TARGET_SEGMENTS: usize = 64;
-                if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-                    if let Some(_lock) = crate::storage::maintenance_lock_blocking(rel) {
-                        let existing = crate::storage::segment_list_read(rel, rbl)
-                            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-                        let merged = crate::storage::merge_with_workers(
-                            rel,
-                            &existing,
-                            COMPACT_TARGET_SEGMENTS,
-                            flush_threshold.saturating_mul(16).max(1024 * 1024),
-                            &crate::storage::tombstone::Snapshot::default(),
-                            None,
-                        )
-                        .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-                        crate::storage::segment_list_rewrite(rel, rbl, &merged)
-                            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-                        if merged != existing {
-                            crate::storage::free_segments(rel, &existing)
-                                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                            crate::storage::maybe_truncate_relation(rel, rbl, &merged)
-                                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
-                        }
-                    }
                 }
             }
             Err(e) => {
@@ -347,14 +317,14 @@ mod implementation {
                     &mut collector,
                     |collector| {
                         if collector.memory_usage() >= flush_threshold {
-                            flush_collector(index_rel, collector, flush_threshold);
+                            flush_collector(index_rel, collector);
                         }
                     },
                 ) {
                     seen = seen.saturating_add(1);
                 }
                 if collector.memory_usage() >= flush_threshold {
-                    flush_collector(index_rel, &mut collector, flush_threshold);
+                    flush_collector(index_rel, &mut collector);
                 }
                 pg_sys::ExecClearTuple(slot);
             });
@@ -365,7 +335,7 @@ mod implementation {
                 warning!("failed to drain pending list: {e:#?}");
             }
 
-            flush_collector(index_rel, &mut collector, flush_threshold);
+            flush_collector(index_rel, &mut collector);
 
             if let Err(e) = merge_segments(
                 index_rel,
@@ -570,6 +540,7 @@ pub use implementation::pg_zoekt_handler;
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+    use std::collections::HashSet;
 
     fn de_bruijn(k: &[u8], n: usize) -> String {
         // Classic de Bruijn sequence generator: returns a string where every length-n
@@ -713,14 +684,17 @@ mod tests {
             let merged = crate::storage::merge(
                 rel,
                 &segments,
-                1,
                 1024 * 1024 * 1024,
                 &crate::storage::tombstone::Snapshot::default(),
             )
             .expect("merge failed");
-            info!("merged.len() = {}", merged.len());
-            assert!(!merged.is_empty());
-            assert!(merged.len() == 1);
+            let merged_block = std::ptr::read_unaligned(std::ptr::addr_of!(merged.block));
+            info!("merged.block = {}", merged_block);
+            assert_ne!(
+                merged_block,
+                pg_sys::InvalidBlockNumber,
+                "expected merged segment"
+            );
 
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         }
@@ -889,6 +863,7 @@ mod tests {
         }
 
         Spi::run("DROP TABLE IF EXISTS merge_parallel_docs")?;
+        assert!(false);
         Ok(())
     }
 
@@ -1097,6 +1072,81 @@ mod tests {
             "expected index size within 2x corpus (corpus_per_index={:.4})",
             corpus_ratio
         );
+        Ok(())
+    }
+
+    fn assert_no_duplicate_postings(index_oid: pg_sys::Oid) {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("read segments");
+            let tombstones = crate::storage::tombstone::load_snapshot(rel)
+                .unwrap_or_else(|e| error!("tombstone load failed: {e:#?}"));
+            let mut seen: HashSet<(u32, crate::storage::ItemPointer)> = HashSet::new();
+            for seg in segments {
+                let entries =
+                    crate::storage::read_segment_entries(rel, &seg).expect("segment entries");
+                for entry in entries {
+                    let trigram = std::ptr::read_unaligned(std::ptr::addr_of!(entry.trigram));
+                    let mut cursor = crate::storage::decode::PostingCursor::new(rel, &entry)
+                        .expect("posting cursor");
+                    while cursor.advance().expect("cursor advance") {
+                        let doc = cursor.current().expect("posting doc");
+                        if tombstones.contains(doc.tid) {
+                            continue;
+                        }
+                        let key = (trigram, doc.tid);
+                        if !seen.insert(key) {
+                            error!("duplicate posting for trigram {} tid {:?}", trigram, doc.tid);
+                        }
+                    }
+                }
+            }
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+    }
+
+    #[pg_test]
+    pub fn test_no_duplicate_postings_after_update() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE nodup_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO nodup_docs (text) SELECT 'doc-' || gs FROM generate_series(1, 200) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_nodup_docs_text_zoekt ON nodup_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_nodup_docs_text_zoekt'::regclass)")?;
+        Spi::run(
+            "UPDATE nodup_docs SET text = text || '-u' WHERE id % 5 = 0",
+        )?;
+        Spi::run("SELECT pg_zoekt_seal('idx_nodup_docs_text_zoekt'::regclass)")?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_nodup_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        assert_no_duplicate_postings(index_oid);
+
+        Spi::run("DROP TABLE IF EXISTS nodup_docs")?;
         Ok(())
     }
 
