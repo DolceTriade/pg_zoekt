@@ -381,9 +381,8 @@ pub fn merge_with_workers(
     // Partition segments into `target_segments` groups by total size.
     let mut sorted = segments.to_vec();
     sorted.sort_by_key(|seg| std::cmp::Reverse(seg.size));
-    let mut groups: Vec<(u64, Vec<Segment>)> = (0..target_segments)
-        .map(|_| (0u64, Vec::new()))
-        .collect();
+    let mut groups: Vec<(u64, Vec<Segment>)> =
+        (0..target_segments).map(|_| (0u64, Vec::new())).collect();
     for seg in sorted {
         if let Some((total, bucket)) = groups.iter_mut().min_by_key(|g| g.0) {
             *total = total.saturating_add(seg.size);
@@ -597,6 +596,8 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
     if segments.is_empty() {
         return Ok(());
     }
+    let start = std::time::Instant::now();
+    info!("free_segments start: segments={}", segments.len());
     let mut blocks: HashSet<u32> = HashSet::new();
     for seg in segments {
         collect_segment_tree_blocks(rel, seg.block, &mut blocks)?;
@@ -621,7 +622,14 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
     }
     let mut list: Vec<u32> = blocks.into_iter().collect();
     list.sort_unstable();
-    free_blocks(rel, &list)
+    let res = free_blocks(rel, &list);
+    info!(
+        "free_segments done: segments={} blocks={} elapsed_ms={}",
+        segments.len(),
+        list.len(),
+        start.elapsed().as_millis()
+    );
+    res
 }
 
 fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) -> Result<Vec<u32>> {
@@ -663,6 +671,8 @@ pub fn maybe_truncate_relation(
     rbl: &RootBlockList,
     segments: &[Segment],
 ) -> Result<()> {
+    let start = std::time::Instant::now();
+    info!("maybe_truncate_relation start: segments={}", segments.len());
     let mut used: HashSet<u32> = HashSet::new();
     used.insert(0);
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
@@ -707,6 +717,10 @@ pub fn maybe_truncate_relation(
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
     if new_nblocks >= nblocks {
+        info!(
+            "maybe_truncate_relation done: truncated=false elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
         return Ok(());
     }
 
@@ -736,6 +750,11 @@ pub fn maybe_truncate_relation(
     unsafe {
         pg_sys::RelationTruncate(rel, new_nblocks);
     }
+    info!(
+        "maybe_truncate_relation done: truncated=true new_nblocks={} elapsed_ms={}",
+        new_nblocks,
+        start.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -849,8 +868,7 @@ impl SegmentCursor {
         if size > pgbuffer::SPECIAL_SIZE {
             anyhow::bail!("block header size exceeds page");
         }
-        let header =
-            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const BlockHeader) };
+        let header = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const BlockHeader) };
         Ok(header)
     }
 
@@ -1174,7 +1192,11 @@ pub fn merge(
         .iter()
         .map(|segment| segment.size as usize)
         .sum::<usize>();
-    info!("merge: segments={} total_bytes={}", segments.len(), total_bytes);
+    info!(
+        "merge: segments={} total_bytes={}",
+        segments.len(),
+        total_bytes
+    );
 
     let mut cursors = Vec::new();
     for segment in segments {
@@ -1214,8 +1236,7 @@ pub fn merge(
     let mut doc_count: u64 = 0;
     let mut occ_count: u64 = 0;
     let mut occ_count_known = true;
-    let max_chunk_size =
-        pgbuffer::SPECIAL_SIZE - std::mem::size_of::<PostingPageHeader>();
+    let max_chunk_size = pgbuffer::SPECIAL_SIZE - std::mem::size_of::<PostingPageHeader>();
 
     fn start_leaf(
         rel: pg_sys::Relation,
@@ -1444,9 +1465,7 @@ pub fn merge(
         &mut leaf_pointers,
     )?;
     if occ_count_known {
-        info!(
-            "Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes"
-        );
+        info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
     } else {
         info!("Encoded {doc_count} docs and {byte_count} bytes (occs elided)");
     }

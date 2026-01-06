@@ -84,7 +84,6 @@ fn flush_segments(
             if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
                 error!("failed to append segments: {e:#?}");
             }
-
         }
         Err(e) => {
             error!("failed to flush segment: {e:#?}");
@@ -264,17 +263,21 @@ fn finalize_segment_list(
     root_block: u32,
     flush_threshold: usize,
 ) {
-    let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
-        Ok(root_buffer) => root_buffer,
-        Err(e) => {
-            error!("failed to acquire root buffer: {e:#?}");
-        }
+    let _lock = crate::storage::maintenance_lock_blocking(index_relation)
+        .unwrap_or_else(|| error!("failed to acquire maintenance lock"));
+    let existing = {
+        let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+            Ok(root_buffer) => root_buffer,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
+        let rbl = root_buffer
+            .as_struct_mut::<crate::storage::RootBlockList>(0)
+            .expect("root header");
+        crate::storage::segment_list_read(index_relation, rbl)
+            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"))
     };
-    let rbl = root_buffer
-        .as_struct_mut::<crate::storage::RootBlockList>(0)
-        .expect("root header");
-    let existing = crate::storage::segment_list_read(index_relation, rbl)
-        .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
     let total_size: u64 = existing.iter().map(|s| s.size).sum();
     info!(
         "Finalizing segment build: Wrote {} segments ({} bytes), flush_threshold={}, target_segments={}",
@@ -284,8 +287,18 @@ fn finalize_segment_list(
         crate::storage::TARGET_SEGMENTS
     );
     let tombstones = crate::storage::tombstone::Snapshot::default();
-    let _lock = crate::storage::maintenance_lock_blocking(index_relation)
-        .unwrap_or_else(|| error!("failed to acquire maintenance lock"));
+    if unsafe { pg_sys::IsInParallelMode() } {
+        info!("Final merge: exiting parallel mode before merge");
+        unsafe {
+            pg_sys::ExitParallelMode();
+        }
+    }
+    let merge_start = std::time::Instant::now();
+    info!(
+        "Final merge start: segments={} target_segments={}",
+        existing.len(),
+        crate::storage::TARGET_SEGMENTS
+    );
     let merged = crate::storage::merge_with_workers(
         index_relation,
         &existing,
@@ -295,13 +308,38 @@ fn finalize_segment_list(
         None,
     )
     .unwrap_or_else(|e| error!("failed to merge segments: {e:#?}"));
+    info!(
+        "Final merge done: input_segments={} output_segments={} elapsed_ms={}",
+        existing.len(),
+        merged.len(),
+        merge_start.elapsed().as_millis()
+    );
+    let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+        Ok(root_buffer) => root_buffer,
+        Err(e) => {
+            error!("failed to acquire root buffer: {e:#?}");
+        }
+    };
+    let rbl = root_buffer
+        .as_struct_mut::<crate::storage::RootBlockList>(0)
+        .expect("root header");
     crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
         .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
     if merged != existing {
+        let cleanup_start = std::time::Instant::now();
+        info!(
+            "Final merge cleanup start: input_segments={} output_segments={}",
+            existing.len(),
+            merged.len()
+        );
         crate::storage::free_segments(index_relation, &existing)
             .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
         crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
             .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+        info!(
+            "Final merge cleanup done: elapsed_ms={}",
+            cleanup_start.elapsed().as_millis()
+        );
     }
 }
 

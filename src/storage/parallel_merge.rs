@@ -12,8 +12,7 @@ const EXTENSION_NAME: &[u8] = b"pg_zoekt\0";
 
 const SHM_TOC_SHARED_KEY: u64 = 0x5A4B540000000201;
 const SHM_TOC_FILESET_KEY: u64 = 0x5A4B540000000202;
-const SHM_TOC_SEGMENTS_KEY: u64 = 0x5A4B540000000203;
-const SHM_TOC_OFFSETS_KEY: u64 = 0x5A4B540000000204;
+const MERGE_INPUT_FILE_NAME: &str = "pg_zoekt_merge_input";
 
 #[cfg(feature = "pg_test")]
 static PARALLEL_MERGE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -95,9 +94,10 @@ pub(crate) unsafe fn merge_parallel(
         }
 
         let group_count = offsets.len().saturating_sub(1);
+        let leader_pid = pg_sys::MyProcPid;
         info!(
-            "merge_parallel: workers={} group_count={} tombstones_empty={}",
-            workers, group_count, tombstones_empty
+            "merge_parallel leader: pid={} workers={} group_count={} tombstones_empty={}",
+            leader_pid, workers, group_count, tombstones_empty
         );
         if group_count == 0 {
             return Some(Vec::new());
@@ -124,13 +124,29 @@ pub(crate) unsafe fn merge_parallel(
         toc_estimate_single_chunk(pcxt, size_of::<ParallelMergeShared>());
         let shared_fileset_size = size_of::<SharedFileSetComplete>();
         toc_estimate_single_chunk(pcxt, shared_fileset_size);
-        toc_estimate_single_chunk(pcxt, segments.len() * size_of::<Segment>());
-        toc_estimate_single_chunk(pcxt, offsets.len() * size_of::<u32>());
 
         pg_sys::InitializeParallelDSM(pcxt);
         if (*pcxt).seg.is_null() {
-            cleanup_parallel_context(pcxt);
-            return None;
+            let est = (*pcxt).estimator;
+            warning!(
+                "merge_parallel leader: pid={} dsm_init_failed segments_len={} offsets_len={} group_count={} workers={} est_space={} est_keys={}",
+                leader_pid,
+                segments.len(),
+                offsets.len(),
+                group_count,
+                (*pcxt).nworkers,
+                est.space_for_chunks,
+                est.number_of_keys
+            );
+            pg_sys::InitializeParallelDSM(pcxt);
+            if (*pcxt).seg.is_null() {
+                cleanup_parallel_context(pcxt);
+                return None;
+            }
+            info!(
+                "merge_parallel leader: pid={} dsm_retry_succeeded",
+                leader_pid
+            );
         }
 
         let shared = pg_sys::shm_toc_allocate((*pcxt).toc, size_of::<ParallelMergeShared>())
@@ -157,35 +173,30 @@ pub(crate) unsafe fn merge_parallel(
         );
         (*shared_fileset_ptr_complete).segment = (*pcxt).seg;
 
-        let segments_ptr = pg_sys::shm_toc_allocate((*pcxt).toc, segments.len() * size_of::<Segment>())
-            .cast::<Segment>();
-        if segments_ptr.is_null() {
-            pgrx::error!("failed to allocate merge segments");
-        }
-        std::ptr::copy_nonoverlapping(segments.as_ptr(), segments_ptr, segments.len());
-
-        let offsets_ptr =
-            pg_sys::shm_toc_allocate((*pcxt).toc, offsets.len() * size_of::<u32>()).cast::<u32>();
-        if offsets_ptr.is_null() {
-            pgrx::error!("failed to allocate merge group offsets");
-        }
-        std::ptr::copy_nonoverlapping(offsets.as_ptr(), offsets_ptr, offsets.len());
-
         pg_sys::shm_toc_insert((*pcxt).toc, SHM_TOC_SHARED_KEY, shared.cast());
         pg_sys::shm_toc_insert(
             (*pcxt).toc,
             SHM_TOC_FILESET_KEY,
             shared_fileset_ptr_raw.cast(),
         );
-        pg_sys::shm_toc_insert((*pcxt).toc, SHM_TOC_SEGMENTS_KEY, segments_ptr.cast());
-        pg_sys::shm_toc_insert((*pcxt).toc, SHM_TOC_OFFSETS_KEY, offsets_ptr.cast());
+        write_merge_input(
+            &raw mut (*shared_fileset_ptr_complete).fs,
+            segments,
+            offsets,
+        );
 
         pg_sys::LaunchParallelWorkers(pcxt);
         info!(
-            "merge_parallel: launched {} workers",
+            "merge_parallel leader: pid={} launched_workers={}",
+            leader_pid,
             (*pcxt).nworkers_launched
         );
         if (*pcxt).nworkers_launched == 0 {
+            warning!(
+                "merge_parallel leader: pid={} requested_workers={} launched_workers=0",
+                leader_pid,
+                workers
+            );
             cleanup_parallel_context(pcxt);
             return None;
         }
@@ -198,8 +209,8 @@ pub(crate) unsafe fn merge_parallel(
             pg_sys::shm_toc_lookup((*pcxt).toc, SHM_TOC_SHARED_KEY, false).cast();
         let worker_slots = (*parallel_shared).state.worker_slot.load(Ordering::Relaxed);
         info!(
-            "merge_parallel: worker_slots={} group_count={}",
-            worker_slots, group_count
+            "merge_parallel leader: pid={} worker_slots={} group_count={}",
+            leader_pid, worker_slots, group_count
         );
 
         let mut leader_local_fileset: SharedFileSetComplete = *shared_fileset_ptr_complete;
@@ -227,8 +238,8 @@ pub(crate) unsafe fn merge_parallel(
             );
         }
         info!(
-            "merge_parallel: collected interim segments={} (from {} workers)",
-            interim_total, worker_slots
+            "merge_parallel leader: pid={} collected_interim_segments={} workers={}",
+            leader_pid, interim_total, worker_slots
         );
 
         pg_sys::SharedFileSetDeleteAll(shared_fileset_ptr_raw.cast::<pg_sys::SharedFileSet>());
@@ -259,9 +270,12 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
             pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_SHARED_KEY, false).cast();
         let shared_fileset_ptr = pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_FILESET_KEY, false)
             .cast::<pg_sys::SharedFileSet>();
-        let segments_ptr = pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_SEGMENTS_KEY, false).cast();
-        let offsets_ptr = pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_OFFSETS_KEY, false).cast();
         let params = (*shared).params;
+        let worker_pid = pg_sys::MyProcPid;
+        info!(
+            "merge_parallel worker enter: pid={} groups={} segments_len={}",
+            worker_pid, params.group_count, params.segments_len
+        );
 
         pg_sys::SharedFileSetAttach(shared_fileset_ptr, seg);
         let mut local_fileset: SharedFileSetComplete =
@@ -279,6 +293,10 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
         };
 
         let slot_id = (*shared).state.worker_slot.fetch_add(1, Ordering::Acquire);
+        info!(
+            "merge_parallel worker start: pid={} slot={}",
+            worker_pid, slot_id
+        );
         let file_name = spill_file_name(slot_id);
         let spill_file = pg_sys::BufFileCreateFileSet(
             &raw mut local_fileset.fs,
@@ -288,8 +306,7 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
             error!("failed to create merge spill file");
         }
 
-        let segments = segments_ptr as *const Segment;
-        let offsets = offsets_ptr as *const u32;
+        let (segments, offsets) = read_merge_input(&raw mut local_fileset.fs);
 
         let mut local_groups = 0usize;
         let mut local_segments = 0usize;
@@ -299,27 +316,26 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
                 break;
             }
             pg_sys::check_for_interrupts!();
-            let start = *offsets.add(group_idx) as usize;
-            let end = *offsets.add(group_idx + 1) as usize;
+            let start = offsets.get(group_idx as usize).copied().unwrap_or(0) as usize;
+            let end = offsets
+                .get(group_idx as usize + 1)
+                .copied()
+                .unwrap_or(start as u32) as usize;
             if start >= end {
                 continue;
             }
-            let slice = std::slice::from_raw_parts(segments.add(start), end - start);
-            let merged = crate::storage::merge(
-                indexrel,
-                slice,
-                params.flush_threshold,
-                &tombstones,
-            )
-            .unwrap_or_else(|e| error!("failed to merge group segments: {e:#?}"));
+            let slice = &segments[start..end];
+            let merged =
+                crate::storage::merge(indexrel, slice, params.flush_threshold, &tombstones)
+                    .unwrap_or_else(|e| error!("failed to merge group segments: {e:#?}"));
             pg_sys::check_for_interrupts!();
             write_segment_batch(spill_file, std::slice::from_ref(&merged));
             local_groups = local_groups.saturating_add(1);
             local_segments = local_segments.saturating_add(1);
         }
         info!(
-            "merge_parallel worker: groups={} merged_segments={}",
-            local_groups, local_segments
+            "merge_parallel worker: pid={} slot={} groups={} merged_segments={}",
+            worker_pid, slot_id, local_groups, local_segments
         );
 
         pg_sys::BufFileExportFileSet(spill_file);
@@ -339,19 +355,96 @@ fn spill_file_name(slot: usize) -> [u8; 64] {
     file_name
 }
 
+fn merge_input_file_name() -> [u8; 64] {
+    let mut name = [0u8; 64];
+    let name_str = MERGE_INPUT_FILE_NAME;
+    if name_str.len() >= name.len() {
+        error!("merge input file name too long");
+    }
+    name[..name_str.len()].copy_from_slice(name_str.as_bytes());
+    name[name_str.len()] = 0;
+    name
+}
+
+fn write_bytes(file: *mut pg_sys::BufFile, bytes: &[u8]) {
+    unsafe {
+        pg_sys::BufFileWrite(file, bytes.as_ptr().cast(), bytes.len());
+    }
+}
+
+fn read_bytes(file: *mut pg_sys::BufFile, bytes: &mut [u8]) {
+    let read = unsafe { pg_sys::BufFileRead(file, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if read != bytes.len() {
+        error!("short read in merge input file");
+    }
+}
+
+fn write_u32(file: *mut pg_sys::BufFile, v: u32) {
+    write_bytes(file, &v.to_le_bytes());
+}
+
+fn write_u64(file: *mut pg_sys::BufFile, v: u64) {
+    write_bytes(file, &v.to_le_bytes());
+}
+
+fn read_u32(file: *mut pg_sys::BufFile) -> u32 {
+    let mut buf = [0u8; 4];
+    read_bytes(file, &mut buf);
+    u32::from_le_bytes(buf)
+}
+
+fn read_u64(file: *mut pg_sys::BufFile) -> u64 {
+    let mut buf = [0u8; 8];
+    read_bytes(file, &mut buf);
+    u64::from_le_bytes(buf)
+}
+
+fn write_merge_input(fileset: *mut pg_sys::FileSet, segments: &[Segment], offsets: &[u32]) {
+    let name = merge_input_file_name();
+    let file = unsafe { pg_sys::BufFileCreateFileSet(fileset, name.as_ptr().cast::<c_char>()) };
+    if file.is_null() {
+        error!("failed to create merge input file");
+    }
+    write_u32(file, segments.len() as u32);
+    write_u32(file, offsets.len() as u32);
+    for seg in segments {
+        write_u32(file, seg.block);
+        write_u64(file, seg.size);
+    }
+    for offset in offsets {
+        write_u32(file, *offset);
+    }
+    unsafe {
+        pg_sys::BufFileClose(file);
+    }
+}
+
+fn read_merge_input(fileset: *mut pg_sys::FileSet) -> (Vec<Segment>, Vec<u32>) {
+    let name = merge_input_file_name();
+    let file =
+        unsafe { pg_sys::BufFileOpenFileSet(fileset, name.as_ptr().cast::<c_char>(), 0, false) };
+    if file.is_null() {
+        error!("failed to open merge input file");
+    }
+    let segments_len = read_u32(file) as usize;
+    let offsets_len = read_u32(file) as usize;
+    let mut segments = Vec::with_capacity(segments_len);
+    for _ in 0..segments_len {
+        let block = read_u32(file);
+        let size = read_u64(file);
+        segments.push(Segment { block, size });
+    }
+    let mut offsets = Vec::with_capacity(offsets_len);
+    for _ in 0..offsets_len {
+        offsets.push(read_u32(file));
+    }
+    unsafe {
+        pg_sys::BufFileClose(file);
+    }
+    (segments, offsets)
+}
+
 fn write_segment_batch(file: *mut pg_sys::BufFile, segments: &[Segment]) {
-    fn write_bytes(file: *mut pg_sys::BufFile, bytes: &[u8]) {
-        unsafe { pg_sys::BufFileWrite(file, bytes.as_ptr().cast(), bytes.len()) }
-    }
-
-    fn write_u32(file: *mut pg_sys::BufFile, v: u32) {
-        write_bytes(file, &v.to_le_bytes());
-    }
-
-    fn write_u64(file: *mut pg_sys::BufFile, v: u64) {
-        write_bytes(file, &v.to_le_bytes());
-    }
-
     write_u32(file, segments.len() as u32);
     for seg in segments {
         write_u32(file, seg.block);

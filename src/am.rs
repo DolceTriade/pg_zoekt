@@ -820,7 +820,7 @@ mod tests {
             client.update(
                 "CREATE INDEX idx_merge_parallel_docs_text_zoekt
                  ON merge_parallel_docs USING pg_zoekt (text)
-                 WITH (parallel_workers = 2)",
+                 WITH (parallel_workers = 4)",
                 None,
                 &[],
             )?;
@@ -1095,7 +1095,10 @@ mod tests {
                         }
                         let key = (trigram, doc.tid);
                         if !seen.insert(key) {
-                            error!("duplicate posting for trigram {} tid {:?}", trigram, doc.tid);
+                            error!(
+                                "duplicate posting for trigram {} tid {:?}",
+                                trigram, doc.tid
+                            );
                         }
                     }
                 }
@@ -1126,9 +1129,7 @@ mod tests {
         })?;
 
         Spi::run("SELECT pg_zoekt_seal('idx_nodup_docs_text_zoekt'::regclass)")?;
-        Spi::run(
-            "UPDATE nodup_docs SET text = text || '-u' WHERE id % 5 = 0",
-        )?;
+        Spi::run("UPDATE nodup_docs SET text = text || '-u' WHERE id % 5 = 0")?;
         Spi::run("SELECT pg_zoekt_seal('idx_nodup_docs_text_zoekt'::regclass)")?;
 
         let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
