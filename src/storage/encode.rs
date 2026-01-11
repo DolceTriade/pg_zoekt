@@ -23,10 +23,26 @@ impl Encoder {
         let mut doc_count = 0;
         let mut occ_count = 0;
         let mut byte_count = 0;
-        let mut segment = super::Segment { block: 0, size: 0 };
+        let mut segment = super::Segment {
+            block: 0,
+            size: 0,
+            extent_head: pg_sys::InvalidBlockNumber,
+            extent_count: 0,
+        };
         let mut leaf_pointers: Vec<super::BlockPointer> = Vec::new();
 
-        let mut p = PageWriter::new(rel, super::pgbuffer::SPECIAL_SIZE);
+        let root = super::pgbuffer::BlockBuffer::acquire(rel, 0)?;
+        let rbl = root
+            .as_struct::<super::RootBlockList>(0)
+            .context("root header")?;
+        let track_extents = rbl.magic == super::ROOT_MAGIC && rbl.version >= 6;
+        let mut tracker = super::BlockExtentTracker::default();
+        let tracker_ptr = if track_extents {
+            Some(&mut tracker as *mut _)
+        } else {
+            None
+        };
+        let mut p = PageWriter::new(rel, super::pgbuffer::SPECIAL_SIZE, tracker_ptr);
         let mut interrupt_counter: u32 = 0;
 
         while remaining_trgms > 0 {
@@ -34,7 +50,7 @@ impl Encoder {
             if (interrupt_counter & 0x3ff) == 0 {
                 pg_sys::check_for_interrupts!();
             }
-            let mut leaf = super::allocate_block(rel);
+            let mut leaf = super::allocate_block_tracked(rel, tracker_ptr);
             let leaf_block = leaf.block_number();
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
             let bh = leaf
@@ -164,7 +180,13 @@ impl Encoder {
         }
         info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
         segment.size = byte_count as u64;
-        segment.block = build_segment_root(rel, &leaf_pointers)?;
+        segment.block = build_segment_root(rel, &leaf_pointers, tracker_ptr)?;
+        segment.extent_head = pg_sys::InvalidBlockNumber;
+        segment.extent_count = 0;
+        if track_extents {
+            let extents = tracker.take();
+            super::segment_attach_extents(rel, &mut segment, &extents)?;
+        }
         Ok(vec![segment])
     }
 }
@@ -172,6 +194,7 @@ impl Encoder {
 pub(crate) fn build_segment_root(
     rel: pg_sys::Relation,
     leaves: &[super::BlockPointer],
+    tracker: Option<*mut super::BlockExtentTracker>,
 ) -> anyhow::Result<u32> {
     if leaves.is_empty() {
         anyhow::bail!("no leaves");
@@ -192,7 +215,7 @@ pub(crate) fn build_segment_root(
     while current.len() > 1 {
         let mut next = Vec::new();
         for chunk in current.chunks(per_page) {
-            let mut page = super::allocate_block(rel);
+            let mut page = super::allocate_block_tracked(rel, tracker);
             let block_no = page.block_number();
             let bh = page
                 .as_struct_mut::<super::BlockHeader>(0)
@@ -463,15 +486,21 @@ pub(super) struct PageWriter {
     buff: Option<BlockBuffer>,
     size: usize,
     pos: usize,
+    tracker: Option<*mut super::BlockExtentTracker>,
 }
 
 impl PageWriter {
-    pub fn new(rel: pg_sys::Relation, size: usize) -> Self {
+    pub fn new(
+        rel: pg_sys::Relation,
+        size: usize,
+        tracker: Option<*mut super::BlockExtentTracker>,
+    ) -> Self {
         let mut writer = Self {
             rel,
             buff: None,
             size,
             pos: 0,
+            tracker,
         };
         writer.ensure_page_available();
         writer
@@ -504,7 +533,7 @@ impl PageWriter {
     }
 
     fn allocate_page(&mut self) {
-        let mut page = super::allocate_block(self.rel);
+        let mut page = super::allocate_block_tracked(self.rel, self.tracker);
         let header = page
             .as_struct_mut::<super::PostingPageHeader>(0)
             .expect("header should fit");
@@ -517,7 +546,7 @@ impl PageWriter {
     }
 
     fn allocate_next_page(&mut self) {
-        let mut next_page = super::allocate_block(self.rel);
+        let mut next_page = super::allocate_block_tracked(self.rel, self.tracker);
         let next_block = next_page.block_number();
         if let Some(mut old) = self.buff.take() {
             let header = old

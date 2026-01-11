@@ -410,6 +410,8 @@ fn write_merge_input(fileset: *mut pg_sys::FileSet, segments: &[Segment], offset
     for seg in segments {
         write_u32(file, seg.block);
         write_u64(file, seg.size);
+        write_u32(file, seg.extent_head);
+        write_u32(file, seg.extent_count);
     }
     for offset in offsets {
         write_u32(file, *offset);
@@ -432,7 +434,14 @@ fn read_merge_input(fileset: *mut pg_sys::FileSet) -> (Vec<Segment>, Vec<u32>) {
     for _ in 0..segments_len {
         let block = read_u32(file);
         let size = read_u64(file);
-        segments.push(Segment { block, size });
+        let extent_head = read_u32(file);
+        let extent_count = read_u32(file);
+        segments.push(Segment {
+            block,
+            size,
+            extent_head,
+            extent_count,
+        });
     }
     let mut offsets = Vec::with_capacity(offsets_len);
     for _ in 0..offsets_len {
@@ -449,6 +458,8 @@ fn write_segment_batch(file: *mut pg_sys::BufFile, segments: &[Segment]) {
     for seg in segments {
         write_u32(file, seg.block);
         write_u64(file, seg.size);
+        write_u32(file, seg.extent_head);
+        write_u32(file, seg.extent_count);
     }
 }
 
@@ -486,7 +497,16 @@ fn collect_segments_from_spill_file(file: *mut pg_sys::BufFile) -> Vec<Segment> 
         for _ in 0..count {
             let block = read_u32(file).unwrap_or_else(|| error!("unexpected eof (block)"));
             let size = read_u64(file).unwrap_or_else(|| error!("unexpected eof (size)"));
-            segments.push(Segment { block, size });
+            let extent_head =
+                read_u32(file).unwrap_or_else(|| error!("unexpected eof (extent head)"));
+            let extent_count =
+                read_u32(file).unwrap_or_else(|| error!("unexpected eof (extent count)"));
+            segments.push(Segment {
+                block,
+                size,
+                extent_head,
+                extent_count,
+            });
         }
     }
 

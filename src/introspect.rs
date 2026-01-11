@@ -2,7 +2,7 @@ use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
 use std::collections::BTreeMap;
 
-use crate::storage::{IndexEntry, Segment};
+use crate::storage::{IndexEntry, Segment, SegmentExtent, WALHeader};
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -159,6 +159,38 @@ pub fn pg_zoekt_segment_entries(
 }
 
 #[pg_extern]
+pub fn pg_zoekt_segment_extents(
+    index: pg_sys::Oid,
+    segment_idx: i32,
+) -> TableIterator<'static, (name!(start_block, i64), name!(len, i64))> {
+    let mut rows = Vec::new();
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let segments = crate::query::read_segments(rel).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read segments: {e:#?}");
+        });
+        let segment = segment_by_index(&segments, segment_idx);
+        if segment.extent_head != pg_sys::InvalidBlockNumber && segment.extent_count > 0 {
+            let (extents, _pages) = crate::storage::segment_extent_list_read(
+                rel,
+                segment.extent_head,
+                segment.extent_count,
+            )
+            .unwrap_or_else(|e| {
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!("failed to read segment extents: {e:#?}");
+            });
+            for SegmentExtent { start_block, len } in extents {
+                rows.push((start_block as i64, len as i64));
+            }
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern]
 pub fn pg_zoekt_postings_preview(
     index: pg_sys::Oid,
     segment_idx: i32,
@@ -234,6 +266,57 @@ pub fn pg_zoekt_postings_preview(
 }
 
 #[pg_extern]
+pub fn pg_zoekt_wal_stats(
+    index: pg_sys::Oid,
+) -> TableIterator<
+    'static,
+    (
+        name!(wal_block, i64),
+        name!(free_head, i64),
+        name!(free_max_block, i64),
+        name!(high_water_block, i64),
+    ),
+> {
+    let mut rows = Vec::new();
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read root: {e:#?}");
+        });
+        let rbl = root
+            .as_struct::<crate::storage::RootBlockList>(0)
+            .unwrap_or_else(|e| {
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!("failed to read root header: {e:#?}");
+            });
+        if rbl.magic != crate::storage::ROOT_MAGIC {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("invalid root magic");
+        }
+        if rbl.wal_block != pg_sys::InvalidBlockNumber {
+            let wal_buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)
+                .unwrap_or_else(|e| {
+                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                    error!("failed to read wal block: {e:#?}");
+                });
+            let wal = wal_buf.as_struct::<WALHeader>(0).unwrap_or_else(|e| {
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!("failed to read wal header: {e:#?}");
+            });
+            rows.push((
+                rbl.wal_block as i64,
+                wal.free_head as i64,
+                wal.free_max_block as i64,
+                wal.high_water_block as i64,
+            ));
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern]
 pub fn pg_zoekt_index_overhead(
     index: pg_sys::Oid,
 ) -> TableIterator<
@@ -256,6 +339,7 @@ pub fn pg_zoekt_index_overhead(
             pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) as usize;
         let special_size = crate::storage::pgbuffer::SPECIAL_SIZE;
         let pg_header_bytes = (pg_sys::BLCKSZ as usize).saturating_sub(special_size);
+        let mut root_version: u16 = 0;
         for block in 0..nblocks {
             let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, block as u32)
                 .unwrap_or_else(|e| error!("failed to read block {block}: {e:#?}"));
@@ -266,6 +350,7 @@ pub fn pg_zoekt_index_overhead(
                 let rbl = buf
                     .as_struct::<crate::storage::RootBlockList>(0)
                     .unwrap_or_else(|e| error!("root header: {e:#?}"));
+                root_version = rbl.version;
                 if rbl.version >= 2 {
                     let header_size = std::mem::size_of::<crate::storage::RootBlockList>();
                     page_type = "root".to_string();
@@ -321,9 +406,27 @@ pub fn pg_zoekt_index_overhead(
                     .as_struct::<crate::storage::SegmentListPageHeader>(0)
                     .unwrap_or_else(|e| error!("segment list header: {e:#?}"));
                 let header_size = std::mem::size_of::<crate::storage::SegmentListPageHeader>();
-                let payload =
-                    (header.count as usize).saturating_mul(std::mem::size_of::<Segment>());
+                let seg_size = if root_version >= 6 {
+                    std::mem::size_of::<Segment>()
+                } else {
+                    std::mem::size_of::<crate::storage::SegmentV1>()
+                };
+                let payload = (header.count as usize).saturating_mul(seg_size);
                 page_type = "segment_list".to_string();
+                (
+                    header_size,
+                    payload,
+                    special_size.saturating_sub(header_size + payload),
+                )
+            } else if magic == crate::storage::SEGMENT_EXTENT_MAGIC {
+                let header = buf
+                    .as_struct::<crate::storage::SegmentExtentListPageHeader>(0)
+                    .unwrap_or_else(|e| error!("segment extent header: {e:#?}"));
+                let header_size =
+                    std::mem::size_of::<crate::storage::SegmentExtentListPageHeader>();
+                let payload = (header.count as usize)
+                    .saturating_mul(std::mem::size_of::<crate::storage::SegmentExtent>());
+                page_type = "segment_extent".to_string();
                 (
                     header_size,
                     payload,

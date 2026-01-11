@@ -112,12 +112,21 @@ pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::
         .as_struct::<crate::storage::RootBlockListV1>(0)
         .context("root header v1")?;
     let segments = root
-        .as_struct_with_elems::<crate::storage::Segments>(
+        .as_struct_with_elems::<crate::storage::SegmentsV1>(
             std::mem::size_of::<crate::storage::RootBlockListV1>(),
             rbl1.num_segments as usize,
         )
         .context("segments")?;
-    Ok(segments.entries.to_vec())
+    Ok(segments
+        .entries
+        .iter()
+        .map(|seg| crate::storage::Segment {
+            block: seg.block,
+            size: seg.size,
+            extent_head: pg_sys::InvalidBlockNumber,
+            extent_count: 0,
+        })
+        .collect())
 }
 
 unsafe fn find_entry_for_trigram(

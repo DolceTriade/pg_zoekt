@@ -45,6 +45,8 @@ mod implementation {
             wal.head_block = pg_sys::InvalidBlockNumber;
             wal.tail_block = pg_sys::InvalidBlockNumber;
             wal.free_head = pg_sys::InvalidBlockNumber;
+            wal.free_max_block = pg_sys::InvalidBlockNumber;
+            wal.high_water_block = wal_block;
             wal_block
         };
 
@@ -67,6 +69,21 @@ mod implementation {
             .expect("root header");
         rbl.wal_block = wal_block;
         rbl.pending_block = pending_block_number;
+        {
+            let mut wal_buffer = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(
+                index_relation,
+                wal_block,
+            ) {
+                Ok(wal_buffer) => wal_buffer,
+                Err(e) => {
+                    error!("failed to acquire wal buffer: {e:#?}");
+                }
+            };
+            let wal = wal_buffer
+                .as_struct_mut::<crate::storage::WALHeader>(0)
+                .expect("wal header");
+            wal.high_water_block = wal_block.max(pending_block_number);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -925,6 +942,39 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_segment_extent_introspection() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE extent_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO extent_docs (text) VALUES ('alpha'), ('bravo'), ('charlie')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_extent_docs_text_zoekt ON extent_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_extent_docs_text_zoekt'::regclass)")?;
+
+        let extent_count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_zoekt_segment_extents('idx_extent_docs_text_zoekt'::regclass, 1)",
+        )?
+        .unwrap_or(0);
+        assert!(extent_count > 0, "expected segment extents to be recorded");
+
+        Spi::run("DROP TABLE IF EXISTS extent_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_index_overhead_totals() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
@@ -1316,6 +1366,7 @@ mod tests {
                     .as_struct_mut::<crate::storage::WALHeader>(0)
                     .expect("wal header");
                 wal.free_head = pg_sys::InvalidBlockNumber;
+                wal.free_max_block = pg_sys::InvalidBlockNumber;
             }
 
             let nblocks_before =
@@ -1347,6 +1398,97 @@ mod tests {
 
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
         }
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_wal_stats_tracks_free_and_high_water() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE wal_stats_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO wal_stats_docs (text) VALUES ('alpha'), ('beta'), ('gamma')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_wal_stats_docs_text_zoekt ON wal_stats_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_wal_stats_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        let (expected_free_max, expected_high_water) = unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+
+            if rbl.wal_block != pg_sys::InvalidBlockNumber {
+                let mut wal_buf =
+                    crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
+                        .expect("wal buffer");
+                let wal = wal_buf
+                    .as_struct_mut::<crate::storage::WALHeader>(0)
+                    .expect("wal header");
+                wal.free_head = pg_sys::InvalidBlockNumber;
+                wal.free_max_block = pg_sys::InvalidBlockNumber;
+            }
+
+            let mut allocated = Vec::new();
+            for _ in 0..3 {
+                let page = crate::storage::allocate_block(rel);
+                allocated.push(page.block_number());
+            }
+            let freed = vec![allocated[0], allocated[1]];
+            crate::storage::free_blocks(rel, &freed).expect("failed to free blocks");
+
+            let expected_free_max = freed.iter().copied().max().unwrap_or(0);
+            let expected_high_water = allocated.iter().copied().max().unwrap_or(0);
+
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+            (expected_free_max, expected_high_water)
+        };
+
+        let (free_max, high_water): (i64, i64) = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client.select(
+                "SELECT free_max_block, high_water_block FROM pg_zoekt_wal_stats('idx_wal_stats_docs_text_zoekt'::regclass)",
+                None,
+                &[],
+            )?;
+            let row = rows.next().expect("wal stats row");
+            let free_max = row.get::<i64>(1)?.unwrap_or_default();
+            let high_water = row.get::<i64>(2)?.unwrap_or_default();
+            Ok((free_max, high_water))
+        })?;
+
+        assert_eq!(
+            free_max, expected_free_max as i64,
+            "expected free_max_block to track freed tail"
+        );
+        assert_eq!(
+            high_water, expected_high_water as i64,
+            "expected high_water_block to track highest allocation"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS wal_stats_docs")?;
         Ok(())
     }
 

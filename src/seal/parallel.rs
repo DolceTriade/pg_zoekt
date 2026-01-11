@@ -455,6 +455,8 @@ fn write_segment_batch(file: *mut pg_sys::BufFile, segments: &[crate::storage::S
     for seg in segments {
         write_u32(file, seg.block);
         write_u64(file, seg.size);
+        write_u32(file, seg.extent_head);
+        write_u32(file, seg.extent_count);
     }
 }
 
@@ -491,7 +493,16 @@ fn collect_segments_from_spill_file(file: *mut pg_sys::BufFile) -> Vec<crate::st
         for _ in 0..count {
             let block = read_u32(file).unwrap_or_else(|| error!("unexpected eof (block)"));
             let size = read_u64(file).unwrap_or_else(|| error!("unexpected eof (size)"));
-            segments.push(crate::storage::Segment { block, size });
+            let extent_head =
+                read_u32(file).unwrap_or_else(|| error!("unexpected eof (extent head)"));
+            let extent_count =
+                read_u32(file).unwrap_or_else(|| error!("unexpected eof (extent count)"));
+            segments.push(crate::storage::Segment {
+                block,
+                size,
+                extent_head,
+                extent_count,
+            });
         }
     }
     segments

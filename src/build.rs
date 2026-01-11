@@ -453,6 +453,8 @@ pub extern "C-unwind" fn ambuild(
         wal.head_block = pg_sys::InvalidBlockNumber;
         wal.tail_block = pg_sys::InvalidBlockNumber;
         wal.free_head = pg_sys::InvalidBlockNumber;
+        wal.free_max_block = pg_sys::InvalidBlockNumber;
+        wal.high_water_block = wal_block;
         wal_block
     };
 
@@ -476,6 +478,18 @@ pub extern "C-unwind" fn ambuild(
             .expect("root header");
         rbl.wal_block = wal_block;
         rbl.pending_block = pending_block_number;
+    }
+    {
+        let mut wal_buffer = match BlockBuffer::aquire_mut(index_relation, wal_block) {
+            Ok(wal_buffer) => wal_buffer,
+            Err(e) => {
+                error!("failed to acquire wal buffer: {e:#?}");
+            }
+        };
+        let wal = wal_buffer
+            .as_struct_mut::<crate::storage::WALHeader>(0)
+            .expect("wal header");
+        wal.high_water_block = root_block.max(wal_block).max(pending_block_number);
     }
     let flush_threshold = flush_threshold_bytes();
     let maintenance_budget_bytes = maintenance_work_mem_bytes();
