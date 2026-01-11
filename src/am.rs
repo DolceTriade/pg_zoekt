@@ -942,6 +942,108 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_trigram_introspection_helpers() -> spi::Result<()> {
+        let trigram: i64 =
+            Spi::get_one("SELECT pg_zoekt_text_to_trigram('abc')")?.unwrap_or_default();
+        assert_eq!(trigram, 6513249, "expected compact trigram value");
+
+        let text: String =
+            Spi::get_one("SELECT pg_zoekt_trigram_to_text(6513249)")?.unwrap_or_default();
+        assert_eq!(text, "abc", "expected trigram text");
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_multisegment_trigram_scan_includes_all_docs() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE multi_seg_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO multi_seg_docs (text) \
+                 SELECT 'prefix_oek_' || gs::text FROM generate_series(1, 512) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_multi_seg_docs_text_zoekt ON multi_seg_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let seq_count: i64 = Spi::get_one(
+            "SET enable_seqscan = on; \
+             SET enable_indexscan = off; \
+             SET enable_bitmapscan = off; \
+             SELECT count(*) FROM multi_seg_docs WHERE text LIKE '%oek%';",
+        )?
+        .unwrap_or(0);
+
+        let idx_count: i64 = Spi::get_one(
+            "SET enable_seqscan = off; \
+             SET enable_indexscan = on; \
+             SET enable_bitmapscan = on; \
+             SELECT count(*) FROM multi_seg_docs WHERE text LIKE '%oek%';",
+        )?
+        .unwrap_or(0);
+
+        assert_eq!(idx_count, seq_count, "index scan should match seqscan");
+
+        Spi::run("DROP TABLE IF EXISTS multi_seg_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_multisegment_multitrigram_pattern_matches() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE multi_trgm_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO multi_trgm_docs (text) \
+                 SELECT 'prefix_zoekt_' || gs::text FROM generate_series(1, 512) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_multi_trgm_docs_text_zoekt ON multi_trgm_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let seq_count: i64 = Spi::get_one(
+            "SET enable_seqscan = on; \
+             SET enable_indexscan = off; \
+             SET enable_bitmapscan = off; \
+             SELECT count(*) FROM multi_trgm_docs WHERE text LIKE '%zoekt%';",
+        )?
+        .unwrap_or(0);
+
+        let idx_count: i64 = Spi::get_one(
+            "SET enable_seqscan = off; \
+             SET enable_indexscan = on; \
+             SET enable_bitmapscan = on; \
+             SELECT count(*) FROM multi_trgm_docs WHERE text LIKE '%zoekt%';",
+        )?
+        .unwrap_or(0);
+
+        assert_eq!(idx_count, seq_count, "index scan should match seqscan");
+
+        Spi::run("DROP TABLE IF EXISTS multi_trgm_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_segment_extent_introspection() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(

@@ -479,33 +479,29 @@ fn stream_segment_occurrences(
 
     struct TrigramCursor {
         cursors: Vec<PostingCursor>,
-        cur_idx: usize,
+        heap: std::collections::BinaryHeap<std::cmp::Reverse<(crate::storage::ItemPointer, usize)>>,
     }
 
     impl TrigramCursor {
         fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
-            self.cursors.get(self.cur_idx)?.current_tid()
+            self.heap.peek().map(|entry| entry.0.0)
         }
 
         fn current(&self) -> Option<&crate::storage::decode::DocPosting> {
-            self.cursors.get(self.cur_idx)?.current()
+            let (_, idx) = self.heap.peek()?.0;
+            self.cursors.get(idx)?.current()
         }
 
         fn advance(&mut self) -> anyhow::Result<bool> {
-            if self.cur_idx >= self.cursors.len() {
+            let Some(std::cmp::Reverse((_tid, idx))) = self.heap.pop() else {
                 return Ok(false);
-            }
-            if self.cursors[self.cur_idx].advance()? {
-                return Ok(true);
-            }
-            self.cur_idx += 1;
-            while self.cur_idx < self.cursors.len() {
-                if self.cursors[self.cur_idx].advance()? {
-                    return Ok(true);
+            };
+            if self.cursors[idx].advance()? {
+                if let Some(next_tid) = self.cursors[idx].current_tid() {
+                    self.heap.push(std::cmp::Reverse((next_tid, idx)));
                 }
-                self.cur_idx += 1;
             }
-            Ok(false)
+            Ok(!self.heap.is_empty())
         }
     }
 
@@ -543,9 +539,20 @@ fn stream_segment_occurrences(
         if per_seg.is_empty() {
             return Ok(Vec::new());
         }
+        let mut heap: std::collections::BinaryHeap<
+            std::cmp::Reverse<(crate::storage::ItemPointer, usize)>,
+        > = std::collections::BinaryHeap::new();
+        for (idx, cur) in per_seg.iter().enumerate() {
+            if let Some(tid) = cur.current_tid() {
+                heap.push(std::cmp::Reverse((tid, idx)));
+            }
+        }
+        if heap.is_empty() {
+            return Ok(Vec::new());
+        }
         cursors.push(TrigramCursor {
             cursors: per_seg,
-            cur_idx: 0,
+            heap,
         });
     }
 

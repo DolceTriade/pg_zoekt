@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use std::collections::BTreeMap;
 
 use crate::storage::{IndexEntry, Segment, SegmentExtent, WALHeader};
+use crate::trgm::CompactTrgm;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -191,6 +192,29 @@ pub fn pg_zoekt_segment_extents(
 }
 
 #[pg_extern]
+pub fn pg_zoekt_trigram_to_text(trigram: i64) -> String {
+    if trigram < 0 || trigram > u32::MAX as i64 {
+        error!("trigram out of range: {}", trigram);
+    }
+    let value = trigram as u32;
+    let b0 = (value & 0xff) as u8;
+    let b1 = ((value >> 8) & 0xff) as u8;
+    let b2 = ((value >> 16) & 0xff) as u8;
+    if b0 == 0 || b1 == 0 || b2 == 0 {
+        error!("trigram has zero byte: {}", trigram);
+    }
+    CompactTrgm(value).txt()
+}
+
+#[pg_extern]
+pub fn pg_zoekt_text_to_trigram(trigram: &str) -> i64 {
+    let ct = CompactTrgm::try_from(trigram).unwrap_or_else(|e| {
+        error!("invalid trigram: {e:#?}");
+    });
+    ct.trgm() as i64
+}
+
+#[pg_extern]
 pub fn pg_zoekt_postings_preview(
     index: pg_sys::Oid,
     segment_idx: i32,
@@ -199,6 +223,7 @@ pub fn pg_zoekt_postings_preview(
 ) -> TableIterator<
     'static,
     (
+        name!(ctid, pg_sys::ItemPointerData),
         name!(block, i64),
         name!(offset, i32),
         name!(positions_count, i32),
@@ -250,7 +275,15 @@ pub fn pg_zoekt_postings_preview(
                     let last_pos = doc.positions.last().map(|p| p.0).unwrap_or(0) as i32;
                     (first_pos, last_pos)
                 };
+                let ctid = pg_sys::ItemPointerData {
+                    ip_blkid: pg_sys::BlockIdData {
+                        bi_hi: (doc.tid.block_number >> 16) as u16,
+                        bi_lo: (doc.tid.block_number & 0xffff) as u16,
+                    },
+                    ip_posid: doc.tid.offset,
+                };
                 rows.push((
+                    ctid,
                     doc.tid.block_number as i64,
                     doc.tid.offset as i32,
                     positions_count,
