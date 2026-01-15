@@ -633,9 +633,7 @@ fn stream_segment_occurrences(
             }
             if ok {
                 let start = *pos - anchor_pt.pos;
-                if !starts.contains(&start) {
-                    starts.push(start);
-                }
+                starts.push(start);
             }
         }
 
@@ -775,33 +773,43 @@ unsafe fn build_scan_state(
 
         let first = &segment_occurrences[0];
         'tid_loop: for (tid, starts) in first {
-            let mut prev_start = if leading_wildcard {
-                *starts.iter().min().unwrap_or(&0)
+            let start_candidates: Vec<u32> = if leading_wildcard {
+                starts.clone()
             } else if starts.contains(&0) {
-                0
+                vec![0]
             } else {
                 continue;
             };
-            for seg_idx in 1..segment_occurrences.len() {
-                let Some(starts_next) = segment_occurrences[seg_idx]
-                    .iter()
-                    .find(|(t, _)| t == tid)
-                    .map(|(_, s)| s)
-                else {
-                    continue 'tid_loop;
-                };
-                if let Some(next_start) = starts_next
-                    .iter()
-                    .copied()
-                    .filter(|s| *s >= prev_start)
-                    .min()
-                {
-                    prev_start = next_start;
-                } else {
+
+            for start in start_candidates {
+                let mut prev_start = start;
+                let mut ok = true;
+                for seg_idx in 1..segment_occurrences.len() {
+                    let Some(starts_next) = segment_occurrences[seg_idx]
+                        .iter()
+                        .find(|(t, _)| t == tid)
+                        .map(|(_, s)| s)
+                    else {
+                        ok = false;
+                        break;
+                    };
+                    if let Some(next_start) = starts_next
+                        .iter()
+                        .copied()
+                        .filter(|s| *s >= prev_start)
+                        .min()
+                    {
+                        prev_start = next_start;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    state.push_match(*tid);
                     continue 'tid_loop;
                 }
             }
-            state.push_match(*tid);
         }
 
         state.sort_dedup();

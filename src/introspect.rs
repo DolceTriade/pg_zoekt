@@ -299,6 +299,60 @@ pub fn pg_zoekt_postings_preview(
 }
 
 #[pg_extern]
+pub fn pg_zoekt_posting_positions(
+    index: pg_sys::Oid,
+    segment_idx: i32,
+    trigram: i64,
+    ctid: pg_sys::ItemPointerData,
+) -> TableIterator<'static, (name!(position, i64), name!(flags, i32))> {
+    let mut rows = Vec::new();
+    let trigram_u32 = trigram as u32;
+    let target: crate::storage::ItemPointer = ctid.into();
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let segments = crate::query::read_segments(rel).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read segments: {e:#?}");
+        });
+        let segment = segment_by_index(&segments, segment_idx);
+        let entries = crate::storage::read_segment_entries(rel, &segment).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read segment entries: {e:#?}");
+        });
+        for entry in entries.iter() {
+            let (entry_trigram, _, _, _, _) = entry_fields(entry);
+            if entry_trigram != trigram_u32 {
+                continue;
+            }
+            let mut cursor =
+                crate::storage::decode::PostingCursor::new(rel, entry).unwrap_or_else(|e| {
+                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                    error!("failed to open posting cursor: {e:#?}");
+                });
+            loop {
+                if !cursor.advance().unwrap_or_else(|e| {
+                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                    error!("failed to advance posting cursor: {e:#?}");
+                }) {
+                    break;
+                }
+                let doc = cursor.current().expect("cursor should have doc");
+                if doc.tid != target {
+                    continue;
+                }
+                for (pos, flags) in doc.positions.iter() {
+                    rows.push((*pos as i64, *flags as i32));
+                }
+                break;
+            }
+            break;
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern]
 pub fn pg_zoekt_wal_stats(
     index: pg_sys::Oid,
 ) -> TableIterator<

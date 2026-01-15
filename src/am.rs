@@ -954,6 +954,55 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_posting_positions_introspection() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE posting_pos_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO posting_pos_docs (text) VALUES ('list_edge_gateway_display_fields')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_posting_pos_docs_text_zoekt ON posting_pos_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_posting_pos_docs_text_zoekt'::regclass)")?;
+
+        let segment_idx = Spi::get_one::<i32>(
+            "SELECT segment_idx FROM pg_zoekt_index_segments('idx_posting_pos_docs_text_zoekt'::regclass) ORDER BY segment_idx LIMIT 1",
+        )?
+        .unwrap_or(0);
+        assert!(segment_idx > 0, "expected segment");
+
+        let trigram = Spi::get_one::<i64>("SELECT pg_zoekt_text_to_trigram('lis')")?
+            .unwrap_or_default();
+        let pos_count = Spi::connect_mut(|client| -> spi::Result<i64> {
+            let mut rows = client.select(
+                "SELECT count(*) \
+                 FROM pg_zoekt_posting_positions(\
+                     'idx_posting_pos_docs_text_zoekt'::regclass, \
+                     $1, $2, (SELECT ctid FROM posting_pos_docs LIMIT 1))",
+                None,
+                &[segment_idx.into(), trigram.into()],
+            )?;
+            let row = rows.next().expect("count row");
+            Ok(row.get::<i64>(1)?.unwrap_or(0))
+        })?;
+        assert!(pos_count > 0, "expected posting positions");
+
+        Spi::run("DROP TABLE IF EXISTS posting_pos_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_multisegment_trigram_scan_includes_all_docs() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
@@ -1040,6 +1089,97 @@ mod tests {
         assert_eq!(idx_count, seq_count, "index scan should match seqscan");
 
         Spi::run("DROP TABLE IF EXISTS multi_trgm_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_wildcard_segments_respect_multiple_starts() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE wildcard_seg_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO wildcard_seg_docs (text) VALUES \
+                 ('list prefix list_edge_gateway_display_fields'), \
+                 ('list_edge_gateway_display_fields')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_wildcard_seg_docs_text_zoekt ON wildcard_seg_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let seq_count: i64 = Spi::get_one(
+            "SET enable_seqscan = on; \
+             SET enable_indexscan = off; \
+             SET enable_bitmapscan = off; \
+             SELECT count(*) FROM wildcard_seg_docs WHERE text LIKE '%list_edge_gateway_display_fields%';",
+        )?
+        .unwrap_or(0);
+
+        let idx_count: i64 = Spi::get_one(
+            "SET enable_seqscan = off; \
+             SET enable_indexscan = on; \
+             SET enable_bitmapscan = on; \
+             SELECT count(*) FROM wildcard_seg_docs WHERE text LIKE '%list_edge_gateway_display_fields%';",
+        )?
+        .unwrap_or(0);
+
+        assert_eq!(idx_count, seq_count, "index scan should match seqscan");
+
+        Spi::run("DROP TABLE IF EXISTS wildcard_seg_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_split_doc_positions_across_chunks() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE split_pos_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "INSERT INTO split_pos_docs (text) \
+                 VALUES (repeat('unw', 5000) || 'unwind')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_split_pos_docs_text_zoekt ON split_pos_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let seq_count: i64 = Spi::get_one(
+            "SET enable_seqscan = on; \
+             SET enable_indexscan = off; \
+             SET enable_bitmapscan = off; \
+             SELECT count(*) FROM split_pos_docs WHERE text LIKE '%unwind%';",
+        )?
+        .unwrap_or(0);
+
+        let idx_count: i64 = Spi::get_one(
+            "SET enable_seqscan = off; \
+             SET enable_indexscan = on; \
+             SET enable_bitmapscan = on; \
+             SELECT count(*) FROM split_pos_docs WHERE text LIKE '%unwind%';",
+        )?
+        .unwrap_or(0);
+
+        assert_eq!(idx_count, seq_count, "index scan should match seqscan");
+
+        Spi::run("DROP TABLE IF EXISTS split_pos_docs")?;
         Ok(())
     }
 

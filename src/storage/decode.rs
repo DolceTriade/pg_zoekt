@@ -449,33 +449,46 @@ impl PostingCursor {
                     self.current = None;
                     return Ok(false);
                 }
-                continue;
             }
 
             let tid = self.chunk_tids[self.chunk_doc_idx];
-            let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
-            self.chunk_doc_idx += 1;
-
-            while self.chunk_doc_idx < self.chunk_tids.len()
-                && self.chunk_tids[self.chunk_doc_idx] == tid
-            {
-                total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
-                self.chunk_doc_idx += 1;
-            }
-
             let mut positions = if let Some(doc) = self.current.take() {
                 let mut p = doc.positions;
                 p.clear();
                 p
             } else {
-                Vec::with_capacity(total_needed_positions.max(4))
+                Vec::with_capacity(4)
             };
 
-            for _ in 0..total_needed_positions {
-                let delta = self.next_pos_delta()?;
-                self.pos_acc = self.pos_acc.wrapping_add(delta);
-                let flag = Self::next_flag(&mut self.flags)?;
-                positions.push((self.pos_acc, flag));
+            loop {
+                let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
+                self.chunk_doc_idx += 1;
+
+                while self.chunk_doc_idx < self.chunk_tids.len()
+                    && self.chunk_tids[self.chunk_doc_idx] == tid
+                {
+                    total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
+                    self.chunk_doc_idx += 1;
+                }
+
+                positions.reserve(total_needed_positions);
+                for _ in 0..total_needed_positions {
+                    let delta = self.next_pos_delta()?;
+                    self.pos_acc = self.pos_acc.wrapping_add(delta);
+                    let flag = Self::next_flag(&mut self.flags)?;
+                    positions.push((self.pos_acc, flag));
+                }
+
+                if self.chunk_doc_idx >= self.chunk_tids.len() {
+                    if !self.load_next_chunk()? {
+                        break;
+                    }
+                    if self.chunk_tids.first().copied() == Some(tid) {
+                        continue;
+                    }
+                }
+
+                break;
             }
 
             self.current = Some(DocPosting { tid, positions });
@@ -497,30 +510,44 @@ impl PostingCursor {
                     self.current = None;
                     return Ok(None);
                 }
-                continue;
             }
 
             let tid = self.chunk_tids[self.chunk_doc_idx];
-            let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
-            self.chunk_doc_idx += 1;
-
-            while self.chunk_doc_idx < self.chunk_tids.len()
-                && self.chunk_tids[self.chunk_doc_idx] == tid
-            {
-                total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
-                self.chunk_doc_idx += 1;
-            }
-
             let mut found = false;
-            for _ in 0..total_needed_positions {
-                let delta = self.next_pos_delta()?;
-                self.pos_acc = self.pos_acc.wrapping_add(delta);
-                let flag = Self::next_flag(&mut self.flags)?;
-                if self.pos_acc == target_pos
-                    && (!case_sensitive || (flag & 0b111) == (pattern_flag & 0b111))
+
+            loop {
+                let mut total_needed_positions = self.chunk_counts[self.chunk_doc_idx] as usize;
+                self.chunk_doc_idx += 1;
+
+                while self.chunk_doc_idx < self.chunk_tids.len()
+                    && self.chunk_tids[self.chunk_doc_idx] == tid
                 {
-                    found = true;
+                    total_needed_positions += self.chunk_counts[self.chunk_doc_idx] as usize;
+                    self.chunk_doc_idx += 1;
                 }
+
+                for _ in 0..total_needed_positions {
+                    let delta = self.next_pos_delta()?;
+                    self.pos_acc = self.pos_acc.wrapping_add(delta);
+                    let flag = Self::next_flag(&mut self.flags)?;
+                    if self.pos_acc == target_pos
+                        && (!case_sensitive || (flag & 0b111) == (pattern_flag & 0b111))
+                    {
+                        found = true;
+                    }
+                }
+
+                if self.chunk_doc_idx >= self.chunk_tids.len() {
+                    if !self.load_next_chunk()? {
+                        self.current = None;
+                        return Ok(Some((tid, found)));
+                    }
+                    if self.chunk_tids.first().copied() == Some(tid) {
+                        continue;
+                    }
+                }
+
+                break;
             }
 
             self.current = None;
