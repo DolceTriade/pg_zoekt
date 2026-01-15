@@ -990,23 +990,77 @@ unsafe fn const_pattern_from_op(op: *mut pg_sys::OpExpr) -> Option<String> {
         return None;
     }
     let args = unsafe { PgList::<pg_sys::Expr>::from_pg(args_ptr) };
-    let const_arg = args.get_ptr(1)?;
-    unsafe { const_text(const_arg) }
+    if let Some(arg) = args.get_ptr(1) {
+        if let Some(text) = unsafe { const_text(arg) } {
+            return Some(text);
+        }
+    }
+    if let Some(arg) = args.get_ptr(0) {
+        if let Some(text) = unsafe { const_text(arg) } {
+            return Some(text);
+        }
+    }
+    None
 }
 
 unsafe fn const_text(expr: *mut pg_sys::Expr) -> Option<String> {
     if expr.is_null() {
         return None;
     }
-    let node = expr as *mut pg_sys::Node;
-    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_Const {
-        return None;
+    let mut cur = expr;
+    loop {
+        let node = cur as *mut pg_sys::Node;
+        match unsafe { (*node).type_ } {
+            pg_sys::NodeTag::T_Const => {
+                let cnst = cur as *mut pg_sys::Const;
+                if unsafe { (*cnst).constisnull } {
+                    return None;
+                }
+                let ty = unsafe { (*cnst).consttype };
+                let mut out_func: pg_sys::Oid = pg_sys::InvalidOid;
+                let mut out_varlena = false;
+                unsafe { pg_sys::getTypeOutputInfo(ty, &mut out_func, &mut out_varlena) };
+                if out_func == pg_sys::InvalidOid {
+                    return None;
+                }
+                let cstr = unsafe { pg_sys::OidOutputFunctionCall(out_func, (*cnst).constvalue) };
+                if cstr.is_null() {
+                    return None;
+                }
+                let text = unsafe { std::ffi::CStr::from_ptr(cstr) };
+                return Some(text.to_string_lossy().to_string());
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                let relabel = cur as *mut pg_sys::RelabelType;
+                cur = unsafe { (*relabel).arg };
+                if cur.is_null() {
+                    return None;
+                }
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let coerce = cur as *mut pg_sys::CoerceViaIO;
+                cur = unsafe { (*coerce).arg };
+                if cur.is_null() {
+                    return None;
+                }
+            }
+            pg_sys::NodeTag::T_CoerceToDomain => {
+                let coerce = cur as *mut pg_sys::CoerceToDomain;
+                cur = unsafe { (*coerce).arg };
+                if cur.is_null() {
+                    return None;
+                }
+            }
+            pg_sys::NodeTag::T_CollateExpr => {
+                let collate = cur as *mut pg_sys::CollateExpr;
+                cur = unsafe { (*collate).arg };
+                if cur.is_null() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
     }
-    let cnst = expr as *mut pg_sys::Const;
-    if unsafe { (*cnst).constisnull } || unsafe { (*cnst).consttype } != pg_sys::TEXTOID {
-        return None;
-    }
-    unsafe { String::from_datum((*cnst).constvalue, false) }
 }
 
 unsafe fn index_path_constant_trigram(path: *mut pg_sys::IndexPath) -> Option<bool> {
@@ -1017,13 +1071,17 @@ unsafe fn index_path_constant_trigram(path: *mut pg_sys::IndexPath) -> Option<bo
     if clauses_ptr.is_null() {
         return None;
     }
-    let clauses = unsafe { PgList::<pg_sys::RestrictInfo>::from_pg(clauses_ptr) };
+    let clauses = unsafe { PgList::<pg_sys::IndexClause>::from_pg(clauses_ptr) };
     let mut saw_constant = false;
-    for restrict_ptr in clauses.iter_ptr() {
-        if restrict_ptr.is_null() {
+    for clause_ptr in clauses.iter_ptr() {
+        if clause_ptr.is_null() {
             continue;
         }
-        let clause = unsafe { (*restrict_ptr).clause } as *mut pg_sys::Node;
+        let rinfo = unsafe { (*clause_ptr).rinfo };
+        if rinfo.is_null() {
+            continue;
+        }
+        let clause = unsafe { (*rinfo).clause } as *mut pg_sys::Node;
         if clause.is_null() || unsafe { (*clause).type_ } != pg_sys::NodeTag::T_OpExpr {
             continue;
         }
@@ -1082,8 +1140,9 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         }
     }
 
-    if let Some(false) = unsafe { index_path_constant_trigram(path) } {
-        let base_cost = (pages * tuples.max(1.0)).max(1.0) * 1000.0;
+    let trigram_hint = unsafe { index_path_constant_trigram(path) };
+    if let Some(false) = trigram_hint {
+        let base_cost = 1.0e30;
         if !index_startup_cost.is_null() {
             unsafe {
                 *index_startup_cost = base_cost;

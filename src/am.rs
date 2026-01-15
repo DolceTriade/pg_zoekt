@@ -982,8 +982,8 @@ mod tests {
         .unwrap_or(0);
         assert!(segment_idx > 0, "expected segment");
 
-        let trigram = Spi::get_one::<i64>("SELECT pg_zoekt_text_to_trigram('lis')")?
-            .unwrap_or_default();
+        let trigram =
+            Spi::get_one::<i64>("SELECT pg_zoekt_text_to_trigram('lis')")?.unwrap_or_default();
         let pos_count = Spi::connect_mut(|client| -> spi::Result<i64> {
             let mut rows = client.select(
                 "SELECT count(*) \
@@ -1840,6 +1840,14 @@ mod tests {
         let explain =
             Spi::get_one::<String>("EXPLAIN SELECT text FROM planner_docs WHERE text LIKE 'ab%';")?
                 .unwrap_or_default();
+        assert!(
+            !explain.contains("zoekt"),
+            "planner unexpectedly chose pg_zoekt: {explain}"
+        );
+        let explain = Spi::get_one::<String>(
+            "EXPLAIN SELECT text FROM planner_docs WHERE text LIKE '%ab%';",
+        )?
+        .unwrap_or_default();
         assert!(
             !explain.contains("zoekt"),
             "planner unexpectedly chose pg_zoekt: {explain}"
