@@ -480,28 +480,48 @@ fn stream_segment_occurrences(
     struct TrigramCursor {
         cursors: Vec<PostingCursor>,
         heap: std::collections::BinaryHeap<std::cmp::Reverse<(crate::storage::ItemPointer, usize)>>,
+        current: Option<crate::storage::decode::DocPosting>,
     }
 
     impl TrigramCursor {
         fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
-            self.heap.peek().map(|entry| entry.0.0)
+            self.current.as_ref().map(|doc| doc.tid)
         }
 
         fn current(&self) -> Option<&crate::storage::decode::DocPosting> {
-            let (_, idx) = self.heap.peek()?.0;
-            self.cursors.get(idx)?.current()
+            self.current.as_ref()
         }
 
         fn advance(&mut self) -> anyhow::Result<bool> {
-            let Some(std::cmp::Reverse((_tid, idx))) = self.heap.pop() else {
+            let Some(std::cmp::Reverse((target, _))) = self.heap.peek().cloned() else {
+                self.current = None;
                 return Ok(false);
             };
-            if self.cursors[idx].advance()? {
-                if let Some(next_tid) = self.cursors[idx].current_tid() {
-                    self.heap.push(std::cmp::Reverse((next_tid, idx)));
+            let mut positions: Vec<(u32, u8)> = Vec::new();
+            let mut sources = 0usize;
+            while let Some(std::cmp::Reverse((tid, idx))) = self.heap.peek().cloned() {
+                if tid != target {
+                    break;
+                }
+                self.heap.pop();
+                sources += 1;
+                if let Some(doc) = self.cursors[idx].current() {
+                    positions.extend(doc.positions.iter().copied());
+                }
+                if self.cursors[idx].advance()? {
+                    if let Some(next_tid) = self.cursors[idx].current_tid() {
+                        self.heap.push(std::cmp::Reverse((next_tid, idx)));
+                    }
                 }
             }
-            Ok(!self.heap.is_empty())
+            if sources > 1 {
+                positions.sort_unstable_by_key(|(pos, _)| *pos);
+            }
+            self.current = Some(crate::storage::decode::DocPosting {
+                tid: target,
+                positions,
+            });
+            Ok(true)
         }
     }
 
@@ -550,10 +570,15 @@ fn stream_segment_occurrences(
         if heap.is_empty() {
             return Ok(Vec::new());
         }
-        cursors.push(TrigramCursor {
+        let mut trgm_cursor = TrigramCursor {
             cursors: per_seg,
             heap,
-        });
+            current: None,
+        };
+        if !trgm_cursor.advance()? {
+            return Ok(Vec::new());
+        }
+        cursors.push(trgm_cursor);
     }
 
     let mut occurrences: Vec<(crate::storage::ItemPointer, Vec<u32>)> = Vec::new();
