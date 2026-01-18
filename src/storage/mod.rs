@@ -1532,10 +1532,12 @@ pub fn merge(
     );
 
     let mut cursors = Vec::new();
-    for segment in segments {
+    let mut cursor_segment_ids = Vec::new();
+    for (seg_idx, segment) in segments.iter().enumerate() {
         let cursor = SegmentCursor::new(rel, segment)?;
         if cursor.current_entry().is_some() {
             cursors.push(cursor);
+            cursor_segment_ids.push(seg_idx + 1);
         }
     }
 
@@ -1728,17 +1730,29 @@ pub fn merge(
             idx_entry.data_length = data_length;
             idx_entry.frequency = frequency;
             if data_length > 0 {
-                let first_len = (data_length as usize).min(max_chunk_size);
-                let loc = writer.start_chunk(first_len);
-                idx_entry.block = loc.block_number;
-                idx_entry.offset = loc.offset as u16;
                 unsafe {
-                    crate::storage::decode::copy_posting_bytes(
-                        rel,
-                        entry,
-                        data_length as usize,
-                        &mut writer,
-                    )?;
+                    let seg_idx = cursor_indices
+                        .first()
+                        .and_then(|idx| cursor_segment_ids.get(*idx).copied())
+                        .unwrap_or(0);
+                    let result =
+                        crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer);
+                    if let Err(e) = result {
+                        let (block, offset, _len) = entry_fields(entry);
+                        warning!(
+                            "posting copy failed: trigram={} segment_idx={} block={} offset={} length={} err={e:#}",
+                            trigram,
+                            seg_idx,
+                            block,
+                            offset,
+                            data_length
+                        );
+                        return Err(e);
+                    }
+                    if let Ok(Some(loc)) = result {
+                        idx_entry.block = loc.block_number;
+                        idx_entry.offset = loc.offset as u16;
+                    }
                 }
                 byte_count = byte_count.saturating_add(data_length as u64);
             }

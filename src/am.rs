@@ -592,7 +592,8 @@ mod implementation {
         routine.amcaninclude = false;
         routine.amusemaintenanceworkmem = false;
         routine.amsummarizing = false;
-        routine.amparallelvacuumoptions = 0;
+        routine.amparallelvacuumoptions =
+            (pg_sys::VACUUM_OPTION_PARALLEL_BULKDEL | pg_sys::VACUUM_OPTION_PARALLEL_CLEANUP) as u8;
         routine.amkeytype = pg_sys::InvalidOid;
 
         // Required callbacks
@@ -1280,6 +1281,78 @@ mod tests {
         assert_eq!(idx_count, seq_count, "index scan should match seqscan");
 
         Spi::run("DROP TABLE IF EXISTS split_pos_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_elide_copy_preserves_chunk_boundaries() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE elide_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO elide_docs (text) VALUES (repeat('abc', 50000))",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_elide_docs_text_zoekt ON elide_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_elide_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("read segments");
+            assert!(!segments.is_empty(), "expected segments");
+            let merged = crate::storage::merge(
+                rel,
+                &segments,
+                1024 * 1024 * 1024,
+                &crate::storage::tombstone::Snapshot::default(),
+            )
+            .expect("merge failed");
+            let entries = crate::storage::read_segment_entries(rel, &merged).expect("read entries");
+            let target = crate::trgm::CompactTrgm::try_from("abc")
+                .expect("trigram")
+                .0;
+            let entry = entries
+                .iter()
+                .find(|entry| {
+                    let trgm = std::ptr::read_unaligned(std::ptr::addr_of!(entry.trigram));
+                    trgm == target
+                })
+                .expect("missing abc trigram entry");
+            let data_length = std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length));
+            let max_chunk_size = crate::storage::pgbuffer::SPECIAL_SIZE
+                - std::mem::size_of::<crate::storage::PostingPageHeader>();
+            assert!(
+                (data_length as usize) > max_chunk_size,
+                "expected multi-chunk posting list (len={})",
+                data_length
+            );
+            let mut cursor =
+                crate::storage::decode::PostingCursor::new(rel, entry).expect("posting cursor");
+            while cursor.advance().expect("posting decode") {}
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
         Ok(())
     }
 

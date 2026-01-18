@@ -614,3 +614,9 @@ impl Write for PageWriter {
         Ok(())
     }
 }
+
+impl crate::storage::decode::PostingChunkWriter for PageWriter {
+    fn start_chunk(&mut self, len: usize) -> super::ItemPointer {
+        self.start_chunk(len)
+    }
+}

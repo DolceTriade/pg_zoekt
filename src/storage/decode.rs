@@ -162,28 +162,6 @@ impl PostingReader {
         self.page_free = header_copy.free as usize;
         Ok(())
     }
-
-    fn copy_to<W: Write>(&mut self, mut len: usize, out: &mut W) -> anyhow::Result<()> {
-        if len > self.remaining {
-            anyhow::bail!("posting copy exceeds declared length");
-        }
-        while len > 0 {
-            let available = self.page_free.saturating_sub(self.cursor);
-            if available == 0 {
-                self.advance_page()?;
-                continue;
-            }
-            let take = available.min(len);
-            let page = self.buf.as_ref();
-            let end = self.cursor + take;
-            out.write_all(&page[self.cursor..end])
-                .context("write posting bytes")?;
-            self.cursor = end;
-            self.remaining -= take;
-            len -= take;
-        }
-        Ok(())
-    }
 }
 
 fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
@@ -193,14 +171,47 @@ fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
     (block, offset, data_length)
 }
 
-pub(crate) unsafe fn copy_posting_bytes<W: Write>(
+pub(crate) trait PostingChunkWriter: Write {
+    fn start_chunk(&mut self, len: usize) -> ItemPointer;
+}
+
+pub(crate) unsafe fn copy_posting_chunks<W>(
     rel: pg_sys::Relation,
     entry: &IndexEntry,
-    len: usize,
     out: &mut W,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ItemPointer>>
+where
+    W: PostingChunkWriter,
+{
+    let (_block, _offset, data_length) = entry_fields(entry);
+    if data_length == 0 {
+        return Ok(None);
+    }
     let mut reader = unsafe { PostingReader::new(rel, entry) }?;
-    reader.copy_to(len, out)
+    let header_size = std::mem::size_of::<CompressedBlockHeader>();
+    let mut first_loc: Option<ItemPointer> = None;
+    while reader.has_remaining() {
+        let header_bytes = reader.take_slice(header_size)?;
+        let hdr = *CompressedBlockHeader::try_ref_from_bytes(header_bytes)
+            .map_err(|e| anyhow::anyhow!("decode header: {e}"))?;
+        let payload_len = hdr.docs_blk_len as usize
+            + hdr.docs_off_len as usize
+            + hdr.counts_len as usize
+            + hdr.pos_len as usize
+            + hdr.flags_len as usize;
+        let total_len = header_size
+            .checked_add(payload_len)
+            .context("posting chunk length overflow")?;
+        let loc = out.start_chunk(total_len);
+        if first_loc.is_none() {
+            first_loc = Some(loc);
+        }
+        out.write_all(header_bytes)
+            .context("write posting header")?;
+        let payload = reader.take_slice(payload_len)?;
+        out.write_all(payload).context("write posting payload")?;
+    }
+    Ok(first_loc)
 }
 
 #[cfg(test)]
