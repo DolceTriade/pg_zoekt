@@ -441,6 +441,9 @@ fn pattern_has_lossy_trigram(segments: &[SegmentPattern]) -> bool {
 }
 
 fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
+    if (doc_flag & LOSSY_FLAG) != (pattern_flag & LOSSY_FLAG) {
+        return false;
+    }
     if !case_sensitive {
         return true;
     }

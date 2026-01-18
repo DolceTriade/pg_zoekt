@@ -143,6 +143,14 @@ mod implementation {
             if !index_rel.is_null() {
                 let index_oid = unsafe { (*index_rel).rd_id };
                 seal_index(index_oid, crate::storage::MaintenanceLockMode::Try);
+                let flush_threshold = crate::build::flush_threshold_bytes();
+                if let Err(e) = merge_segments(
+                    index_rel,
+                    flush_threshold,
+                    crate::storage::MaintenanceLockMode::Try,
+                ) {
+                    warning!("failed to merge segments during vacuum: {e:#}");
+                }
             }
         }
         if !stats.is_null() {
@@ -152,17 +160,99 @@ mod implementation {
         stats.into_pg()
     }
 
-    unsafe extern "C-unwind" fn ambulkdelete(
+    pub(super) unsafe extern "C-unwind" fn ambulkdelete(
         _info: *mut pg_sys::IndexVacuumInfo,
         stats: *mut pg_sys::IndexBulkDeleteResult,
         _callback: pg_sys::IndexBulkDeleteCallback,
         _callback_state: *mut std::ffi::c_void,
     ) -> *mut pg_sys::IndexBulkDeleteResult {
-        if !stats.is_null() {
-            return stats;
+        let stats_ptr = if !stats.is_null() {
+            stats
+        } else {
+            unsafe {
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBulkDeleteResult>())
+                    as *mut pg_sys::IndexBulkDeleteResult
+            }
+        };
+        let stats = unsafe { &mut *stats_ptr };
+
+        let Some(callback) = _callback else {
+            return stats_ptr;
+        };
+        if _info.is_null() {
+            return stats_ptr;
         }
-        let stats = unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() };
-        stats.into_pg()
+        let index_rel = unsafe { (*_info).index };
+        if index_rel.is_null() {
+            return stats_ptr;
+        }
+
+        let mut seen: u64 = 0;
+        let mut removed: Vec<crate::storage::ItemPointer> = Vec::new();
+        let Ok(segments) = (unsafe { crate::query::read_segments(index_rel) }) else {
+            return stats_ptr;
+        };
+
+        for seg in segments.iter() {
+            let entries = match crate::storage::read_segment_entries(index_rel, seg) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warning!("failed to read segment entries: {e:#}");
+                    continue;
+                }
+            };
+            for entry in entries.iter() {
+                let mut cursor =
+                    match unsafe { crate::storage::decode::PostingCursor::new(index_rel, entry) } {
+                        Ok(cur) => cur,
+                        Err(e) => {
+                            warning!("failed to open posting cursor: {e:#}");
+                            continue;
+                        }
+                    };
+                loop {
+                    match cursor.advance() {
+                        Ok(true) => {
+                            let Some(doc) = cursor.current() else {
+                                continue;
+                            };
+                            seen = seen.saturating_add(1);
+                            let tid = pg_sys::ItemPointerData {
+                                ip_blkid: pg_sys::BlockIdData {
+                                    bi_hi: (doc.tid.block_number >> 16) as u16,
+                                    bi_lo: (doc.tid.block_number & 0xffff) as u16,
+                                },
+                                ip_posid: doc.tid.offset,
+                            };
+                            let delete = unsafe {
+                                callback(&tid as *const _ as pg_sys::ItemPointer, _callback_state)
+                            };
+                            if delete {
+                                removed.push(doc.tid);
+                                stats.tuples_removed += 1.0;
+                            } else {
+                                stats.num_index_tuples += 1.0;
+                            }
+                        }
+                        Ok(false) => break,
+                        Err(e) => {
+                            warning!("failed to advance posting cursor: {e:#}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !removed.is_empty() {
+            if let Err(e) = crate::storage::tombstone::apply_deletions(index_rel, removed) {
+                warning!("failed to persist tombstones: {e:#}");
+            }
+        }
+        if seen > 0 {
+            stats.estimated_count = false;
+        }
+        stats_ptr
     }
 
     fn merge_segments(
@@ -552,6 +642,16 @@ mod implementation {
 #[cfg(feature = "pg18")]
 #[allow(unused_imports)]
 pub use implementation::pg_zoekt_handler;
+
+#[cfg(any(test, feature = "pg_test"))]
+unsafe fn test_ambulkdelete(
+    info: *mut pg_sys::IndexVacuumInfo,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
+    callback: pg_sys::IndexBulkDeleteCallback,
+    callback_state: *mut std::ffi::c_void,
+) -> *mut pg_sys::IndexBulkDeleteResult {
+    unsafe { implementation::ambulkdelete(info, stats, callback, callback_state) }
+}
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
@@ -1812,6 +1912,102 @@ mod tests {
             Spi::get_one("SELECT count(*) FROM tombstone_docs WHERE text LIKE '%mee%';")?
                 .unwrap_or(0);
         assert_eq!(after, 2);
+        Ok(())
+    }
+
+    fn tombstone_bytes(index_oid: pg_sys::Oid) -> u32 {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+            let bytes = rbl.tombstone_bytes;
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            bytes
+        }
+    }
+
+    #[pg_test]
+    pub fn test_vacuum_bulkdelete_writes_tombstones() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE vacuum_tomb_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO vacuum_tomb_docs (text) VALUES ('keep me'), ('delete me'), ('keep me too')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_vacuum_tomb_docs_text_zoekt ON vacuum_tomb_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_vacuum_tomb_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_vacuum_tomb_docs_text_zoekt'::regclass)")?;
+        let before = tombstone_bytes(index_oid);
+
+        let tid: pg_sys::ItemPointerData =
+            Spi::get_one("SELECT ctid FROM vacuum_tomb_docs WHERE text = 'delete me' LIMIT 1")?
+                .expect("delete me tid");
+
+        #[repr(C)]
+        struct BulkDeleteState {
+            target: pg_sys::ItemPointerData,
+        }
+
+        unsafe extern "C-unwind" fn bulkdelete_callback(
+            item: pg_sys::ItemPointer,
+            state: *mut std::ffi::c_void,
+        ) -> bool {
+            if item.is_null() || state.is_null() {
+                return false;
+            }
+            let current = unsafe { *item };
+            let target = unsafe { &*(state as *const BulkDeleteState) }.target;
+            current.ip_posid == target.ip_posid
+                && current.ip_blkid.bi_hi == target.ip_blkid.bi_hi
+                && current.ip_blkid.bi_lo == target.ip_blkid.bi_lo
+        }
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let mut info: pg_sys::IndexVacuumInfo = std::mem::zeroed();
+            info.index = rel;
+            let mut state = BulkDeleteState { target: tid };
+            super::test_ambulkdelete(
+                &mut info,
+                std::ptr::null_mut(),
+                Some(bulkdelete_callback),
+                (&mut state as *mut BulkDeleteState).cast(),
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
+        let after = tombstone_bytes(index_oid);
+        assert!(
+            after > before,
+            "expected tombstone bytes to increase after vacuum (before={}, after={})",
+            before,
+            after
+        );
         Ok(())
     }
 
