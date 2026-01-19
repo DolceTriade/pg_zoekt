@@ -2443,4 +2443,46 @@ mod tests {
             Ok(())
         })
     }
+
+    #[pg_test]
+    pub fn test_adaptive_trigram_regex_matches() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE adaptive_regex_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO adaptive_regex_docs (text) VALUES
+                 ('deep learning is fun'),
+                 ('deep neural learning systems'),
+                 ('no match here'),
+                 ('deeply learning'),
+                 ('deep ---- learning')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_adaptive_regex_docs_text_zoekt ON adaptive_regex_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+
+            let count = client
+                .select(
+                    "SELECT count(*) FROM adaptive_regex_docs WHERE text ~ 'deep.*learning'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(count, 4, "expected adaptive regex matches");
+
+            client.update("RESET enable_seqscan", None, &[])?;
+            client.update("DROP TABLE adaptive_regex_docs", None, &[])?;
+            Ok(())
+        })
+    }
 }

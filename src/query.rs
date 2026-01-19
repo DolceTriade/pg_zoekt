@@ -92,6 +92,12 @@ struct SegmentPattern {
     trigrams: Vec<PatternTrgm>,
 }
 
+struct TrgmWork {
+    pat_idx: usize,
+    entries: Vec<crate::storage::IndexEntry>,
+    freq: u32,
+}
+
 const LOSSY_FLAG: u8 = 0x80;
 
 pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::storage::Segment>> {
@@ -369,6 +375,54 @@ fn regex_to_wildcard_pattern(pattern: &str) -> String {
     out
 }
 
+fn regex_safe_for_ordering(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut prev_dot_wildcard = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            prev_dot_wildcard = false;
+            continue;
+        }
+        if in_class {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == ']' {
+                in_class = false;
+            }
+            prev_dot_wildcard = false;
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                prev_dot_wildcard = false;
+            }
+            '[' => {
+                in_class = true;
+                prev_dot_wildcard = false;
+            }
+            '|' | '?' | '+' | '{' => return false,
+            '*' => {
+                if !prev_dot_wildcard {
+                    return false;
+                }
+                prev_dot_wildcard = false;
+            }
+            '.' => {
+                prev_dot_wildcard = true;
+            }
+            _ => {
+                prev_dot_wildcard = false;
+            }
+        }
+    }
+    true
+}
+
 fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
     let mut leading = false;
     let mut has_single = false;
@@ -440,6 +494,10 @@ fn pattern_has_lossy_trigram(segments: &[SegmentPattern]) -> bool {
         .any(|segment| segment.trigrams.iter().any(|pt| pt.flags & LOSSY_FLAG != 0))
 }
 
+const ADAPTIVE_INITIAL_TRIGRAMS: usize = 6;
+const ADAPTIVE_MAX_TRIGRAMS: usize = 12;
+const ADAPTIVE_TARGET_CANDIDATES: usize = 2048;
+
 fn flags_match(doc_flag: u8, pattern_flag: u8, case_sensitive: bool) -> bool {
     if (doc_flag & LOSSY_FLAG) != (pattern_flag & LOSSY_FLAG) {
         return false;
@@ -472,12 +530,6 @@ fn stream_segment_occurrences(
 ) -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
     if seg_pattern.trigrams.is_empty() {
         return Ok(Vec::new());
-    }
-
-    struct TrgmWork {
-        pat_idx: usize,
-        entries: Vec<crate::storage::IndexEntry>,
-        freq: u32,
     }
 
     struct TrigramCursor {
@@ -528,6 +580,21 @@ fn stream_segment_occurrences(
         }
     }
 
+    let mut trgm_entries = build_trgm_entries(rel, index_segments, seg_pattern)?;
+    trgm_entries.sort_by_key(|w| w.freq);
+    stream_segment_occurrences_with_entries(
+        rel,
+        seg_pattern,
+        case_sensitive,
+        &trgm_entries,
+    )
+}
+
+fn build_trgm_entries(
+    rel: pg_sys::Relation,
+    index_segments: &[crate::storage::Segment],
+    seg_pattern: &SegmentPattern,
+) -> anyhow::Result<Vec<TrgmWork>> {
     let mut trgm_entries: Vec<TrgmWork> = Vec::new();
     for (idx, pt) in seg_pattern.trigrams.iter().enumerate() {
         let entries = entry_for_trigram(rel, index_segments, pt.trigram);
@@ -545,11 +612,69 @@ fn stream_segment_occurrences(
             freq,
         });
     }
+    Ok(trgm_entries)
+}
 
-    trgm_entries.sort_by_key(|w| w.freq);
+fn stream_segment_occurrences_with_entries(
+    rel: pg_sys::Relation,
+    seg_pattern: &SegmentPattern,
+    case_sensitive: bool,
+    trgm_entries: &[TrgmWork],
+) -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
+    if trgm_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    struct TrigramCursor {
+        cursors: Vec<PostingCursor>,
+        heap: std::collections::BinaryHeap<std::cmp::Reverse<(crate::storage::ItemPointer, usize)>>,
+        current: Option<crate::storage::decode::DocPosting>,
+    }
+
+    impl TrigramCursor {
+        fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
+            self.current.as_ref().map(|doc| doc.tid)
+        }
+
+        fn current(&self) -> Option<&crate::storage::decode::DocPosting> {
+            self.current.as_ref()
+        }
+
+        fn advance(&mut self) -> anyhow::Result<bool> {
+            let Some(std::cmp::Reverse((target, _))) = self.heap.peek().cloned() else {
+                self.current = None;
+                return Ok(false);
+            };
+            let mut positions: Vec<(u32, u8)> = Vec::new();
+            let mut sources = 0usize;
+            while let Some(std::cmp::Reverse((tid, idx))) = self.heap.peek().cloned() {
+                if tid != target {
+                    break;
+                }
+                self.heap.pop();
+                sources += 1;
+                if let Some(doc) = self.cursors[idx].current() {
+                    positions.extend(doc.positions.iter().copied());
+                }
+                if self.cursors[idx].advance()? {
+                    if let Some(next_tid) = self.cursors[idx].current_tid() {
+                        self.heap.push(std::cmp::Reverse((next_tid, idx)));
+                    }
+                }
+            }
+            if sources > 1 {
+                positions.sort_unstable_by_key(|(pos, _)| *pos);
+            }
+            self.current = Some(crate::storage::decode::DocPosting {
+                tid: target,
+                positions,
+            });
+            Ok(true)
+        }
+    }
 
     let mut cursors = Vec::with_capacity(trgm_entries.len());
-    for work in &trgm_entries {
+    for work in trgm_entries {
         let mut per_seg = Vec::new();
         for entry in &work.entries {
             let mut cur = unsafe { PostingCursor::new(rel, entry)? };
@@ -595,7 +720,7 @@ fn stream_segment_occurrences(
         let mut mismatch = false;
         for idx in 1..cursors.len() {
             loop {
-                let tid = match cursors[idx].current_tid() {
+                let tid: crate::storage::ItemPointer = match cursors[idx].current_tid() {
                     Some(t) => t,
                     None => break 'driver,
                 };
@@ -677,6 +802,100 @@ fn stream_segment_occurrences(
     Ok(occurrences)
 }
 
+fn stream_segment_occurrences_adaptive(
+    rel: pg_sys::Relation,
+    index_segments: &[crate::storage::Segment],
+    seg_pattern: &SegmentPattern,
+    case_sensitive: bool,
+) -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
+    let mut trgm_entries = build_trgm_entries(rel, index_segments, seg_pattern)?;
+    if trgm_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    trgm_entries.sort_by_key(|w| w.freq);
+    let total = trgm_entries.len();
+    let mut k = total.min(ADAPTIVE_INITIAL_TRIGRAMS);
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let mut occurrences = stream_segment_occurrences_with_entries(
+        rel,
+        seg_pattern,
+        case_sensitive,
+        &trgm_entries[..k],
+    )?;
+    loop {
+        if occurrences.len() <= ADAPTIVE_TARGET_CANDIDATES
+            || k >= total
+            || k >= ADAPTIVE_MAX_TRIGRAMS
+        {
+            break;
+        }
+        let next_k = (k + 2).min(total).min(ADAPTIVE_MAX_TRIGRAMS);
+        if next_k == k {
+            break;
+        }
+        k = next_k;
+        occurrences = stream_segment_occurrences_with_entries(
+            rel,
+            seg_pattern,
+            case_sensitive,
+            &trgm_entries[..k],
+        )?;
+    }
+    Ok(occurrences)
+}
+
+fn add_matches_from_segment_occurrences(
+    state: &mut ScanState,
+    segment_occurrences: &[Vec<(crate::storage::ItemPointer, Vec<u32>)>],
+    leading_wildcard: bool,
+) {
+    if segment_occurrences.is_empty() {
+        return;
+    }
+    let first = &segment_occurrences[0];
+    'tid_loop: for (tid, starts) in first {
+        let start_candidates: Vec<u32> = if leading_wildcard {
+            starts.clone()
+        } else if starts.contains(&0) {
+            vec![0]
+        } else {
+            continue;
+        };
+
+        for start in start_candidates {
+            let mut prev_start = start;
+            let mut ok = true;
+            for seg_idx in 1..segment_occurrences.len() {
+                let Some(starts_next) = segment_occurrences[seg_idx]
+                    .iter()
+                    .find(|(t, _)| t == tid)
+                    .map(|(_, s)| s)
+                else {
+                    ok = false;
+                    break;
+                };
+                if let Some(next_start) = starts_next
+                    .iter()
+                    .copied()
+                    .filter(|s| *s >= prev_start)
+                    .min()
+                {
+                    prev_start = next_start;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                state.push_match(*tid);
+                continue 'tid_loop;
+            }
+        }
+    }
+}
+
 unsafe fn build_scan_state(
     index_relation: pg_sys::Relation,
     keys: pg_sys::ScanKey,
@@ -725,23 +944,34 @@ unsafe fn build_scan_state(
             });
 
         if is_regex {
+            let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> =
+                Vec::new();
+            let can_order = regex_safe_for_ordering(&pattern_str);
             for seg_pattern in &segments {
-                match stream_segment_occurrences(
+                match stream_segment_occurrences_adaptive(
                     index_relation,
                     &index_segments,
                     seg_pattern,
                     case_sensitive,
                 ) {
-                    Ok(occs) => {
-                        for (tid, _) in occs {
-                            state.push_match(tid);
+                    Ok(occs) if !occs.is_empty() => {
+                        if can_order {
+                            segment_occurrences.push(occs);
+                        } else {
+                            for (tid, _) in occs {
+                                state.push_match(tid);
+                            }
                         }
                     }
+                    Ok(_) => return state,
                     Err(e) => {
                         warning!("failed to stream segment postings: {e:#}");
                         return state;
                     }
                 }
+            }
+            if can_order {
+                add_matches_from_segment_occurrences(&mut state, &segment_occurrences, true);
             }
             state.sort_dedup();
             return state;
@@ -780,12 +1010,24 @@ unsafe fn build_scan_state(
         let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> = Vec::new();
 
         for seg_pattern in &segments {
-            match stream_segment_occurrences(
-                index_relation,
-                &index_segments,
-                seg_pattern,
-                case_sensitive,
-            ) {
+            let use_adaptive = seg_pattern.trigrams.len() > ADAPTIVE_INITIAL_TRIGRAMS;
+            let occs = if use_adaptive {
+                state.lossy = true;
+                stream_segment_occurrences_adaptive(
+                    index_relation,
+                    &index_segments,
+                    seg_pattern,
+                    case_sensitive,
+                )
+            } else {
+                stream_segment_occurrences(
+                    index_relation,
+                    &index_segments,
+                    seg_pattern,
+                    case_sensitive,
+                )
+            };
+            match occs {
                 Ok(occs) if !occs.is_empty() => segment_occurrences.push(occs),
                 Ok(_) => return state,
                 Err(e) => {
@@ -799,46 +1041,11 @@ unsafe fn build_scan_state(
             return state;
         }
 
-        let first = &segment_occurrences[0];
-        'tid_loop: for (tid, starts) in first {
-            let start_candidates: Vec<u32> = if leading_wildcard {
-                starts.clone()
-            } else if starts.contains(&0) {
-                vec![0]
-            } else {
-                continue;
-            };
-
-            for start in start_candidates {
-                let mut prev_start = start;
-                let mut ok = true;
-                for seg_idx in 1..segment_occurrences.len() {
-                    let Some(starts_next) = segment_occurrences[seg_idx]
-                        .iter()
-                        .find(|(t, _)| t == tid)
-                        .map(|(_, s)| s)
-                    else {
-                        ok = false;
-                        break;
-                    };
-                    if let Some(next_start) = starts_next
-                        .iter()
-                        .copied()
-                        .filter(|s| *s >= prev_start)
-                        .min()
-                    {
-                        prev_start = next_start;
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    state.push_match(*tid);
-                    continue 'tid_loop;
-                }
-            }
-        }
+        add_matches_from_segment_occurrences(
+            &mut state,
+            &segment_occurrences,
+            leading_wildcard,
+        );
 
         state.sort_dedup();
         state
@@ -1289,5 +1496,17 @@ mod tests {
     fn test_regex_to_wildcard_char_class() {
         let pat = regex_to_wildcard_pattern("[a-z]+_end");
         assert_eq!(pat, "%_end");
+    }
+
+    #[test]
+    fn test_regex_safe_for_ordering() {
+        assert!(regex_safe_for_ordering("deep.*learning"));
+        assert!(!regex_safe_for_ordering("foo|bar"));
+        assert!(!regex_safe_for_ordering("ab?c"));
+        assert!(!regex_safe_for_ordering("ab+c"));
+        assert!(!regex_safe_for_ordering("ab{2,3}c"));
+        assert!(!regex_safe_for_ordering("a*b"));
+        assert!(regex_safe_for_ordering("a.*b"));
+        assert!(!regex_safe_for_ordering("a\\*b"));
     }
 }
