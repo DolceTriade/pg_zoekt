@@ -90,6 +90,7 @@ struct PatternTrgm {
 #[derive(Debug, Clone)]
 struct SegmentPattern {
     trigrams: Vec<PatternTrgm>,
+    len: u32,
 }
 
 struct TrgmWork {
@@ -423,6 +424,36 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
     true
 }
 
+fn regex_is_line_oriented(pattern: &str) -> bool {
+    let mut chars = pattern.chars().peekable();
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch != '(' || chars.peek().copied() != Some('?') {
+            continue;
+        }
+        _ = chars.next();
+        let mut flags = String::new();
+        while let Some(c) = chars.next() {
+            if c == ')' || c == ':' {
+                break;
+            }
+            flags.push(c);
+        }
+        if flags.contains('s') && !flags.contains("-s") {
+            return false;
+        }
+    }
+    true
+}
+
 fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
     let mut leading = false;
     let mut has_single = false;
@@ -458,6 +489,10 @@ fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
 fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
     let mut segments = Vec::new();
     for seg in extract_literal_segments(pattern) {
+        let len: u32 = seg
+            .len()
+            .try_into()
+            .unwrap_or_else(|_| error!("literal segment too large"));
         let mut trigms = Vec::new();
         for (trgm, pos) in crate::trgm::Extractor::extract(&seg) {
             if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
@@ -469,7 +504,10 @@ fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
             }
         }
         if !trigms.is_empty() {
-            segments.push(SegmentPattern { trigrams: trigms });
+            segments.push(SegmentPattern {
+                trigrams: trigms,
+                len,
+            });
         }
     }
     segments
@@ -896,6 +934,109 @@ fn add_matches_from_segment_occurrences(
     }
 }
 
+fn has_newline_between(newlines: &[u32], start: u32, end: u32) -> bool {
+    if newlines.is_empty() || start >= end {
+        return false;
+    }
+    let idx = newlines.partition_point(|p| *p < start);
+    idx < newlines.len() && newlines[idx] < end
+}
+
+fn collect_newline_positions(
+    rel: pg_sys::Relation,
+    index_segments: &[crate::storage::Segment],
+    candidates: &std::collections::BTreeSet<crate::storage::ItemPointer>,
+) -> anyhow::Result<std::collections::BTreeMap<crate::storage::ItemPointer, Vec<u32>>> {
+    let mut out = std::collections::BTreeMap::new();
+    if candidates.is_empty() {
+        return Ok(out);
+    }
+    let entries = entry_for_trigram(rel, index_segments, crate::trgm::NEWLINE_TRGM);
+    if entries.is_empty() {
+        return Ok(out);
+    }
+    for entry in &entries {
+        let mut cursor = unsafe { PostingCursor::new(rel, entry)? };
+        loop {
+            if !cursor.advance()? {
+                break;
+            }
+            let doc = cursor.current().expect("cursor should have doc");
+            if !candidates.contains(&doc.tid) {
+                continue;
+            }
+            let slot = out.entry(doc.tid).or_insert_with(Vec::new);
+            for (pos, _) in &doc.positions {
+                slot.push(*pos);
+            }
+        }
+    }
+    for positions in out.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+    Ok(out)
+}
+
+fn add_matches_from_segment_occurrences_line_oriented(
+    state: &mut ScanState,
+    segment_occurrences: &[Vec<(crate::storage::ItemPointer, Vec<u32>)>],
+    segment_lengths: &[u32],
+    leading_wildcard: bool,
+    newlines: &std::collections::BTreeMap<crate::storage::ItemPointer, Vec<u32>>,
+) {
+    if segment_occurrences.is_empty() || segment_occurrences.len() != segment_lengths.len() {
+        return;
+    }
+    let first = &segment_occurrences[0];
+    'tid_loop: for (tid, starts) in first {
+        let start_candidates: Vec<u32> = if leading_wildcard {
+            starts.clone()
+        } else if starts.contains(&0) {
+            vec![0]
+        } else {
+            continue;
+        };
+        let newline_positions = newlines.get(tid).map(|v| v.as_slice()).unwrap_or(&[]);
+        for start in start_candidates {
+            let mut prev_start = start;
+            let mut prev_end = prev_start.saturating_add(segment_lengths[0]);
+            let mut ok = true;
+            for seg_idx in 1..segment_occurrences.len() {
+                let Some(starts_next) = segment_occurrences[seg_idx]
+                    .iter()
+                    .find(|(t, _)| t == tid)
+                    .map(|(_, s)| s)
+                else {
+                    ok = false;
+                    break;
+                };
+                let mut found = None;
+                for next_start in starts_next.iter().copied() {
+                    if next_start < prev_end {
+                        continue;
+                    }
+                    if has_newline_between(newline_positions, prev_end, next_start) {
+                        continue;
+                    }
+                    found = Some(next_start);
+                    break;
+                }
+                let Some(next_start) = found else {
+                    ok = false;
+                    break;
+                };
+                prev_start = next_start;
+                prev_end = prev_start.saturating_add(segment_lengths[seg_idx]);
+            }
+            if ok {
+                state.push_match(*tid);
+                continue 'tid_loop;
+            }
+        }
+    }
+}
+
 unsafe fn build_scan_state(
     index_relation: pg_sys::Relation,
     keys: pg_sys::ScanKey,
@@ -947,6 +1088,8 @@ unsafe fn build_scan_state(
             let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> =
                 Vec::new();
             let can_order = regex_safe_for_ordering(&pattern_str);
+            let line_oriented = regex_is_line_oriented(&pattern_str);
+            let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
             for seg_pattern in &segments {
                 match stream_segment_occurrences_adaptive(
                     index_relation,
@@ -971,7 +1114,31 @@ unsafe fn build_scan_state(
                 }
             }
             if can_order {
-                add_matches_from_segment_occurrences(&mut state, &segment_occurrences, true);
+                if line_oriented && segment_occurrences.len() > 1 {
+                    let mut candidates = std::collections::BTreeSet::new();
+                    for (tid, _) in &segment_occurrences[0] {
+                        candidates.insert(*tid);
+                    }
+                    match collect_newline_positions(index_relation, &index_segments, &candidates) {
+                        Ok(newlines) => add_matches_from_segment_occurrences_line_oriented(
+                            &mut state,
+                            &segment_occurrences,
+                            &segment_lengths,
+                            true,
+                            &newlines,
+                        ),
+                        Err(e) => {
+                            warning!("failed to load newline postings: {e:#}");
+                            add_matches_from_segment_occurrences(
+                                &mut state,
+                                &segment_occurrences,
+                                true,
+                            );
+                        }
+                    }
+                } else {
+                    add_matches_from_segment_occurrences(&mut state, &segment_occurrences, true);
+                }
             }
             state.sort_dedup();
             return state;

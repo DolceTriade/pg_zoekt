@@ -155,6 +155,30 @@ where
             flush_check(collector);
         }
     }
+    let mut newline_count = 0usize;
+    for (idx, b) in text.as_bytes().iter().enumerate() {
+        if *b != b'\n' {
+            continue;
+        }
+        interrupt = interrupt.wrapping_add(1);
+        if (interrupt & 0x3ff) == 0 {
+            pg_sys::check_for_interrupts!();
+        }
+        if idx >> 24 > 0 || idx > u32::MAX as usize {
+            error!("newline position {idx} exceeds 24-bit limit");
+        }
+        let mut occ = crate::trgm::Occurance(idx as u32);
+        occ.set_flags(0);
+        collector.add_occurrences(
+            crate::trgm::NEWLINE_TRGM,
+            ctid,
+            std::slice::from_ref(&occ),
+        );
+        newline_count += 1;
+        if (newline_count & 0xff) == 0 {
+            flush_check(collector);
+        }
+    }
     true
 }
 

@@ -729,6 +729,27 @@ unsafe extern "C-unwind" fn log_index_value_callback_spill(
                     state.flush_if_needed();
                 }
             }
+            let mut newline_count = 0usize;
+            for (idx, b) in text.as_bytes().iter().enumerate() {
+                if *b != b'\n' {
+                    continue;
+                }
+                if idx >> 24 > 0 || idx > u32::MAX as usize {
+                    error!("newline position {idx} exceeds 24-bit limit");
+                }
+                let mut occ = crate::trgm::Occurance(idx as u32);
+                occ.set_flags(0);
+                state.collector.add_occurrences(
+                    crate::trgm::NEWLINE_TRGM,
+                    ctid,
+                    std::slice::from_ref(&occ),
+                );
+                newline_count += 1;
+                if (newline_count & 0xff) == 0 {
+                    pg_sys::check_for_interrupts!();
+                    state.flush_if_needed();
+                }
+            }
         }
 
         state.seen_pending += 1;

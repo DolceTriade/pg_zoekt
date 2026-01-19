@@ -1124,6 +1124,59 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_newline_postings() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE newline_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO newline_docs (text) VALUES (E'abc\\ndef')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_newline_docs_text_zoekt ON newline_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_newline_docs_text_zoekt'::regclass)")?;
+
+        let segment_idx = Spi::get_one::<i32>(
+            "SELECT segment_idx FROM pg_zoekt_index_segments('idx_newline_docs_text_zoekt'::regclass) ORDER BY segment_idx LIMIT 1",
+        )?
+        .unwrap_or(0);
+        assert!(segment_idx > 0, "expected segment");
+
+        let (min_pos, max_pos, count) = Spi::connect_mut(|client| -> spi::Result<(i64, i64, i64)> {
+            let mut rows = client.select(
+                "SELECT min(position), max(position), count(*) \
+                 FROM pg_zoekt_posting_positions(\
+                     'idx_newline_docs_text_zoekt'::regclass, \
+                     $1, 0, (SELECT ctid FROM newline_docs LIMIT 1))",
+                None,
+                &[segment_idx.into()],
+            )?;
+            let row = rows.next().expect("newline positions row");
+            Ok((
+                row.get::<i64>(1)?.unwrap_or(-1),
+                row.get::<i64>(2)?.unwrap_or(-1),
+                row.get::<i64>(3)?.unwrap_or(0),
+            ))
+        })?;
+        assert_eq!(count, 1, "expected one newline posting");
+        assert_eq!(min_pos, 3, "expected newline at byte 3");
+        assert_eq!(max_pos, 3, "expected newline at byte 3");
+
+        Spi::run("DROP TABLE IF EXISTS newline_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_multisegment_trigram_scan_includes_all_docs() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(

@@ -8,6 +8,8 @@ use anyhow::Context;
 
 pub struct CompactTrgm(pub u32);
 
+pub const NEWLINE_TRGM: u32 = 0;
+
 impl CompactTrgm {
     pub fn flags(&self) -> u8 {
         (self.0 >> 24) as u8
