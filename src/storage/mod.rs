@@ -590,7 +590,11 @@ pub fn merge_with_workers(
     tombstones: &tombstone::Snapshot,
     workers: Option<usize>,
 ) -> Result<Vec<Segment>> {
-    let workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
+    let mut workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
+    if unsafe { pg_sys::IsInParallelMode() } {
+        info!("merge_with_workers: parallel mode active, disabling internal parallel merge");
+        workers = 0;
+    }
     let target_segments = target_segments.max(1);
     if segments.len() <= target_segments {
         return Ok(segments.to_vec());
@@ -978,6 +982,10 @@ pub fn maybe_truncate_relation(
     }
     if rbl.pending_block != pg_sys::InvalidBlockNumber {
         used.insert(rbl.pending_block);
+        match crate::storage::pending::collect_all_blocks(rel, rbl.pending_block) {
+            Ok(blocks) => used.extend(blocks),
+            Err(e) => warning!("failed to collect pending blocks: {e:#}"),
+        }
     }
     if rbl.tombstone_block != pg_sys::InvalidBlockNumber {
         used.insert(rbl.tombstone_block);

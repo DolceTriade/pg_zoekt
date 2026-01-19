@@ -87,6 +87,7 @@ mod implementation {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pg_guard]
     unsafe extern "C-unwind" fn aminsert(
         _index_relation: pg_sys::Relation,
         values: *mut pg_sys::Datum,
@@ -113,6 +114,20 @@ mod implementation {
         if nulls[0] {
             return true;
         }
+        if !_heap_relation.is_null() {
+            let nblocks = unsafe {
+                pg_sys::RelationGetNumberOfBlocksInFork(
+                    _heap_relation,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                )
+            };
+            let heap_tid = unsafe { *heap_tid };
+            let blk = ((heap_tid.ip_blkid.bi_hi as u32) << 16) | heap_tid.ip_blkid.bi_lo as u32;
+            if blk >= nblocks {
+                return true;
+            }
+        }
+
         let ctid: crate::storage::ItemPointer = match heap_tid.try_into() {
             Ok(tid) => tid,
             Err(err) => error!("failed to parse heap TID: {err:#?}"),
@@ -134,6 +149,7 @@ mod implementation {
         }
     }
 
+    #[pg_guard]
     unsafe extern "C-unwind" fn amvacuumcleanup(
         _info: *mut pg_sys::IndexVacuumInfo,
         stats: *mut pg_sys::IndexBulkDeleteResult,
@@ -144,6 +160,9 @@ mod implementation {
                 let index_oid = unsafe { (*index_rel).rd_id };
                 seal_index(index_oid, crate::storage::MaintenanceLockMode::Try);
                 let flush_threshold = crate::build::flush_threshold_bytes();
+                if let Err(e) = crate::storage::pending::cleanup_free_list(index_rel) {
+                    warning!("failed to clean pending free list during vacuum: {e:#}");
+                }
                 if let Err(e) = merge_segments(
                     index_rel,
                     flush_threshold,
@@ -160,6 +179,7 @@ mod implementation {
         stats.into_pg()
     }
 
+    #[pg_guard]
     pub(super) unsafe extern "C-unwind" fn ambulkdelete(
         _info: *mut pg_sys::IndexVacuumInfo,
         stats: *mut pg_sys::IndexBulkDeleteResult,
@@ -1351,6 +1371,62 @@ mod tests {
                 crate::storage::decode::PostingCursor::new(rel, entry).expect("posting cursor");
             while cursor.advance().expect("posting decode") {}
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_pending_free_list_cleanup() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE pending_free_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO pending_free_docs (text) VALUES ('alpha'), ('beta'), ('gamma')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_pending_free_docs_text_zoekt ON pending_free_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
+            let mut rows = client
+                .select(
+                    "SELECT oid FROM pg_class WHERE relname = 'idx_pending_free_docs_text_zoekt' AND relkind = 'i' LIMIT 1",
+                    None,
+                    &[],
+                )?
+                .into_iter();
+            let row = rows.next().expect("index not created");
+            Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
+        })?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            let bad_block = nblocks.saturating_add(10);
+            crate::storage::pending::test_set_free_head(rel, bad_block)
+                .expect("set free_head");
+            crate::storage::pending::cleanup_free_list(rel).expect("cleanup free list");
+            let free_head = crate::storage::pending::test_get_free_head(rel)
+                .expect("get free_head");
+            assert_eq!(
+                free_head,
+                pg_sys::InvalidBlockNumber,
+                "free_head should be reset after cleanup"
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
         }
 
         Ok(())
