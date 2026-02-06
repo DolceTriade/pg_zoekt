@@ -377,7 +377,22 @@ fn regex_to_wildcard_pattern(pattern: &str) -> String {
 }
 
 fn regex_safe_for_ordering(pattern: &str) -> bool {
-    let mut chars = pattern.chars().peekable();
+    let mut normalized = pattern.trim().to_string();
+    for prefix in ["(?:|^)", "(?:^|)", "(^|)"] {
+        if normalized.starts_with(prefix) {
+            normalized = normalized[prefix.len()..].to_string();
+            break;
+        }
+    }
+    for suffix in ["($)", "$"] {
+        if normalized.ends_with(suffix) {
+            let keep = normalized.len().saturating_sub(suffix.len());
+            normalized.truncate(keep);
+            break;
+        }
+    }
+
+    let mut chars = normalized.chars().peekable();
     let mut escaped = false;
     let mut in_class = false;
     let mut prev_dot_wildcard = false;
@@ -404,6 +419,17 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
             }
             '[' => {
                 in_class = true;
+                prev_dot_wildcard = false;
+            }
+            '(' => {
+                if chars.peek().copied() == Some('?') {
+                    _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == ')' || c == ':' {
+                            break;
+                        }
+                    }
+                }
                 prev_dot_wildcard = false;
             }
             '|' | '?' | '+' | '{' => return false,
@@ -489,10 +515,12 @@ fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
 fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
     let mut segments = Vec::new();
     for seg in extract_literal_segments(pattern) {
-        let len: u32 = seg
-            .len()
-            .try_into()
-            .unwrap_or_else(|_| error!("literal segment too large"));
+        let len: u32 = match u32::try_from(seg.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                continue;
+            }
+        };
         let mut trigms = Vec::new();
         for (trgm, pos) in crate::trgm::Extractor::extract(&seg) {
             if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
@@ -568,54 +596,6 @@ fn stream_segment_occurrences(
 ) -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
     if seg_pattern.trigrams.is_empty() {
         return Ok(Vec::new());
-    }
-
-    struct TrigramCursor {
-        cursors: Vec<PostingCursor>,
-        heap: std::collections::BinaryHeap<std::cmp::Reverse<(crate::storage::ItemPointer, usize)>>,
-        current: Option<crate::storage::decode::DocPosting>,
-    }
-
-    impl TrigramCursor {
-        fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
-            self.current.as_ref().map(|doc| doc.tid)
-        }
-
-        fn current(&self) -> Option<&crate::storage::decode::DocPosting> {
-            self.current.as_ref()
-        }
-
-        fn advance(&mut self) -> anyhow::Result<bool> {
-            let Some(std::cmp::Reverse((target, _))) = self.heap.peek().cloned() else {
-                self.current = None;
-                return Ok(false);
-            };
-            let mut positions: Vec<(u32, u8)> = Vec::new();
-            let mut sources = 0usize;
-            while let Some(std::cmp::Reverse((tid, idx))) = self.heap.peek().cloned() {
-                if tid != target {
-                    break;
-                }
-                self.heap.pop();
-                sources += 1;
-                if let Some(doc) = self.cursors[idx].current() {
-                    positions.extend(doc.positions.iter().copied());
-                }
-                if self.cursors[idx].advance()? {
-                    if let Some(next_tid) = self.cursors[idx].current_tid() {
-                        self.heap.push(std::cmp::Reverse((next_tid, idx)));
-                    }
-                }
-            }
-            if sources > 1 {
-                positions.sort_unstable_by_key(|(pos, _)| *pos);
-            }
-            self.current = Some(crate::storage::decode::DocPosting {
-                tid: target,
-                positions,
-            });
-            Ok(true)
-        }
     }
 
     let mut trgm_entries = build_trgm_entries(rel, index_segments, seg_pattern)?;
@@ -1090,6 +1070,8 @@ unsafe fn build_scan_state(
             let can_order = regex_safe_for_ordering(&pattern_str);
             let line_oriented = regex_is_line_oriented(&pattern_str);
             let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
+            let mut unordered_candidates: Option<std::collections::BTreeSet<crate::storage::ItemPointer>> =
+                None;
             for seg_pattern in &segments {
                 match stream_segment_occurrences_adaptive(
                     index_relation,
@@ -1101,9 +1083,12 @@ unsafe fn build_scan_state(
                         if can_order {
                             segment_occurrences.push(occs);
                         } else {
-                            for (tid, _) in occs {
-                                state.push_match(tid);
-                            }
+                            let tids: std::collections::BTreeSet<crate::storage::ItemPointer> =
+                                occs.into_iter().map(|(tid, _)| tid).collect();
+                            unordered_candidates = Some(match unordered_candidates.take() {
+                                None => tids,
+                                Some(prev) => prev.intersection(&tids).copied().collect(),
+                            });
                         }
                     }
                     Ok(_) => return state,
@@ -1138,6 +1123,10 @@ unsafe fn build_scan_state(
                     }
                 } else {
                     add_matches_from_segment_occurrences(&mut state, &segment_occurrences, true);
+                }
+            } else if let Some(candidates) = unordered_candidates {
+                for tid in candidates {
+                    state.push_match(tid);
                 }
             }
             state.sort_dedup();
@@ -1668,12 +1657,14 @@ mod tests {
     #[test]
     fn test_regex_safe_for_ordering() {
         assert!(regex_safe_for_ordering("deep.*learning"));
+        assert!(regex_safe_for_ordering("(?m)^.*deep.*learning.*$"));
+        assert!(regex_safe_for_ordering("(?:|^)(.*)deep.*learning(.*)($)"));
         assert!(!regex_safe_for_ordering("foo|bar"));
         assert!(!regex_safe_for_ordering("ab?c"));
         assert!(!regex_safe_for_ordering("ab+c"));
         assert!(!regex_safe_for_ordering("ab{2,3}c"));
         assert!(!regex_safe_for_ordering("a*b"));
         assert!(regex_safe_for_ordering("a.*b"));
-        assert!(!regex_safe_for_ordering("a\\*b"));
+        assert!(regex_safe_for_ordering("a\\*b"));
     }
 }

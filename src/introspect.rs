@@ -1,6 +1,6 @@
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::storage::{IndexEntry, Segment, SegmentExtent, WALHeader};
 use crate::trgm::CompactTrgm;
@@ -97,6 +97,22 @@ fn entry_fields(entry: &IndexEntry) -> (u32, u32, u16, u32, u32) {
     let data_length = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length)) };
     let frequency = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.frequency)) };
     (trigram, block, offset, data_length, frequency)
+}
+
+fn add_blocks_to_category(
+    categories: &mut BTreeMap<String, HashSet<u32>>,
+    used: &mut HashSet<u32>,
+    name: &str,
+    blocks: &[u32],
+    include_used: bool,
+) {
+    let entry = categories.entry(name.to_string()).or_default();
+    for blk in blocks {
+        entry.insert(*blk);
+        if include_used {
+            used.insert(*blk);
+        }
+    }
 }
 
 #[pg_extern]
@@ -579,6 +595,226 @@ pub fn pg_zoekt_index_overhead(
             s.bytes_free as i64,
             s.bytes_unknown as i64,
         ));
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern(parallel_safe)]
+pub fn pg_zoekt_index_waste(
+    index: pg_sys::Oid,
+) -> TableIterator<
+    'static,
+    (
+        name!(category, String),
+        name!(blocks, i64),
+        name!(bytes, i64),
+        name!(percent, f64),
+    ),
+> {
+    let mut rows = Vec::new();
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let nblocks =
+            pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+        let rel_blocks = nblocks as u64;
+        let mut used = HashSet::<u32>::new();
+        let mut categories: BTreeMap<String, HashSet<u32>> = BTreeMap::new();
+
+        let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read root: {e:#?}");
+        });
+        let rbl = root
+            .as_struct::<crate::storage::RootBlockList>(0)
+            .unwrap_or_else(|e| {
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!("failed to read root header: {e:#?}");
+            });
+
+        used.insert(0);
+        categories
+            .entry("root".to_string())
+            .or_default()
+            .insert(0);
+
+        if rbl.wal_block != pg_sys::InvalidBlockNumber {
+            add_blocks_to_category(&mut categories, &mut used, "wal", &[rbl.wal_block], true);
+        }
+        if rbl.pending_block != pg_sys::InvalidBlockNumber {
+            add_blocks_to_category(
+                &mut categories,
+                &mut used,
+                "pending_header",
+                &[rbl.pending_block],
+                true,
+            );
+            match crate::storage::pending::collect_all_blocks(rel, rbl.pending_block) {
+                Ok(blocks) => add_blocks_to_category(
+                    &mut categories,
+                    &mut used,
+                    "pending_bucket",
+                    &blocks,
+                    true,
+                ),
+                Err(e) => warning!("failed to collect pending blocks: {e:#}"),
+            }
+        }
+        if rbl.tombstone_block != pg_sys::InvalidBlockNumber {
+            add_blocks_to_category(
+                &mut categories,
+                &mut used,
+                "tombstone",
+                &[rbl.tombstone_block],
+                true,
+            );
+        }
+        if rbl.segment_list_head != pg_sys::InvalidBlockNumber {
+            match crate::storage::collect_segment_list_pages(rel, rbl.segment_list_head) {
+                Ok(blocks) => add_blocks_to_category(
+                    &mut categories,
+                    &mut used,
+                    "segment_list",
+                    &blocks,
+                    true,
+                ),
+                Err(e) => warning!("failed to collect segment list pages: {e:#}"),
+            }
+        }
+
+        let segments = crate::query::read_segments(rel).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read segments: {e:#?}");
+        });
+        for seg in segments {
+            if seg.extent_head != pg_sys::InvalidBlockNumber && seg.extent_count > 0 {
+                match crate::storage::segment_extent_list_read(rel, seg.extent_head, seg.extent_count)
+                {
+                    Ok((extents, extent_pages)) => {
+                        add_blocks_to_category(
+                            &mut categories,
+                            &mut used,
+                            "segment_extent_list",
+                            &extent_pages,
+                            true,
+                        );
+                        for extent in extents {
+                            let end = extent.start_block.saturating_add(extent.len);
+                            for blk in extent.start_block..end {
+                                used.insert(blk);
+                                categories
+                                    .entry("segment_extent".to_string())
+                                    .or_default()
+                                    .insert(blk);
+                            }
+                        }
+                    }
+                    Err(e) => warning!("failed to read segment extents: {e:#}"),
+                }
+                continue;
+            }
+
+            let mut tree_blocks = HashSet::new();
+            if let Err(e) = crate::storage::collect_segment_tree_blocks(rel, seg.block, &mut tree_blocks)
+            {
+                warning!("failed to collect segment tree blocks: {e:#}");
+            }
+            let tree_vec: Vec<u32> = tree_blocks.iter().copied().collect();
+            add_blocks_to_category(&mut categories, &mut used, "segment_tree", &tree_vec, true);
+
+            let leaf_blocks = crate::storage::collect_leaf_blocks(rel, seg.block).unwrap_or_else(|e| {
+                warning!("failed to collect leaf blocks: {e:#}");
+                Vec::new()
+            });
+            for leaf in leaf_blocks {
+                let buf = match crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        warning!("failed to read leaf block {leaf}: {e:#}");
+                        continue;
+                    }
+                };
+                let header = match buf.as_struct::<crate::storage::BlockHeader>(0) {
+                    Ok(header) => header,
+                    Err(e) => {
+                        warning!("failed to read leaf header {leaf}: {e:#}");
+                        continue;
+                    }
+                };
+                if header.magic != crate::storage::BLOCK_MAGIC {
+                    warning!("invalid block magic at leaf {leaf}");
+                    continue;
+                }
+                let entries = match buf.as_struct_with_elems::<crate::storage::IndexList>(
+                    std::mem::size_of::<crate::storage::BlockHeader>(),
+                    header.num_entries as usize,
+                ) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        warning!("failed to read leaf entries {leaf}: {e:#}");
+                        continue;
+                    }
+                };
+                let slice = &entries.entries[..header.num_entries as usize];
+                for entry in slice {
+                    let mut posting_blocks = HashSet::new();
+                    if let Err(e) =
+                        crate::storage::collect_posting_blocks(rel, entry, &mut posting_blocks)
+                    {
+                        warning!("failed to collect posting blocks: {e:#}");
+                        continue;
+                    }
+                    let post_vec: Vec<u32> = posting_blocks.iter().copied().collect();
+                    add_blocks_to_category(&mut categories, &mut used, "posting", &post_vec, true);
+                }
+            }
+        }
+
+        let free_blocks = crate::storage::collect_free_list_blocks(rel, rbl.wal_block)
+            .unwrap_or_else(|e| {
+                warning!("failed to collect free list blocks: {e:#}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter(|b| (*b as u64) < rel_blocks)
+            .collect::<Vec<u32>>();
+        add_blocks_to_category(&mut categories, &mut used, "free_list", &free_blocks, false);
+
+        let used_blocks = used.len() as u64;
+        let free_blocks_count = categories
+            .get("free_list")
+            .map(|set| set.len() as u64)
+            .unwrap_or(0);
+        let orphan_blocks = rel_blocks
+            .saturating_sub(used_blocks)
+            .saturating_sub(free_blocks_count);
+
+        if orphan_blocks > 0 {
+            rows.push((
+                "orphan".to_string(),
+                orphan_blocks as i64,
+                (orphan_blocks as i64) * (pg_sys::BLCKSZ as i64),
+                (orphan_blocks as f64) * 100.0 / (rel_blocks.max(1) as f64),
+            ));
+        }
+
+        rows.push((
+            "used_total".to_string(),
+            used_blocks as i64,
+            (used_blocks as i64) * (pg_sys::BLCKSZ as i64),
+            (used_blocks as f64) * 100.0 / (rel_blocks.max(1) as f64),
+        ));
+
+        for (category, blocks) in categories {
+            let count = blocks.len() as u64;
+            rows.push((
+                category,
+                count as i64,
+                (count as i64) * (pg_sys::BLCKSZ as i64),
+                (count as f64) * 100.0 / (rel_blocks.max(1) as f64),
+            ));
+        }
+
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
     }
     TableIterator::new(rows.into_iter())
 }

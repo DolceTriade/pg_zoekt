@@ -536,7 +536,7 @@ fn segment_attach_extents(
     Ok(())
 }
 
-fn collect_segment_list_pages(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
+pub(crate) fn collect_segment_list_pages(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
     let mut pages = Vec::new();
     let mut blk = head;
     while blk != pg_sys::InvalidBlockNumber {
@@ -809,7 +809,7 @@ fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {
     Ok(())
 }
 
-fn collect_segment_tree_blocks(
+pub(crate) fn collect_segment_tree_blocks(
     rel: pg_sys::Relation,
     block: u32,
     out: &mut HashSet<u32>,
@@ -838,7 +838,7 @@ fn collect_segment_tree_blocks(
     Ok(())
 }
 
-fn collect_posting_blocks(
+pub(crate) fn collect_posting_blocks(
     rel: pg_sys::Relation,
     entry: &IndexEntry,
     out: &mut HashSet<u32>,
@@ -920,7 +920,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
     res
 }
 
-fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) -> Result<Vec<u32>> {
+pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) -> Result<Vec<u32>> {
     if wal_block == pg_sys::InvalidBlockNumber {
         return Ok(Vec::new());
     }
@@ -963,11 +963,10 @@ pub fn maybe_truncate_relation(
     info!("maybe_truncate_relation start: segments={}", segments.len());
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    let tail = nblocks.saturating_sub(1);
     if rbl.version >= 5 && rbl.wal_block != pg_sys::InvalidBlockNumber {
         let wal_buf = pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)?;
         let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
-        if wal.free_max_block != pg_sys::InvalidBlockNumber && wal.free_max_block < tail {
+        if wal.free_max_block == pg_sys::InvalidBlockNumber {
             info!(
                 "maybe_truncate_relation done: truncated=false elapsed_ms={}",
                 start.elapsed().as_millis()
