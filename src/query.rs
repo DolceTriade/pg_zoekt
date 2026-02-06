@@ -1087,7 +1087,10 @@ unsafe fn build_scan_state(
                                 occs.into_iter().map(|(tid, _)| tid).collect();
                             unordered_candidates = Some(match unordered_candidates.take() {
                                 None => tids,
-                                Some(prev) => prev.intersection(&tids).copied().collect(),
+                                Some(mut prev) => {
+                                    prev.extend(tids);
+                                    prev
+                                }
                             });
                         }
                     }

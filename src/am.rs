@@ -9,6 +9,65 @@ compile_error!("pg_zoekt currently targets Postgres 18; enable the `pg18` featur
 mod implementation {
     use super::*;
     use anyhow::{Result as AnyResult, anyhow};
+    use pgrx::iter::TableIterator;
+
+    #[derive(Clone, Copy, Debug)]
+    enum MaintenanceMode {
+        Seal,
+        Merge,
+        Full,
+    }
+
+    impl MaintenanceMode {
+        fn parse(mode: &str) -> Option<Self> {
+            match mode {
+                "seal" => Some(Self::Seal),
+                "merge" => Some(Self::Merge),
+                "full" => Some(Self::Full),
+                _ => None,
+            }
+        }
+
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Seal => "seal",
+                Self::Merge => "merge",
+                Self::Full => "full",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MaintenanceResult {
+        index_oid: pg_sys::Oid,
+        mode: MaintenanceMode,
+        sealed_tuples: i64,
+        segments_before: i32,
+        segments_after: i32,
+        skipped_busy: bool,
+    }
+
+    impl MaintenanceResult {
+        fn row(
+            self,
+        ) -> (
+            name!(index_oid, pg_sys::Oid),
+            name!(mode, String),
+            name!(sealed_tuples, i64),
+            name!(segments_before, i32),
+            name!(segments_after, i32),
+            name!(skipped_busy, bool),
+        ) {
+            (
+                self.index_oid,
+                self.mode.as_str().to_string(),
+                self.sealed_tuples,
+                self.segments_before,
+                self.segments_after,
+                self.skipped_busy,
+            )
+        }
+    }
 
     // --- Required callbacks -------------------------------------------------
 
@@ -150,25 +209,15 @@ mod implementation {
     }
 
     #[pg_guard]
-    unsafe extern "C-unwind" fn amvacuumcleanup(
+    pub(super) unsafe extern "C-unwind" fn amvacuumcleanup(
         _info: *mut pg_sys::IndexVacuumInfo,
         stats: *mut pg_sys::IndexBulkDeleteResult,
     ) -> *mut pg_sys::IndexBulkDeleteResult {
         if !_info.is_null() {
             let index_rel = unsafe { (*_info).index };
             if !index_rel.is_null() {
-                let index_oid = unsafe { (*index_rel).rd_id };
-                seal_index(index_oid, crate::storage::MaintenanceLockMode::Try);
-                let flush_threshold = crate::build::flush_threshold_bytes();
                 if let Err(e) = crate::storage::pending::cleanup_free_list(index_rel) {
                     warning!("failed to clean pending free list during vacuum: {e:#}");
-                }
-                if let Err(e) = merge_segments(
-                    index_rel,
-                    flush_threshold,
-                    crate::storage::MaintenanceLockMode::Try,
-                ) {
-                    warning!("failed to merge segments during vacuum: {e:#}");
                 }
             }
         }
@@ -279,12 +328,12 @@ mod implementation {
         rel: pg_sys::Relation,
         flush_threshold: usize,
         lock_mode: crate::storage::MaintenanceLockMode,
-    ) -> AnyResult<()> {
+    ) -> AnyResult<bool> {
         let _lock = match crate::storage::maintenance_lock(rel, lock_mode) {
             Some(lock) => lock,
             None => {
                 info!("merge skipped: maintenance lock busy");
-                return Ok(());
+                return Ok(true);
             }
         };
         let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
@@ -294,7 +343,7 @@ mod implementation {
             .map_err(|e| anyhow!("{e}"))?;
         let existing = crate::storage::segment_list_read(rel, rbl)?;
         if existing.is_empty() || existing.len() <= crate::storage::TARGET_SEGMENTS {
-            return Ok(());
+            return Ok(false);
         }
         let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
             .unwrap_or_else(|e| {
@@ -316,7 +365,7 @@ mod implementation {
             crate::storage::maybe_truncate_relation(rel, rbl, &merged)
                 .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
         }
-        Ok(())
+        Ok(false)
     }
 
     fn flush_collector(rel: pg_sys::Relation, collector: &mut crate::trgm::Collector) {
@@ -359,7 +408,7 @@ mod implementation {
         if workers >= 0 { Some(workers) } else { None }
     }
 
-    pub(super) fn seal_serial(index: pg_sys::Oid, pending_head: u32) {
+    pub(super) fn seal_serial(index: pg_sys::Oid, pending_head: u32) -> u64 {
         unsafe {
             info!(
                 "seal_serial: index_oid={} pending_head={}",
@@ -464,30 +513,23 @@ mod implementation {
 
             flush_collector(index_rel, &mut collector);
 
-            if let Err(e) = merge_segments(
-                index_rel,
-                flush_threshold,
-                crate::storage::MaintenanceLockMode::Block,
-            ) {
-                warning!("failed to merge segments: {e:#?}");
-            }
-
             pg_sys::ExecDropSingleTupleTableSlot(slot);
             pg_sys::FreeExecutorState(estate);
             pg_sys::relation_close(heap_rel, pg_sys::AccessShareLock as i32);
             pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
             info!("sealed {} pending tuples (requeued {})", seen, requeued);
+            seen
         }
     }
 
-    fn seal_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) {
+    fn seal_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) -> (u64, bool) {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
             let lock = match crate::storage::maintenance_lock(rel, lock_mode) {
                 Some(lock) => lock,
                 None => {
                     pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
-                    return;
+                    return (0, true);
                 }
             };
             let pending_head = match crate::storage::pending::detach_pending(rel, 0) {
@@ -502,7 +544,7 @@ mod implementation {
             let Some(pending_head) = pending_head else {
                 drop(lock);
                 pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
-                return;
+                return (0, false);
             };
 
             let workers = reloption_parallel_workers(rel).unwrap_or(0).max(0) as usize;
@@ -518,18 +560,183 @@ mod implementation {
                 ) {
                     info!("sealed {} pending tuples (parallel)", seen);
                     drop(lock);
-                    return;
+                    return (seen, false);
                 }
             }
 
-            seal_serial(index, pending_head);
+            let seen = seal_serial(index, pending_head);
             drop(lock);
+            (seen, false)
         }
+    }
+
+    fn segment_count(index: pg_sys::Oid) -> i32 {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+            let root = match crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0) {
+                Ok(root) => root,
+                Err(e) => {
+                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                    error!("failed to acquire root buffer: {e:#?}");
+                }
+            };
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+            let count = rbl.num_segments as i32;
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            count
+        }
+    }
+
+    fn merge_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) -> AnyResult<bool> {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
+            let flush_threshold = crate::build::flush_threshold_bytes();
+            let res = merge_segments(rel, flush_threshold, lock_mode);
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+            res
+        }
+    }
+
+    fn run_maintenance(
+        index: pg_sys::Oid,
+        mode: MaintenanceMode,
+        lock_mode: crate::storage::MaintenanceLockMode,
+    ) -> AnyResult<MaintenanceResult> {
+        let segments_before = segment_count(index);
+        let mut sealed_tuples = 0i64;
+        let mut skipped_busy;
+
+        match mode {
+            MaintenanceMode::Seal => {
+                let (seen, skipped) = seal_index(index, lock_mode);
+                sealed_tuples = seen as i64;
+                skipped_busy = skipped;
+            }
+            MaintenanceMode::Merge => {
+                skipped_busy = merge_index(index, lock_mode)?;
+            }
+            MaintenanceMode::Full => {
+                let (seen, skipped) = seal_index(index, lock_mode);
+                sealed_tuples = seen as i64;
+                skipped_busy = skipped;
+                if !skipped_busy {
+                    skipped_busy = merge_index(index, lock_mode)?;
+                }
+            }
+        }
+
+        let segments_after = segment_count(index);
+        Ok(MaintenanceResult {
+            index_oid: index,
+            mode,
+            sealed_tuples,
+            segments_before,
+            segments_after,
+            skipped_busy,
+        })
     }
 
     #[pg_extern]
     fn pg_zoekt_seal(index: pg_sys::Oid) {
-        seal_index(index, crate::storage::MaintenanceLockMode::Block);
+        run_maintenance(
+            index,
+            MaintenanceMode::Full,
+            crate::storage::MaintenanceLockMode::Block,
+        )
+        .unwrap_or_else(|e| error!("maintenance failed: {e:#}"));
+    }
+
+    #[pg_extern]
+    fn pg_zoekt_maintain(
+        index: pg_sys::Oid,
+        mode: default!(&str, "'full'"),
+        wait: default!(bool, "false"),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(index_oid, pg_sys::Oid),
+            name!(mode, String),
+            name!(sealed_tuples, i64),
+            name!(segments_before, i32),
+            name!(segments_after, i32),
+            name!(skipped_busy, bool),
+        ),
+    > {
+        let mode = MaintenanceMode::parse(mode).unwrap_or_else(|| {
+            error!("invalid mode '{mode}', expected one of: seal, merge, full")
+        });
+        let lock_mode = if wait {
+            crate::storage::MaintenanceLockMode::Block
+        } else {
+            crate::storage::MaintenanceLockMode::Try
+        };
+        let row = run_maintenance(index, mode, lock_mode)
+            .unwrap_or_else(|e| error!("maintenance failed: {e:#}"))
+            .row();
+        TableIterator::new(std::iter::once(row))
+    }
+
+    #[pg_extern]
+    fn pg_zoekt_maintain_all(
+        mode: default!(&str, "'full'"),
+        wait: default!(bool, "false"),
+        max_indexes: default!(Option<i32>, "NULL"),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(index_oid, pg_sys::Oid),
+            name!(mode, String),
+            name!(sealed_tuples, i64),
+            name!(segments_before, i32),
+            name!(segments_after, i32),
+            name!(skipped_busy, bool),
+        ),
+    > {
+        let mode = MaintenanceMode::parse(mode).unwrap_or_else(|| {
+            error!("invalid mode '{mode}', expected one of: seal, merge, full")
+        });
+        let lock_mode = if wait {
+            crate::storage::MaintenanceLockMode::Block
+        } else {
+            crate::storage::MaintenanceLockMode::Try
+        };
+
+        let limit = max_indexes.unwrap_or(0);
+        let limit_clause = if limit > 0 {
+            format!(" LIMIT {limit}")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT i.indexrelid::oid \
+             FROM pg_catalog.pg_index i \
+             JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_catalog.pg_am a ON a.oid = c.relam \
+             WHERE a.amname = 'pg_zoekt' AND i.indisvalid AND i.indisready \
+             ORDER BY i.indexrelid{}",
+            limit_clause
+        );
+
+        let index_oids: Vec<pg_sys::Oid> = Spi::connect_mut(|client| -> spi::Result<Vec<pg_sys::Oid>> {
+            let mut out = Vec::new();
+            for row in client.select(&sql, None, &[])? {
+                if let Some(oid) = row.get::<pg_sys::Oid>(1)? {
+                    out.push(oid);
+                }
+            }
+            Ok(out)
+        })
+        .unwrap_or_else(|e| error!("failed to enumerate pg_zoekt indexes: {e:#?}"));
+
+        let mut rows = Vec::with_capacity(index_oids.len());
+        for oid in index_oids {
+            let result = run_maintenance(oid, mode, lock_mode)
+                .unwrap_or_else(|e| error!("maintenance failed for index {oid}: {e:#}"));
+            rows.push(result.row());
+        }
+        TableIterator::new(rows.into_iter())
     }
 
     #[cfg(feature = "pg_test")]
@@ -675,6 +882,14 @@ unsafe fn test_ambulkdelete(
 }
 
 #[cfg(any(test, feature = "pg_test"))]
+unsafe fn test_amvacuumcleanup(
+    info: *mut pg_sys::IndexVacuumInfo,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
+) -> *mut pg_sys::IndexBulkDeleteResult {
+    unsafe { implementation::amvacuumcleanup(info, stats) }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
@@ -709,6 +924,23 @@ mod tests {
             out.extend_from_slice(&prefix);
         }
         String::from_utf8(out).expect("ascii alphabet")
+    }
+
+    fn lookup_index_oid(relname: &str) -> spi::Result<pg_sys::Oid> {
+        let sql = format!(
+            "SELECT oid FROM pg_class WHERE relname = '{}' AND relkind = 'i' LIMIT 1",
+            relname
+        );
+        Ok(Spi::get_one::<pg_sys::Oid>(&sql)?.expect("index oid not found"))
+    }
+
+    fn segment_count(index_oid: pg_sys::Oid) -> usize {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            segments.len()
+        }
     }
 
     #[pg_test]
@@ -2210,6 +2442,335 @@ mod tests {
             before,
             after
         );
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_full_indexes_pending_without_vacuum() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_full_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_full_docs_text_zoekt ON maintain_full_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO maintain_full_docs (text) VALUES ('alpha needle beta')",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SET enable_seqscan = OFF")?;
+        let before = Spi::get_one::<i64>(
+            "SELECT count(*) FROM maintain_full_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(before, 0, "pending rows should be invisible before maintenance");
+
+        let sealed = Spi::get_one::<i64>(
+            "SELECT sealed_tuples FROM pg_zoekt_maintain('idx_maintain_full_docs_text_zoekt'::regclass, 'full', true)",
+        )?
+        .unwrap_or(0);
+        assert!(sealed >= 1, "expected full maintenance to seal pending tuples");
+
+        let after = Spi::get_one::<i64>(
+            "SELECT count(*) FROM maintain_full_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(after, 1, "full maintenance should make pending row searchable");
+
+        Spi::run("RESET enable_seqscan")?;
+        Spi::run("DROP TABLE IF EXISTS maintain_full_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_merge_caps_segments() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_merge_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_maintain_merge_docs_text_zoekt ON maintain_merge_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO maintain_merge_docs (text)
+                 SELECT repeat(md5((gs * 17)::text), 16) || ' needle ' || gs::text
+                 FROM generate_series(1, 12000) gs",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_merge_docs_text_zoekt'::regclass, 'seal', true)",
+        )?;
+        let index_oid = lookup_index_oid("idx_maintain_merge_docs_text_zoekt")?;
+        let before = segment_count(index_oid);
+        assert!(
+            before > crate::storage::TARGET_SEGMENTS,
+            "expected segment fanout before merge (got {before})"
+        );
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_merge_docs_text_zoekt'::regclass, 'merge', true)",
+        )?;
+        let after = segment_count(index_oid);
+        assert!(
+            after <= crate::storage::TARGET_SEGMENTS,
+            "expected merge to cap segments <= {} (got {after})",
+            crate::storage::TARGET_SEGMENTS
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_merge_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_seal_only_no_forced_merge() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_seal_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_maintain_seal_docs_text_zoekt ON maintain_seal_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO maintain_seal_docs (text)
+                 SELECT repeat(md5((gs * 13)::text), 16) || ' marker ' || gs::text
+                 FROM generate_series(1, 12000) gs",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let result = Spi::connect_mut(|client| -> spi::Result<(i32, i32)> {
+            let row = client
+                .select(
+                    "SELECT segments_before, segments_after
+                     FROM pg_zoekt_maintain('idx_maintain_seal_docs_text_zoekt'::regclass, 'seal', true)",
+                    None,
+                    &[],
+                )?
+                .first();
+            Ok((
+                row.get::<i32>(1)?.unwrap_or(0),
+                row.get::<i32>(2)?.unwrap_or(0),
+            ))
+        })?;
+
+        let (before, after) = result;
+        assert!(
+            after >= before,
+            "seal-only maintenance should not force merge (before={before}, after={after})"
+        );
+        assert!(
+            after as usize > crate::storage::TARGET_SEGMENTS,
+            "expected seal-only to leave > target segments (after={after})"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_seal_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_all_filters_to_pg_zoekt() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_all_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_all_docs_text_zoekt ON maintain_all_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_all_docs_id_btree ON maintain_all_docs (id)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let non_zoekt = Spi::get_one::<i64>(
+            "SELECT count(*)
+             FROM pg_zoekt_maintain_all('full', true, NULL) m
+             JOIN pg_class c ON c.oid = m.index_oid
+             JOIN pg_am a ON a.oid = c.relam
+             WHERE a.amname <> 'pg_zoekt'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(non_zoekt, 0, "maintain_all should only target pg_zoekt indexes");
+
+        let zoekt_count = Spi::get_one::<i64>(
+            "SELECT count(*)
+             FROM pg_zoekt_maintain_all('full', true, NULL) m
+             JOIN pg_class c ON c.oid = m.index_oid
+             JOIN pg_am a ON a.oid = c.relam
+             WHERE c.relname = 'idx_maintain_all_docs_text_zoekt' AND a.amname = 'pg_zoekt'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(zoekt_count, 1, "expected pg_zoekt index in maintain_all output");
+
+        Spi::run("DROP TABLE IF EXISTS maintain_all_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_try_lock_skips_busy() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_lock_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_lock_docs_text_zoekt ON maintain_lock_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        // pgrx tests run inside a single transaction/backend, so we cannot create true
+        // cross-backend contention here without breaking test framework assumptions.
+        // Validate that the non-blocking code path is callable and reports no skip
+        // when no external contention exists.
+        let skipped = Spi::get_one::<bool>(
+            "SELECT skipped_busy
+             FROM pg_zoekt_maintain('idx_maintain_lock_docs_text_zoekt'::regclass, 'full', false)",
+        )?
+        .unwrap_or(false);
+        assert!(
+            !skipped,
+            "expected wait=false maintenance to proceed when no external contender exists"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_lock_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_vacuumcleanup_no_longer_seals_or_merges() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE vacuum_cleanup_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_vacuum_cleanup_docs_text_zoekt ON vacuum_cleanup_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO vacuum_cleanup_docs (text) VALUES ('vacuum cleanup needle')",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SET enable_seqscan = OFF")?;
+        let before = Spi::get_one::<i64>(
+            "SELECT count(*) FROM vacuum_cleanup_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(before, 0, "row should be pending before vacuum cleanup callback");
+
+        let index_oid = lookup_index_oid("idx_vacuum_cleanup_docs_text_zoekt")?;
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let mut info: pg_sys::IndexVacuumInfo = std::mem::zeroed();
+            info.index = rel;
+            super::test_amvacuumcleanup(&mut info, std::ptr::null_mut());
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        }
+
+        let after = Spi::get_one::<i64>(
+            "SELECT count(*) FROM vacuum_cleanup_docs WHERE text LIKE '%needle%'",
+        )?
+        .unwrap_or(0);
+        assert_eq!(
+            after, 0,
+            "vacuum cleanup callback should not seal pending rows anymore"
+        );
+
+        Spi::run("RESET enable_seqscan")?;
+        Spi::run("DROP TABLE IF EXISTS vacuum_cleanup_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_parallel_full_maintenance_converges_segments() -> spi::Result<()> {
+        let max_parallel_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+                .unwrap_or(0);
+        if max_parallel_workers <= 0 {
+            info!("skipping parallel full maintenance test: max_parallel_workers=0");
+            return Ok(());
+        }
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_parallel_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_maintain_parallel_docs_text_zoekt
+                 ON maintain_parallel_docs USING pg_zoekt (text)
+                 WITH (parallel_workers = 4)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO maintain_parallel_docs (text)
+                 SELECT repeat(md5((gs * 31)::text), 16) || ' parallel-needle ' || gs::text
+                 FROM generate_series(1, 12000) gs",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let sealed = Spi::get_one::<i64>(
+            "SELECT sealed_tuples
+             FROM pg_zoekt_maintain('idx_maintain_parallel_docs_text_zoekt'::regclass, 'full', true)",
+        )?
+        .unwrap_or(0);
+        assert!(sealed > 0, "expected full maintenance to seal pending rows");
+
+        let index_oid = lookup_index_oid("idx_maintain_parallel_docs_text_zoekt")?;
+        let after = segment_count(index_oid);
+        assert!(
+            after <= crate::storage::TARGET_SEGMENTS,
+            "expected full maintenance to converge <= {} segments (got {after})",
+            crate::storage::TARGET_SEGMENTS
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_parallel_docs")?;
         Ok(())
     }
 

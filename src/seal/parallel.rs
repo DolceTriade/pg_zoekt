@@ -225,30 +225,6 @@ pub(crate) unsafe fn seal_parallel(
             error!("failed to append segments: {e:#?}");
         }
 
-        const MAX_ACTIVE_SEGMENTS: u32 = 512;
-        const COMPACT_TARGET_SEGMENTS: usize = 64;
-        if rbl.num_segments > MAX_ACTIVE_SEGMENTS {
-            let existing = crate::storage::segment_list_read(index_rel, rbl)
-                .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
-            let merged = crate::storage::merge_with_workers(
-                index_rel,
-                &existing,
-                COMPACT_TARGET_SEGMENTS,
-                flush_threshold.saturating_mul(16).max(1024 * 1024),
-                &crate::storage::tombstone::Snapshot::default(),
-                None,
-            )
-            .unwrap_or_else(|e| error!("failed to compact segments: {e:#?}"));
-            crate::storage::segment_list_rewrite(index_rel, rbl, &merged)
-                .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
-            if merged != existing {
-                crate::storage::free_segments(index_rel, &existing)
-                    .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-                crate::storage::maybe_truncate_relation(index_rel, rbl, &merged)
-                    .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
-            }
-        }
-
         drop(root);
         crate::storage::pending::free_blocks(index_rel, &blocks)
             .unwrap_or_else(|e| error!("failed to free pending blocks: {e:#?}"));
