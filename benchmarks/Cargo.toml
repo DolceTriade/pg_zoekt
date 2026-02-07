@@ -1,0 +1,11 @@
+[package]
+name = "pg_zoekt_benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["alloc"] }
+clap = { version = "4", features = ["derive"] }
+postgres = "0.19.12"
+regex = "1"
