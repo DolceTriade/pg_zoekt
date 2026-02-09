@@ -330,6 +330,21 @@ impl CompressedBatchBuilder {
         }
     }
 
+    pub fn add_raw(&mut self, doc: super::ItemPointer, occs: &[(u32, u8)]) {
+        self.worst_size += Self::DOC_OVERHEAD_WORST + Self::PER_POS_WORST * occs.len();
+
+        self.blks.push(doc.block_number);
+        self.offs.push(doc.offset);
+        self.counts.push(occs.len() as u32);
+
+        self.positions.reserve(occs.len());
+        self.flags.reserve(occs.len());
+        for &(position, flags) in occs {
+            self.positions.push(position);
+            self.flags.push(flags);
+        }
+    }
+
     pub fn compress_into(&mut self, dst: &mut Vec<u8>) {
         let num_docs = self.blks.len();
         let header_size = std::mem::size_of::<super::CompressedBlockHeader>();

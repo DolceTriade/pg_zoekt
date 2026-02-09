@@ -632,10 +632,7 @@ pub fn pg_zoekt_index_waste(
             });
 
         used.insert(0);
-        categories
-            .entry("root".to_string())
-            .or_default()
-            .insert(0);
+        categories.entry("root".to_string()).or_default().insert(0);
 
         if rbl.wal_block != pg_sys::InvalidBlockNumber {
             add_blocks_to_category(&mut categories, &mut used, "wal", &[rbl.wal_block], true);
@@ -687,8 +684,11 @@ pub fn pg_zoekt_index_waste(
         });
         for seg in segments {
             if seg.extent_head != pg_sys::InvalidBlockNumber && seg.extent_count > 0 {
-                match crate::storage::segment_extent_list_read(rel, seg.extent_head, seg.extent_count)
-                {
+                match crate::storage::segment_extent_list_read(
+                    rel,
+                    seg.extent_head,
+                    seg.extent_count,
+                ) {
                     Ok((extents, extent_pages)) => {
                         add_blocks_to_category(
                             &mut categories,
@@ -714,17 +714,19 @@ pub fn pg_zoekt_index_waste(
             }
 
             let mut tree_blocks = HashSet::new();
-            if let Err(e) = crate::storage::collect_segment_tree_blocks(rel, seg.block, &mut tree_blocks)
+            if let Err(e) =
+                crate::storage::collect_segment_tree_blocks(rel, seg.block, &mut tree_blocks)
             {
                 warning!("failed to collect segment tree blocks: {e:#}");
             }
             let tree_vec: Vec<u32> = tree_blocks.iter().copied().collect();
             add_blocks_to_category(&mut categories, &mut used, "segment_tree", &tree_vec, true);
 
-            let leaf_blocks = crate::storage::collect_leaf_blocks(rel, seg.block).unwrap_or_else(|e| {
-                warning!("failed to collect leaf blocks: {e:#}");
-                Vec::new()
-            });
+            let leaf_blocks =
+                crate::storage::collect_leaf_blocks(rel, seg.block).unwrap_or_else(|e| {
+                    warning!("failed to collect leaf blocks: {e:#}");
+                    Vec::new()
+                });
             for leaf in leaf_blocks {
                 let buf = match crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf) {
                     Ok(buf) => buf,

@@ -600,12 +600,7 @@ fn stream_segment_occurrences(
 
     let mut trgm_entries = build_trgm_entries(rel, index_segments, seg_pattern)?;
     trgm_entries.sort_by_key(|w| w.freq);
-    stream_segment_occurrences_with_entries(
-        rel,
-        seg_pattern,
-        case_sensitive,
-        &trgm_entries,
-    )
+    stream_segment_occurrences_with_entries(rel, seg_pattern, case_sensitive, &trgm_entries)
 }
 
 fn build_trgm_entries(
@@ -1070,8 +1065,9 @@ unsafe fn build_scan_state(
             let can_order = regex_safe_for_ordering(&pattern_str);
             let line_oriented = regex_is_line_oriented(&pattern_str);
             let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
-            let mut unordered_candidates: Option<std::collections::BTreeSet<crate::storage::ItemPointer>> =
-                None;
+            let mut unordered_candidates: Option<
+                std::collections::BTreeSet<crate::storage::ItemPointer>,
+            > = None;
             for seg_pattern in &segments {
                 match stream_segment_occurrences_adaptive(
                     index_relation,
@@ -1200,11 +1196,7 @@ unsafe fn build_scan_state(
             return state;
         }
 
-        add_matches_from_segment_occurrences(
-            &mut state,
-            &segment_occurrences,
-            leading_wildcard,
-        );
+        add_matches_from_segment_occurrences(&mut state, &segment_occurrences, leading_wildcard);
 
         state.sort_dedup();
         state

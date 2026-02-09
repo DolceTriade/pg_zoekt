@@ -590,7 +590,8 @@ pub fn merge_with_workers(
     tombstones: &tombstone::Snapshot,
     workers: Option<usize>,
 ) -> Result<Vec<Segment>> {
-    let mut workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
+    let requested_workers = workers.unwrap_or_else(|| reloption_parallel_workers(rel));
+    let mut workers = requested_workers;
     if unsafe { pg_sys::IsInParallelMode() } {
         info!("merge_with_workers: parallel mode active, disabling internal parallel merge");
         workers = 0;
@@ -624,13 +625,20 @@ pub fn merge_with_workers(
         flat.extend_from_slice(group);
         offsets.push(flat.len() as u32);
     }
+    let group_count = offsets.len().saturating_sub(1);
+    if workers > 0 {
+        let max_workers = unsafe { pg_sys::max_parallel_workers.max(0) as usize };
+        workers = workers.min(max_workers).min(group_count);
+    }
     info!(
-        "merge_with_workers: group_count={} total_input_segments={}",
-        offsets.len().saturating_sub(1),
-        flat.len()
+        "merge_with_workers: group_count={} total_input_segments={} requested_workers={} effective_workers={}",
+        group_count,
+        flat.len(),
+        requested_workers,
+        workers
     );
 
-    if workers > 1 {
+    if workers > 0 {
         if let Some(merged) = unsafe {
             parallel_merge::merge_parallel(
                 rel,
@@ -653,6 +661,10 @@ pub fn merge_with_workers(
             continue;
         }
         let segs = &flat[start..end];
+        if tombstones.is_empty() && segs.len() == 1 {
+            merged.push(segs[0]);
+            continue;
+        }
         merged.push(merge(rel, segs, flush_threshold, tombstones)?);
     }
     Ok(merged)
@@ -689,30 +701,51 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
-    if wal.free_head == pg_sys::InvalidBlockNumber {
-        return Ok(None);
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    while wal.free_head != pg_sys::InvalidBlockNumber {
+        let head = wal.free_head;
+        if head >= nblocks {
+            warning!(
+                "free list corruption: block {} is outside relation size {}",
+                head,
+                nblocks
+            );
+            wal.free_head = pg_sys::InvalidBlockNumber;
+            wal.free_max_block = pg_sys::InvalidBlockNumber;
+            break;
+        }
+        let free_buf = match pgbuffer::BlockBuffer::acquire(rel, head) {
+            Ok(buf) => buf,
+            Err(e) => {
+                warning!("free list corruption: cannot read block {}: {e:#}", head);
+                wal.free_head = pg_sys::InvalidBlockNumber;
+                wal.free_max_block = pg_sys::InvalidBlockNumber;
+                break;
+            }
+        };
+        let free_hdr = free_buf
+            .as_struct::<FreePageHeader>(0)
+            .context("free page header")?;
+        let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(free_hdr.magic)) };
+        if magic != FREE_PAGE_MAGIC {
+            warning!(
+                "free list corruption: block {} has magic {}, expected {}",
+                head,
+                magic,
+                FREE_PAGE_MAGIC
+            );
+            wal.free_head = pg_sys::InvalidBlockNumber;
+            wal.free_max_block = pg_sys::InvalidBlockNumber;
+            break;
+        }
+        if rbl.version >= 5 && wal.free_max_block == head {
+            wal.free_max_block = pg_sys::InvalidBlockNumber;
+        }
+        wal.free_head = free_hdr.next_block;
+        return Ok(Some(head));
     }
-    let head = wal.free_head;
-    let free_buf = pgbuffer::BlockBuffer::acquire(rel, head)?;
-    let free_hdr = free_buf
-        .as_struct::<FreePageHeader>(0)
-        .context("free page header")?;
-    let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(free_hdr.magic)) };
-    if magic != FREE_PAGE_MAGIC {
-        warning!(
-            "free list corruption: block {} has magic {}, expected {}",
-            head,
-            magic,
-            FREE_PAGE_MAGIC
-        );
-        wal.free_head = pg_sys::InvalidBlockNumber;
-        return Ok(None);
-    }
-    if rbl.version >= 5 && wal.free_max_block == head {
-        wal.free_max_block = pg_sys::InvalidBlockNumber;
-    }
-    wal.free_head = free_hdr.next_block;
-    Ok(Some(head))
+    Ok(None)
 }
 
 pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
@@ -954,26 +987,11 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
     Ok(out)
 }
 
-pub fn maybe_truncate_relation(
+fn collect_reachable_blocks(
     rel: pg_sys::Relation,
     rbl: &RootBlockList,
     segments: &[Segment],
-) -> Result<()> {
-    let start = std::time::Instant::now();
-    info!("maybe_truncate_relation start: segments={}", segments.len());
-    let nblocks =
-        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    if rbl.version >= 5 && rbl.wal_block != pg_sys::InvalidBlockNumber {
-        let wal_buf = pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)?;
-        let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
-        if wal.free_max_block == pg_sys::InvalidBlockNumber {
-            info!(
-                "maybe_truncate_relation done: truncated=false elapsed_ms={}",
-                start.elapsed().as_millis()
-            );
-            return Ok(());
-        }
-    }
+) -> Result<HashSet<u32>> {
     let mut used: HashSet<u32> = HashSet::new();
     used.insert(0);
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
@@ -1014,7 +1032,7 @@ pub fn maybe_truncate_relation(
             let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
-                anyhow::bail!("invalid block magic while truncating");
+                anyhow::bail!("invalid block magic while collecting reachable blocks");
             }
             let entries = buf
                 .as_struct_with_elems::<IndexList>(
@@ -1028,9 +1046,84 @@ pub fn maybe_truncate_relation(
             }
         }
     }
+    Ok(used)
+}
 
-    let max_used = *used.iter().max().unwrap_or(&0);
-    let new_nblocks = max_used.saturating_add(1);
+pub fn reclaim_orphan_blocks(
+    rel: pg_sys::Relation,
+    rbl: &RootBlockList,
+    segments: &[Segment],
+) -> Result<usize> {
+    let start = std::time::Instant::now();
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    if nblocks <= 1 {
+        return Ok(0);
+    }
+    let used = collect_reachable_blocks(rel, rbl, segments)?;
+    let free_list_blocks = if rbl.wal_block != pg_sys::InvalidBlockNumber {
+        collect_free_list_blocks(rel, rbl.wal_block)?
+    } else {
+        Vec::new()
+    };
+    let free: HashSet<u32> = free_list_blocks.into_iter().collect();
+    let mut orphans = Vec::new();
+    for blk in 1..nblocks {
+        if !used.contains(&blk) && !free.contains(&blk) {
+            orphans.push(blk);
+        }
+    }
+    free_blocks(rel, &orphans)?;
+    info!(
+        "reclaim_orphan_blocks done: relation_blocks={} reachable_blocks={} reclaimed_blocks={} elapsed_ms={}",
+        nblocks,
+        used.len(),
+        orphans.len(),
+        start.elapsed().as_millis()
+    );
+    Ok(orphans.len())
+}
+
+fn block_is_free_page(rel: pg_sys::Relation, block: u32) -> Result<bool> {
+    let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+    let hdr = buf
+        .as_struct::<FreePageHeader>(0)
+        .context("free page header")?;
+    let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(hdr.magic)) };
+    Ok(magic == FREE_PAGE_MAGIC)
+}
+
+pub fn maybe_truncate_relation(
+    rel: pg_sys::Relation,
+    rbl: &RootBlockList,
+    _segments: &[Segment],
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    info!("maybe_truncate_relation start");
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    if nblocks <= 1 {
+        return Ok(());
+    }
+    if rbl.version >= 5 && rbl.wal_block != pg_sys::InvalidBlockNumber {
+        let wal_buf = pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)?;
+        let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
+        if wal.free_max_block == pg_sys::InvalidBlockNumber {
+            info!(
+                "maybe_truncate_relation done: truncated=false elapsed_ms={}",
+                start.elapsed().as_millis()
+            );
+            return Ok(());
+        }
+    }
+    let mut new_nblocks = nblocks;
+    while new_nblocks > 1 {
+        let tail = new_nblocks.saturating_sub(1);
+        if !block_is_free_page(rel, tail)? {
+            break;
+        }
+        new_nblocks = tail;
+    }
     if new_nblocks >= nblocks {
         info!(
             "maybe_truncate_relation done: truncated=false elapsed_ms={}",
@@ -1039,11 +1132,14 @@ pub fn maybe_truncate_relation(
         return Ok(());
     }
 
+    let freelist_start = std::time::Instant::now();
     let keep = collect_free_list_blocks(rel, rbl.wal_block)?
         .into_iter()
         .filter(|b| *b < new_nblocks)
         .collect::<Vec<u32>>();
+    let freelist_collect_elapsed_ms = freelist_start.elapsed().as_millis();
 
+    let freelist_rewrite_start = std::time::Instant::now();
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
         let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
         let wal = wal_buf
@@ -1069,10 +1165,23 @@ pub fn maybe_truncate_relation(
             wal.high_water_block = new_nblocks.saturating_sub(1);
         }
     }
+    let freelist_rewrite_elapsed_ms = freelist_rewrite_start.elapsed().as_millis();
+    info!(
+        "maybe_truncate_relation phase=free_list keep_blocks={} collect_elapsed_ms={} rewrite_elapsed_ms={}",
+        keep.len(),
+        freelist_collect_elapsed_ms,
+        freelist_rewrite_elapsed_ms
+    );
 
+    let truncate_start = std::time::Instant::now();
     unsafe {
         pg_sys::RelationTruncate(rel, new_nblocks);
     }
+    let truncate_elapsed_ms = truncate_start.elapsed().as_millis();
+    info!(
+        "maybe_truncate_relation phase=truncate old_nblocks={} new_nblocks={} elapsed_ms={}",
+        nblocks, new_nblocks, truncate_elapsed_ms
+    );
     info!(
         "maybe_truncate_relation done: truncated=true new_nblocks={} elapsed_ms={}",
         new_nblocks,
@@ -1441,8 +1550,32 @@ fn merge_entry_postings_stream(
     rel: pg_sys::Relation,
     entries: &[IndexEntry],
     tombstones: &tombstone::Snapshot,
-    mut on_doc: impl FnMut(ItemPointer, &[crate::trgm::Occurance]) -> Result<()>,
+    mut on_doc: impl FnMut(ItemPointer, &[(u32, u8)]) -> Result<()>,
 ) -> Result<()> {
+    fn advance_posting_cursor(
+        cursors: &mut [crate::storage::decode::PostingCursor],
+        heap: &mut BinaryHeap<Reverse<(ItemPointer, usize)>>,
+        idx: usize,
+        deleted: bool,
+        source_count: &mut usize,
+        occs: &mut Vec<(u32, u8)>,
+    ) -> Result<()> {
+        let cursor = &mut cursors[idx];
+        if !deleted {
+            if let Some(doc) = cursor.current() {
+                *source_count = source_count.saturating_add(1);
+                occs.reserve(doc.positions.len());
+                occs.extend(doc.positions.iter().copied());
+            }
+        }
+        if cursor.advance()? {
+            if let Some(next_tid) = cursor.current_tid() {
+                heap.push(Reverse((next_tid, idx)));
+            }
+        }
+        Ok(())
+    }
+
     let mut cursors = Vec::new();
     for entry in entries {
         let mut cursor = unsafe { crate::storage::decode::PostingCursor::new(rel, entry)? };
@@ -1458,53 +1591,47 @@ fn merge_entry_postings_stream(
         }
     }
 
-    let mut occs: Vec<crate::trgm::Occurance> = Vec::new();
-    let mut cursor_indices: Vec<usize> = Vec::new();
+    let mut occs: Vec<(u32, u8)> = Vec::new();
     while let Some(Reverse((target, idx))) = heap.pop() {
-        cursor_indices.clear();
-        cursor_indices.push(idx);
-        while let Some(Reverse((next_tid, next_idx))) = heap.peek().cloned() {
+        let mut source_count = 0usize;
+        occs.clear();
+        let deleted = tombstones.contains(target);
+
+        advance_posting_cursor(
+            &mut cursors,
+            &mut heap,
+            idx,
+            deleted,
+            &mut source_count,
+            &mut occs,
+        )?;
+        loop {
+            let Some(&Reverse((next_tid, _))) = heap.peek() else {
+                break;
+            };
             if next_tid != target {
                 break;
             }
-            heap.pop();
-            cursor_indices.push(next_idx);
+            let Some(Reverse((_, next_idx))) = heap.pop() else {
+                break;
+            };
+            advance_posting_cursor(
+                &mut cursors,
+                &mut heap,
+                next_idx,
+                deleted,
+                &mut source_count,
+                &mut occs,
+            )?;
         }
 
-        if tombstones.contains(target) {
-            for idx in cursor_indices.iter().copied() {
-                let cursor = &mut cursors[idx];
-                if cursor.advance()? {
-                    if let Some(next_tid) = cursor.current_tid() {
-                        heap.push(Reverse((next_tid, idx)));
-                    }
-                }
-            }
+        if deleted {
             continue;
-        }
-        let needs_sort = cursor_indices.len() > 1;
-
-        occs.clear();
-        for idx in cursor_indices.iter().copied() {
-            let cursor = &mut cursors[idx];
-            if let Some(doc) = cursor.current() {
-                occs.reserve(doc.positions.len());
-                for (position, flags) in doc.positions.iter() {
-                    let mut occ = crate::trgm::Occurance(*position);
-                    occ.set_flags(*flags);
-                    occs.push(occ);
-                }
-            }
-            if cursor.advance()? {
-                if let Some(next_tid) = cursor.current_tid() {
-                    heap.push(Reverse((next_tid, idx)));
-                }
-            }
         }
 
         if !occs.is_empty() {
-            if needs_sort {
-                occs.sort_unstable_by_key(|occ| occ.position());
+            if source_count > 1 {
+                occs.sort_unstable_by_key(|(position, _)| *position);
             }
             on_doc(target, &occs)?;
         }
@@ -1519,6 +1646,28 @@ pub fn merge(
     _flush_threshold: usize,
     tombstones: &tombstone::Snapshot,
 ) -> Result<Segment> {
+    fn advance_segment_cursor(
+        cursors: &mut [SegmentCursor],
+        heap: &mut BinaryHeap<Reverse<(u32, usize)>>,
+        group_entries: &mut Vec<IndexEntry>,
+        idx: usize,
+        trigram: u32,
+    ) -> Result<()> {
+        let cursor = &mut cursors[idx];
+        let Some(entry) = cursor.current_entry() else {
+            return Ok(());
+        };
+        if entry.trigram != trigram {
+            return Ok(());
+        }
+        group_entries.push(*entry);
+        cursor.advance()?;
+        if let Some(next) = cursor.current_entry() {
+            heap.push(Reverse((next.trigram, idx)));
+        }
+        Ok(())
+    }
+
     let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     let track_extents = rbl.magic == ROOT_MAGIC && rbl.version >= 6;
@@ -1539,12 +1688,10 @@ pub fn merge(
     );
 
     let mut cursors = Vec::new();
-    let mut cursor_segment_ids = Vec::new();
-    for (seg_idx, segment) in segments.iter().enumerate() {
+    for segment in segments {
         let cursor = SegmentCursor::new(rel, segment)?;
         if cursor.current_entry().is_some() {
             cursors.push(cursor);
-            cursor_segment_ids.push(seg_idx + 1);
         }
     }
 
@@ -1626,33 +1773,27 @@ pub fn merge(
     }
 
     let mut group_entries: Vec<IndexEntry> = Vec::new();
-    let mut cursor_indices: Vec<usize> = Vec::new();
     while let Some(Reverse((trigram, idx))) = heap.pop() {
-        cursor_indices.clear();
-        cursor_indices.push(idx);
-        while let Some(Reverse((next_trigram, next_idx))) = heap.peek().cloned() {
+        // Collect all segment entries for this trigram and advance those cursors.
+        group_entries.clear();
+        advance_segment_cursor(&mut cursors, &mut heap, &mut group_entries, idx, trigram)?;
+        loop {
+            let Some(&Reverse((next_trigram, _))) = heap.peek() else {
+                break;
+            };
             if next_trigram != trigram {
                 break;
             }
-            heap.pop();
-            cursor_indices.push(next_idx);
-        }
-
-        // Collect all segment entries for this trigram and advance those cursors.
-        group_entries.clear();
-        for idx in cursor_indices.iter().copied() {
-            let cursor = &mut cursors[idx];
-            let Some(entry) = cursor.current_entry() else {
-                continue;
+            let Some(Reverse((_, next_idx))) = heap.pop() else {
+                break;
             };
-            if entry.trigram != trigram {
-                continue;
-            }
-            group_entries.push(*entry);
-            cursor.advance()?;
-            if let Some(next) = cursor.current_entry() {
-                heap.push(Reverse((next.trigram, idx)));
-            }
+            advance_segment_cursor(
+                &mut cursors,
+                &mut heap,
+                &mut group_entries,
+                next_idx,
+                trigram,
+            )?;
         }
 
         if leaf.is_none() {
@@ -1738,18 +1879,13 @@ pub fn merge(
             idx_entry.frequency = frequency;
             if data_length > 0 {
                 unsafe {
-                    let seg_idx = cursor_indices
-                        .first()
-                        .and_then(|idx| cursor_segment_ids.get(*idx).copied())
-                        .unwrap_or(0);
                     let result =
                         crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer);
                     if let Err(e) = result {
                         let (block, offset, _len) = entry_fields(entry);
                         warning!(
-                            "posting copy failed: trigram={} segment_idx={} block={} offset={} length={} err={e:#}",
+                            "posting copy failed: trigram={} block={} offset={} length={} err={e:#}",
                             trigram,
-                            seg_idx,
                             block,
                             offset,
                             data_length
@@ -1793,7 +1929,7 @@ pub fn merge(
                         flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
                         continue;
                     }
-                    builder.add(doc, &occs[start..start + can_take]);
+                    builder.add_raw(doc, &occs[start..start + can_take]);
                     start += can_take;
                 }
                 Ok(())

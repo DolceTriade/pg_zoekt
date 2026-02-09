@@ -81,7 +81,7 @@ pub(crate) unsafe fn seal_parallel(
     pending_head: u32,
     workers: usize,
     flush_threshold: usize,
-) -> Option<u64> {
+) -> Option<(u64, usize)> {
     unsafe {
         if workers == 0 {
             return None;
@@ -235,7 +235,7 @@ pub(crate) unsafe fn seal_parallel(
         cleanup_parallel_context(pcxt);
         pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
 
-        Some(ntuples)
+        Some((ntuples, all_segments.len()))
     }
 }
 

@@ -325,9 +325,12 @@ pub extern "C-unwind" fn _pg_zoekt_merge_main(
                 continue;
             }
             let slice = &segments[start..end];
-            let merged =
+            let merged = if params.tombstones_empty && slice.len() == 1 {
+                slice[0]
+            } else {
                 crate::storage::merge(indexrel, slice, params.flush_threshold, &tombstones)
-                    .unwrap_or_else(|e| error!("failed to merge group segments: {e:#?}"));
+                    .unwrap_or_else(|e| error!("failed to merge group segments: {e:#?}"))
+            };
             pg_sys::check_for_interrupts!();
             write_segment_batch(spill_file, std::slice::from_ref(&merged));
             local_groups = local_groups.saturating_add(1);

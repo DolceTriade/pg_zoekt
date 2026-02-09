@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 use std::collections::HashSet;
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use super::{
     ItemPointer, PENDING_BUCKET_MAGIC, PENDING_MAGIC, RootBlockList, pgbuffer::BlockBuffer,
@@ -55,8 +55,8 @@ fn write_struct<T: Copy>(bytes: &mut [u8], value: T) {
 }
 
 pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
-    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)
-        .context("init_pending: acquire header block")?;
+    let mut header_buf =
+        BlockBuffer::aquire_mut(rel, header_block).context("init_pending: acquire header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -142,7 +142,9 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     if header.magic != PENDING_MAGIC {
         warning!(
             "pending header magic mismatch: expected={} got={} header_block={}",
-            PENDING_MAGIC, header.magic, header_block
+            PENDING_MAGIC,
+            header.magic,
+            header_block
         );
         bail!("invalid pending header magic");
     }
@@ -155,8 +157,8 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
 
     let tail_blk = header.tail_block;
     if tail_blk == INVALID_BLOCK {
-        let new_block = allocate_page(rel, &mut header.free_head)
-            .context("append_tid: allocate first page")?;
+        let new_block =
+            allocate_page(rel, &mut header.free_head).context("append_tid: allocate first page")?;
         header.head_block = new_block;
         header.tail_block = new_block;
     }
@@ -171,7 +173,9 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         if header.magic != PENDING_BUCKET_MAGIC {
             warning!(
                 "pending page magic mismatch: expected={} got={} block={}",
-                PENDING_BUCKET_MAGIC, header.magic, tail_block
+                PENDING_BUCKET_MAGIC,
+                header.magic,
+                tail_block
             );
             bail!("corrupt pending page");
         }
@@ -180,10 +184,10 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
 
     if free < ENTRY_SIZE {
         drop(page);
-        let new_block = allocate_page(rel, &mut header.free_head)
-            .context("append_tid: allocate new page")?;
-        let mut old_tail =
-            BlockBuffer::aquire_mut(rel, header.tail_block).context("append_tid: acquire old tail")?;
+        let new_block =
+            allocate_page(rel, &mut header.free_head).context("append_tid: allocate new page")?;
+        let mut old_tail = BlockBuffer::aquire_mut(rel, header.tail_block)
+            .context("append_tid: acquire old tail")?;
         let old_header = old_tail
             .as_struct_mut::<PendingBucket>(0)
             .context("pending page header")?;
@@ -222,7 +226,10 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     let needed_u16: u16 = ENTRY_SIZE
         .try_into()
         .map_err(|e| {
-            warning!("pending entry size overflow: entry_size={} err={e}", ENTRY_SIZE);
+            warning!(
+                "pending entry size overflow: entry_size={} err={e}",
+                ENTRY_SIZE
+            );
             e
         })
         .context("pending entry size overflow")?;
@@ -231,7 +238,9 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         None => {
             warning!(
                 "pending page free underflow: block={} free={} needed={}",
-                header.tail_block, page_header.free, needed_u16
+                header.tail_block,
+                page_header.free,
+                needed_u16
             );
             return Err(anyhow::anyhow!("pending page free underflow"));
         }
@@ -435,9 +444,8 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
         return Ok(());
     }
 
-    let nblocks = unsafe {
-        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
-    };
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
 
     let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)
         .context("cleanup_free_list: pending header block")?;
@@ -483,8 +491,8 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
 
     let mut head = INVALID_BLOCK;
     for block in valid.into_iter().rev() {
-        let mut page = BlockBuffer::aquire_mut(rel, block)
-            .context("cleanup_free_list: rebuild free block")?;
+        let mut page =
+            BlockBuffer::aquire_mut(rel, block).context("cleanup_free_list: rebuild free block")?;
         let page_header = page
             .as_struct_mut::<PendingBucket>(0)
             .context("cleanup_free_list: rebuild header")?;

@@ -16,6 +16,7 @@ mod implementation {
         Seal,
         Merge,
         Full,
+        Truncate,
     }
 
     impl MaintenanceMode {
@@ -24,6 +25,7 @@ mod implementation {
                 "seal" => Some(Self::Seal),
                 "merge" => Some(Self::Merge),
                 "full" => Some(Self::Full),
+                "truncate" => Some(Self::Truncate),
                 _ => None,
             }
         }
@@ -33,6 +35,7 @@ mod implementation {
                 Self::Seal => "seal",
                 Self::Merge => "merge",
                 Self::Full => "full",
+                Self::Truncate => "truncate",
             }
         }
     }
@@ -328,6 +331,7 @@ mod implementation {
         rel: pg_sys::Relation,
         flush_threshold: usize,
         lock_mode: crate::storage::MaintenanceLockMode,
+        recent_segments_hint: usize,
     ) -> AnyResult<bool> {
         let _lock = match crate::storage::maintenance_lock(rel, lock_mode) {
             Some(lock) => lock,
@@ -342,7 +346,7 @@ mod implementation {
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
         let existing = crate::storage::segment_list_read(rel, rbl)?;
-        if existing.is_empty() || existing.len() <= crate::storage::TARGET_SEGMENTS {
+        if existing.is_empty() {
             return Ok(false);
         }
         let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
@@ -350,33 +354,98 @@ mod implementation {
                 warning!("failed to load tombstones during merge: {e:#?}");
                 crate::storage::tombstone::Snapshot::default()
             });
-        let merged = crate::storage::merge_with_workers(
-            rel,
-            &existing,
-            crate::storage::TARGET_SEGMENTS,
-            flush_threshold,
-            &tombstones,
-            None,
-        )?;
-        crate::storage::segment_list_rewrite(rel, rbl, &merged)?;
-        if merged != existing {
-            crate::storage::free_segments(rel, &existing)
-                .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
-            crate::storage::maybe_truncate_relation(rel, rbl, &merged)
-                .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+
+        let target = crate::storage::TARGET_SEGMENTS;
+        let seg_count = existing.len();
+        let mut required_victims = if seg_count > target {
+            seg_count - target + 1
+        } else if recent_segments_hint > 1 {
+            recent_segments_hint
+        } else {
+            0
+        };
+        if required_victims < 2 {
+            return Ok(false);
         }
+        required_victims = required_victims.min(seg_count);
+
+        let recent_count = recent_segments_hint.min(seg_count);
+        let recent_start = seg_count.saturating_sub(recent_count);
+        let mut victim_set: Vec<crate::storage::Segment> = Vec::with_capacity(required_victims);
+
+        if recent_count > 0 {
+            for seg in &existing[recent_start..] {
+                if victim_set.len() >= required_victims {
+                    break;
+                }
+                if !victim_set.contains(seg) {
+                    victim_set.push(*seg);
+                }
+            }
+        }
+        if victim_set.len() < required_victims {
+            let mut candidates: Vec<crate::storage::Segment> =
+                existing[..recent_start].iter().copied().collect();
+            candidates.sort_by_key(|seg| seg.size);
+            for seg in candidates {
+                if victim_set.len() >= required_victims {
+                    break;
+                }
+                if !victim_set.contains(&seg) {
+                    victim_set.push(seg);
+                }
+            }
+        }
+        if victim_set.len() < 2 {
+            return Ok(false);
+        }
+
+        let victims: Vec<crate::storage::Segment> = existing
+            .iter()
+            .copied()
+            .filter(|seg| victim_set.contains(seg))
+            .collect();
+        let victim_total_bytes = victims
+            .iter()
+            .fold(0u64, |acc, seg| acc.saturating_add(seg.size));
+        info!(
+            "merge_segments decision: seg_count={} target={} recent_hint={} required_victims={} selected_victims={} selected_victim_bytes={}",
+            seg_count,
+            target,
+            recent_segments_hint,
+            required_victims,
+            victims.len(),
+            victim_total_bytes
+        );
+        let replacement = crate::storage::merge(rel, &victims, flush_threshold, &tombstones)?;
+        let mut rewritten: Vec<crate::storage::Segment> = existing
+            .iter()
+            .copied()
+            .filter(|seg| !victim_set.contains(seg))
+            .collect();
+        if replacement.block != pg_sys::InvalidBlockNumber {
+            rewritten.push(replacement);
+        }
+
+        crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
+        info!(
+            "merge_segments publish: kept_segments={} deferred_reclaim_segments={}",
+            rewritten.len(),
+            victims.len()
+        );
         Ok(false)
     }
 
-    fn flush_collector(rel: pg_sys::Relation, collector: &mut crate::trgm::Collector) {
+    fn flush_collector(rel: pg_sys::Relation, collector: &mut crate::trgm::Collector) -> usize {
         let trgms = collector.take_trgms();
         if trgms.is_empty() {
-            return;
+            return 0;
         }
         let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);
         drop(trgms);
         match res {
             Ok(segs) => {
+                let count = segs.len();
                 let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0) {
                     Ok(root) => root,
                     Err(e) => {
@@ -389,6 +458,7 @@ mod implementation {
                 if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
                     error!("failed to append segments: {e:#?}");
                 }
+                count
             }
             Err(e) => {
                 error!("failed to flush segment: {e:#?}");
@@ -408,7 +478,7 @@ mod implementation {
         if workers >= 0 { Some(workers) } else { None }
     }
 
-    pub(super) fn seal_serial(index: pg_sys::Oid, pending_head: u32) -> u64 {
+    pub(super) fn seal_serial(index: pg_sys::Oid, pending_head: u32) -> (u64, usize) {
         unsafe {
             info!(
                 "seal_serial: index_oid={} pending_head={}",
@@ -429,6 +499,7 @@ mod implementation {
             info!("seal_serial: snapshot registered");
 
             let mut seen = 0u64;
+            let mut appended_segments = 0usize;
             let mut requeued = 0u64;
             pg_sys::PushActiveSnapshot(snapshot);
             let res = crate::storage::pending::drain_detached(index_rel, pending_head, |tid| {
@@ -493,14 +564,16 @@ mod implementation {
                     &mut collector,
                     |collector| {
                         if collector.memory_usage() >= flush_threshold {
-                            flush_collector(index_rel, collector);
+                            appended_segments = appended_segments
+                                .saturating_add(flush_collector(index_rel, collector));
                         }
                     },
                 ) {
                     seen = seen.saturating_add(1);
                 }
                 if collector.memory_usage() >= flush_threshold {
-                    flush_collector(index_rel, &mut collector);
+                    appended_segments = appended_segments
+                        .saturating_add(flush_collector(index_rel, &mut collector));
                 }
                 pg_sys::ExecClearTuple(slot);
             });
@@ -511,25 +584,32 @@ mod implementation {
                 warning!("failed to drain pending list: {e:#?}");
             }
 
-            flush_collector(index_rel, &mut collector);
+            appended_segments =
+                appended_segments.saturating_add(flush_collector(index_rel, &mut collector));
 
             pg_sys::ExecDropSingleTupleTableSlot(slot);
             pg_sys::FreeExecutorState(estate);
             pg_sys::relation_close(heap_rel, pg_sys::AccessShareLock as i32);
             pg_sys::relation_close(index_rel, pg_sys::RowExclusiveLock as i32);
-            info!("sealed {} pending tuples (requeued {})", seen, requeued);
-            seen
+            info!(
+                "sealed {} pending tuples into {} segments (requeued {})",
+                seen, appended_segments, requeued
+            );
+            (seen, appended_segments)
         }
     }
 
-    fn seal_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) -> (u64, bool) {
+    fn seal_index(
+        index: pg_sys::Oid,
+        lock_mode: crate::storage::MaintenanceLockMode,
+    ) -> (u64, usize, bool) {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
             let lock = match crate::storage::maintenance_lock(rel, lock_mode) {
                 Some(lock) => lock,
                 None => {
                     pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
-                    return (0, true);
+                    return (0, 0, true);
                 }
             };
             let pending_head = match crate::storage::pending::detach_pending(rel, 0) {
@@ -544,7 +624,7 @@ mod implementation {
             let Some(pending_head) = pending_head else {
                 drop(lock);
                 pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
-                return (0, false);
+                return (0, 0, false);
             };
 
             let workers = reloption_parallel_workers(rel).unwrap_or(0).max(0) as usize;
@@ -552,21 +632,24 @@ mod implementation {
 
             if workers > 0 {
                 let flush_threshold = crate::build::flush_threshold_bytes();
-                if let Some(seen) = crate::seal::parallel::seal_parallel(
+                if let Some((seen, appended_segments)) = crate::seal::parallel::seal_parallel(
                     index,
                     pending_head,
                     workers,
                     flush_threshold,
                 ) {
-                    info!("sealed {} pending tuples (parallel)", seen);
+                    info!(
+                        "sealed {} pending tuples into {} segments (parallel)",
+                        seen, appended_segments
+                    );
                     drop(lock);
-                    return (seen, false);
+                    return (seen, appended_segments, false);
                 }
             }
 
-            let seen = seal_serial(index, pending_head);
+            let (seen, appended_segments) = seal_serial(index, pending_head);
             drop(lock);
-            (seen, false)
+            (seen, appended_segments, false)
         }
     }
 
@@ -589,13 +672,54 @@ mod implementation {
         }
     }
 
-    fn merge_index(index: pg_sys::Oid, lock_mode: crate::storage::MaintenanceLockMode) -> AnyResult<bool> {
+    fn merge_index(
+        index: pg_sys::Oid,
+        lock_mode: crate::storage::MaintenanceLockMode,
+        recent_segments_hint: usize,
+    ) -> AnyResult<bool> {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
             let flush_threshold = crate::build::flush_threshold_bytes();
-            let res = merge_segments(rel, flush_threshold, lock_mode);
+            let res = merge_segments(rel, flush_threshold, lock_mode, recent_segments_hint);
             pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
             res
+        }
+    }
+
+    fn truncate_index(
+        index: pg_sys::Oid,
+        lock_mode: crate::storage::MaintenanceLockMode,
+    ) -> AnyResult<bool> {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::ShareUpdateExclusiveLock as i32);
+            let lock = match crate::storage::maintenance_lock(rel, lock_mode) {
+                Some(lock) => lock,
+                None => {
+                    pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+                    info!("truncate skipped: maintenance lock busy");
+                    return Ok(true);
+                }
+            };
+            let res: AnyResult<()> = (|| {
+                let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)
+                    .map_err(|e| anyhow!("failed to acquire root buffer: {e:#?}"))?;
+                let rbl = root
+                    .as_struct::<crate::storage::RootBlockList>(0)
+                    .map_err(|e| anyhow!("failed to read root header: {e:#?}"))?;
+                let segments = crate::storage::segment_list_read(rel, rbl)?;
+                let reclaimed = crate::storage::reclaim_orphan_blocks(rel, rbl, &segments)?;
+                info!(
+                    "truncate_index reclaim phase: orphan_segments={} reclaimed_blocks={}",
+                    segments.len(),
+                    reclaimed
+                );
+                crate::storage::maybe_truncate_relation(rel, rbl, &segments)?;
+                Ok(())
+            })();
+            drop(lock);
+            pg_sys::relation_close(rel, pg_sys::ShareUpdateExclusiveLock as i32);
+            res?;
+            Ok(false)
         }
     }
 
@@ -610,20 +734,23 @@ mod implementation {
 
         match mode {
             MaintenanceMode::Seal => {
-                let (seen, skipped) = seal_index(index, lock_mode);
+                let (seen, _appended_segments, skipped) = seal_index(index, lock_mode);
                 sealed_tuples = seen as i64;
                 skipped_busy = skipped;
             }
             MaintenanceMode::Merge => {
-                skipped_busy = merge_index(index, lock_mode)?;
+                skipped_busy = merge_index(index, lock_mode, 0)?;
             }
             MaintenanceMode::Full => {
-                let (seen, skipped) = seal_index(index, lock_mode);
+                let (seen, appended_segments, skipped) = seal_index(index, lock_mode);
                 sealed_tuples = seen as i64;
                 skipped_busy = skipped;
                 if !skipped_busy {
-                    skipped_busy = merge_index(index, lock_mode)?;
+                    skipped_busy = merge_index(index, lock_mode, appended_segments)?;
                 }
+            }
+            MaintenanceMode::Truncate => {
+                skipped_busy = truncate_index(index, lock_mode)?;
             }
         }
 
@@ -665,7 +792,7 @@ mod implementation {
         ),
     > {
         let mode = MaintenanceMode::parse(mode).unwrap_or_else(|| {
-            error!("invalid mode '{mode}', expected one of: seal, merge, full")
+            error!("invalid mode '{mode}', expected one of: seal, merge, full, truncate")
         });
         let lock_mode = if wait {
             crate::storage::MaintenanceLockMode::Block
@@ -695,7 +822,7 @@ mod implementation {
         ),
     > {
         let mode = MaintenanceMode::parse(mode).unwrap_or_else(|| {
-            error!("invalid mode '{mode}', expected one of: seal, merge, full")
+            error!("invalid mode '{mode}', expected one of: seal, merge, full, truncate")
         });
         let lock_mode = if wait {
             crate::storage::MaintenanceLockMode::Block
@@ -719,16 +846,17 @@ mod implementation {
             limit_clause
         );
 
-        let index_oids: Vec<pg_sys::Oid> = Spi::connect_mut(|client| -> spi::Result<Vec<pg_sys::Oid>> {
-            let mut out = Vec::new();
-            for row in client.select(&sql, None, &[])? {
-                if let Some(oid) = row.get::<pg_sys::Oid>(1)? {
-                    out.push(oid);
+        let index_oids: Vec<pg_sys::Oid> =
+            Spi::connect_mut(|client| -> spi::Result<Vec<pg_sys::Oid>> {
+                let mut out = Vec::new();
+                for row in client.select(&sql, None, &[])? {
+                    if let Some(oid) = row.get::<pg_sys::Oid>(1)? {
+                        out.push(oid);
+                    }
                 }
-            }
-            Ok(out)
-        })
-        .unwrap_or_else(|e| error!("failed to enumerate pg_zoekt indexes: {e:#?}"));
+                Ok(out)
+            })
+            .unwrap_or_else(|e| error!("failed to enumerate pg_zoekt indexes: {e:#?}"));
 
         let mut rows = Vec::with_capacity(index_oids.len());
         for oid in index_oids {
@@ -940,6 +1068,25 @@ mod tests {
             let segments = crate::query::read_segments(rel).expect("failed to read segments");
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             segments.len()
+        }
+    }
+
+    fn read_segments(index_oid: pg_sys::Oid) -> Vec<crate::storage::Segment> {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            segments
+        }
+    }
+
+    fn index_nblocks(index_oid: pg_sys::Oid) -> u32 {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let nblocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            nblocks
         }
     }
 
@@ -1384,22 +1531,23 @@ mod tests {
         .unwrap_or(0);
         assert!(segment_idx > 0, "expected segment");
 
-        let (min_pos, max_pos, count) = Spi::connect_mut(|client| -> spi::Result<(i64, i64, i64)> {
-            let mut rows = client.select(
-                "SELECT min(position), max(position), count(*) \
+        let (min_pos, max_pos, count) =
+            Spi::connect_mut(|client| -> spi::Result<(i64, i64, i64)> {
+                let mut rows = client.select(
+                    "SELECT min(position), max(position), count(*) \
                  FROM pg_zoekt_posting_positions(\
                      'idx_newline_docs_text_zoekt'::regclass, \
                      $1, 0, (SELECT ctid FROM newline_docs LIMIT 1))",
-                None,
-                &[segment_idx.into()],
-            )?;
-            let row = rows.next().expect("newline positions row");
-            Ok((
-                row.get::<i64>(1)?.unwrap_or(-1),
-                row.get::<i64>(2)?.unwrap_or(-1),
-                row.get::<i64>(3)?.unwrap_or(0),
-            ))
-        })?;
+                    None,
+                    &[segment_idx.into()],
+                )?;
+                let row = rows.next().expect("newline positions row");
+                Ok((
+                    row.get::<i64>(1)?.unwrap_or(-1),
+                    row.get::<i64>(2)?.unwrap_or(-1),
+                    row.get::<i64>(3)?.unwrap_or(0),
+                ))
+            })?;
         assert_eq!(count, 1, "expected one newline posting");
         assert_eq!(min_pos, 3, "expected newline at byte 3");
         assert_eq!(max_pos, 3, "expected newline at byte 3");
@@ -1696,16 +1844,13 @@ mod tests {
 
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
-            let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
-                rel,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-            );
+            let nblocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
             let bad_block = nblocks.saturating_add(10);
-            crate::storage::pending::test_set_free_head(rel, bad_block)
-                .expect("set free_head");
+            crate::storage::pending::test_set_free_head(rel, bad_block).expect("set free_head");
             crate::storage::pending::cleanup_free_list(rel).expect("cleanup free list");
-            let free_head = crate::storage::pending::test_get_free_head(rel)
-                .expect("get free_head");
+            let free_head =
+                crate::storage::pending::test_get_free_head(rel).expect("get free_head");
             assert_eq!(
                 free_head,
                 pg_sys::InvalidBlockNumber,
@@ -2471,19 +2616,28 @@ mod tests {
             "SELECT count(*) FROM maintain_full_docs WHERE text LIKE '%needle%'",
         )?
         .unwrap_or(0);
-        assert_eq!(before, 0, "pending rows should be invisible before maintenance");
+        assert_eq!(
+            before, 0,
+            "pending rows should be invisible before maintenance"
+        );
 
         let sealed = Spi::get_one::<i64>(
             "SELECT sealed_tuples FROM pg_zoekt_maintain('idx_maintain_full_docs_text_zoekt'::regclass, 'full', true)",
         )?
         .unwrap_or(0);
-        assert!(sealed >= 1, "expected full maintenance to seal pending tuples");
+        assert!(
+            sealed >= 1,
+            "expected full maintenance to seal pending tuples"
+        );
 
         let after = Spi::get_one::<i64>(
             "SELECT count(*) FROM maintain_full_docs WHERE text LIKE '%needle%'",
         )?
         .unwrap_or(0);
-        assert_eq!(after, 1, "full maintenance should make pending row searchable");
+        assert_eq!(
+            after, 1,
+            "full maintenance should make pending row searchable"
+        );
 
         Spi::run("RESET enable_seqscan")?;
         Spi::run("DROP TABLE IF EXISTS maintain_full_docs")?;
@@ -2535,6 +2689,68 @@ mod tests {
         );
 
         Spi::run("DROP TABLE IF EXISTS maintain_merge_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_maintain_merge_rewrites_minimal_victims() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_merge_min_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_merge_min_docs_text_zoekt ON maintain_merge_min_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=14i32 {
+            let insert_sql = format!(
+                "INSERT INTO maintain_merge_min_docs (text) VALUES (repeat(md5(({} * 97)::text), 16) || ' minimal-victim ' || {}::text)",
+                i, i
+            );
+            Spi::run(&insert_sql)?;
+            Spi::run(
+                "SELECT pg_zoekt_maintain('idx_maintain_merge_min_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+
+        let index_oid = lookup_index_oid("idx_maintain_merge_min_docs_text_zoekt")?;
+        let before_segments = read_segments(index_oid);
+        assert!(
+            before_segments.len() > crate::storage::TARGET_SEGMENTS,
+            "expected > target segments before merge (got {})",
+            before_segments.len()
+        );
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_merge_min_docs_text_zoekt'::regclass, 'merge', true)",
+        )?;
+
+        let after_segments = read_segments(index_oid);
+        assert_eq!(
+            after_segments.len(),
+            crate::storage::TARGET_SEGMENTS,
+            "expected merge to leave exactly target segments"
+        );
+
+        let survivors = after_segments
+            .iter()
+            .filter(|seg| before_segments.contains(seg))
+            .count();
+        let expected_survivors =
+            before_segments.len() - (before_segments.len() - crate::storage::TARGET_SEGMENTS + 1);
+        assert_eq!(
+            survivors, expected_survivors,
+            "expected minimal-victim merge to preserve {} original segments (got {})",
+            expected_survivors, survivors
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_merge_min_docs")?;
         Ok(())
     }
 
@@ -2620,7 +2836,10 @@ mod tests {
              WHERE a.amname <> 'pg_zoekt'",
         )?
         .unwrap_or(0);
-        assert_eq!(non_zoekt, 0, "maintain_all should only target pg_zoekt indexes");
+        assert_eq!(
+            non_zoekt, 0,
+            "maintain_all should only target pg_zoekt indexes"
+        );
 
         let zoekt_count = Spi::get_one::<i64>(
             "SELECT count(*)
@@ -2630,7 +2849,10 @@ mod tests {
              WHERE c.relname = 'idx_maintain_all_docs_text_zoekt' AND a.amname = 'pg_zoekt'",
         )?
         .unwrap_or(0);
-        assert_eq!(zoekt_count, 1, "expected pg_zoekt index in maintain_all output");
+        assert_eq!(
+            zoekt_count, 1,
+            "expected pg_zoekt index in maintain_all output"
+        );
 
         Spi::run("DROP TABLE IF EXISTS maintain_all_docs")?;
         Ok(())
@@ -2671,6 +2893,57 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_maintain_truncate_reclaims_after_merge() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_truncate_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_maintain_truncate_docs_text_zoekt ON maintain_truncate_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=18i32 {
+            let insert_sql = format!(
+                "INSERT INTO maintain_truncate_docs (text) VALUES (repeat(md5(({} * 29)::text), 16) || ' truncate-marker ' || {}::text)",
+                i, i
+            );
+            Spi::run(&insert_sql)?;
+            Spi::run(
+                "SELECT pg_zoekt_maintain('idx_maintain_truncate_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+        let index_oid = lookup_index_oid("idx_maintain_truncate_docs_text_zoekt")?;
+        let segments_before_merge = segment_count(index_oid);
+        assert!(
+            segments_before_merge > crate::storage::TARGET_SEGMENTS,
+            "expected enough segments for merge before truncate test (got {segments_before_merge})"
+        );
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_truncate_docs_text_zoekt'::regclass, 'merge', true)",
+        )?;
+        let blocks_after_merge = index_nblocks(index_oid);
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_truncate_docs_text_zoekt'::regclass, 'truncate', true)",
+        )?;
+        let blocks_after_truncate = index_nblocks(index_oid);
+        assert!(
+            blocks_after_truncate <= blocks_after_merge,
+            "truncate mode should not grow relation (after_merge={blocks_after_merge}, after_truncate={blocks_after_truncate})"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_truncate_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_vacuumcleanup_no_longer_seals_or_merges() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
@@ -2696,7 +2969,10 @@ mod tests {
             "SELECT count(*) FROM vacuum_cleanup_docs WHERE text LIKE '%needle%'",
         )?
         .unwrap_or(0);
-        assert_eq!(before, 0, "row should be pending before vacuum cleanup callback");
+        assert_eq!(
+            before, 0,
+            "row should be pending before vacuum cleanup callback"
+        );
 
         let index_oid = lookup_index_oid("idx_vacuum_cleanup_docs_text_zoekt")?;
         unsafe {

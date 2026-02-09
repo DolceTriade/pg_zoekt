@@ -169,11 +169,7 @@ where
         }
         let mut occ = crate::trgm::Occurance(idx as u32);
         occ.set_flags(0);
-        collector.add_occurrences(
-            crate::trgm::NEWLINE_TRGM,
-            ctid,
-            std::slice::from_ref(&occ),
-        );
+        collector.add_occurrences(crate::trgm::NEWLINE_TRGM, ctid, std::slice::from_ref(&occ));
         newline_count += 1;
         if (newline_count & 0xff) == 0 {
             flush_check(collector);
