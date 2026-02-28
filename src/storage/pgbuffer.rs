@@ -96,6 +96,8 @@ impl BlockBuffer {
     }
 
     pub fn allocate(rel: pg_sys::Relation) -> Self {
+        // TODO(pg18): evaluate whether ExtendBufferedRel can replace this path
+        // without changing extension-locking or Generic WAL semantics.
         let lock = unsafe {
             RelationExtensionLockGuard::new(rel, pg_sys::ExclusiveLock as pg_sys::LOCKMODE)
         };

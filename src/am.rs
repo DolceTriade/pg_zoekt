@@ -72,80 +72,34 @@ mod implementation {
         }
     }
 
+    fn should_skip_insert_for_heap_bounds(
+        heap_relation: pg_sys::Relation,
+        heap_tid: pg_sys::ItemPointer,
+    ) -> bool {
+        if heap_relation.is_null() {
+            return false;
+        }
+
+        let nblocks = unsafe {
+            pg_sys::RelationGetNumberOfBlocksInFork(heap_relation, pg_sys::ForkNumber::MAIN_FORKNUM)
+        };
+        let heap_tid = unsafe { *heap_tid };
+        let blk = ((heap_tid.ip_blkid.bi_hi as u32) << 16) | heap_tid.ip_blkid.bi_lo as u32;
+        blk >= nblocks
+    }
+
     // --- Required callbacks -------------------------------------------------
 
     unsafe extern "C-unwind" fn ambuildempty(index_relation: pg_sys::Relation) {
-        let _root_block = {
-            let mut root_buffer = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
-            let root_block = root_buffer.block_number();
-            if root_block != 0 {
-                error!("expected root block 0 for empty index, got {}", root_block);
-            }
-            let rbl = root_buffer
-                .as_struct_mut::<crate::storage::RootBlockList>(0)
-                .expect("root header");
-            rbl.magic = crate::storage::ROOT_MAGIC;
-            rbl.version = crate::storage::VERSION;
-            rbl.num_segments = 0;
-            rbl.segment_list_head = pg_sys::InvalidBlockNumber;
-            rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
-            rbl.tombstone_block = pg_sys::InvalidBlockNumber;
-            rbl.tombstone_bytes = 0;
-            rbl.wal_block = pg_sys::InvalidBlockNumber;
-            rbl.pending_block = pg_sys::InvalidBlockNumber;
-            root_block
-        };
-
-        let wal_block = {
-            let mut wal_buffer = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
-            let wal_block = wal_buffer.block_number();
-            let wal = wal_buffer
-                .as_struct_mut::<crate::storage::WALHeader>(0)
-                .expect("wal header");
-            wal.magic = crate::storage::WAL_MAGIC;
-            wal.bytes_used = 0;
-            wal.head_block = pg_sys::InvalidBlockNumber;
-            wal.tail_block = pg_sys::InvalidBlockNumber;
-            wal.free_head = pg_sys::InvalidBlockNumber;
-            wal.free_max_block = pg_sys::InvalidBlockNumber;
-            wal.high_water_block = wal_block;
-            wal_block
-        };
-
-        let pending_block_number = {
-            let pending_block = crate::storage::pgbuffer::BlockBuffer::allocate(index_relation);
-            pending_block.block_number()
-        };
-        crate::storage::pending::init_pending(index_relation, pending_block_number)
-            .unwrap_or_else(|e| error!("failed to init pending list: {e:#?}"));
-
-        let mut root_buffer =
-            match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, 0) {
-                Ok(root_buffer) => root_buffer,
-                Err(e) => {
-                    error!("failed to acquire root buffer: {e:#?}");
-                }
-            };
-        let rbl = root_buffer
-            .as_struct_mut::<crate::storage::RootBlockList>(0)
-            .expect("root header");
-        rbl.wal_block = wal_block;
-        rbl.pending_block = pending_block_number;
-        {
-            let mut wal_buffer = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(
-                index_relation,
-                wal_block,
-            ) {
-                Ok(wal_buffer) => wal_buffer,
-                Err(e) => {
-                    error!("failed to acquire wal buffer: {e:#?}");
-                }
-            };
-            let wal = wal_buffer
-                .as_struct_mut::<crate::storage::WALHeader>(0)
-                .expect("wal header");
-            wal.high_water_block = wal_block.max(pending_block_number);
-        }
+        let crate::storage::IndexBootstrapBlocks {
+            root_block,
+            wal_block,
+            pending_block,
+        } = crate::storage::initialize_index_storage(index_relation, true)
+            .unwrap_or_else(|e| error!("failed to initialize empty index storage: {e:#?}"));
+        debug_assert_eq!(root_block, 0);
+        debug_assert_ne!(wal_block, pg_sys::InvalidBlockNumber);
+        debug_assert_ne!(pending_block, pg_sys::InvalidBlockNumber);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -155,7 +109,7 @@ mod implementation {
         values: *mut pg_sys::Datum,
         isnull: *mut bool,
         heap_tid: pg_sys::ItemPointer,
-        _heap_relation: pg_sys::Relation,
+        heap_relation: pg_sys::Relation,
         _check_unique: pg_sys::IndexUniqueCheck::Type,
         _index_unchanged: bool,
         _index_info: *mut pg_sys::IndexInfo,
@@ -176,18 +130,10 @@ mod implementation {
         if nulls[0] {
             return true;
         }
-        if !_heap_relation.is_null() {
-            let nblocks = unsafe {
-                pg_sys::RelationGetNumberOfBlocksInFork(
-                    _heap_relation,
-                    pg_sys::ForkNumber::MAIN_FORKNUM,
-                )
-            };
-            let heap_tid = unsafe { *heap_tid };
-            let blk = ((heap_tid.ip_blkid.bi_hi as u32) << 16) | heap_tid.ip_blkid.bi_lo as u32;
-            if blk >= nblocks {
-                return true;
-            }
+        // Keep the defensive heap-bounds guard for now until the aminsert
+        // heapRelation contract is verified against upstream callers.
+        if should_skip_insert_for_heap_bounds(heap_relation, heap_tid) {
+            return true;
         }
 
         let ctid: crate::storage::ItemPointer = match heap_tid.try_into() {
@@ -1857,6 +1803,56 @@ mod tests {
                 "free_head should be reset after cleanup"
             );
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+        }
+
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_pending_header_initialized_at_index_creation() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE pending_init_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_pending_init_docs_text_zoekt ON pending_init_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid = lookup_index_oid("idx_pending_init_docs_text_zoekt")?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let root =
+                crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("acquire root");
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+            let pending_block = std::ptr::read_unaligned(std::ptr::addr_of!(rbl.pending_block));
+            let wal_block = std::ptr::read_unaligned(std::ptr::addr_of!(rbl.wal_block));
+            assert_ne!(
+                pending_block,
+                pg_sys::InvalidBlockNumber,
+                "pending header should be initialized during index creation"
+            );
+            assert_ne!(
+                wal_block,
+                pg_sys::InvalidBlockNumber,
+                "wal header should be initialized during index creation"
+            );
+            let free_head =
+                crate::storage::pending::test_get_free_head(rel).expect("get pending free_head");
+            assert_eq!(
+                free_head,
+                pg_sys::InvalidBlockNumber,
+                "new pending header should start with an empty free list"
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         }
 
         Ok(())

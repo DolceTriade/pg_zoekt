@@ -42,6 +42,13 @@ pub struct RootBlockList {
     // Segments...
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IndexBootstrapBlocks {
+    pub(crate) root_block: u32,
+    pub(crate) wal_block: u32,
+    pub(crate) pending_block: u32,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum MaintenanceLockMode {
     Try,
@@ -824,6 +831,70 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         wal.free_max_block = free_max;
     }
     Ok(())
+}
+
+pub(crate) fn initialize_index_storage(
+    rel: pg_sys::Relation,
+    expect_root_block_zero: bool,
+) -> Result<IndexBootstrapBlocks> {
+    let root_block = {
+        let mut root_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        let root_block = root_buffer.block_number();
+        if expect_root_block_zero && root_block != 0 {
+            anyhow::bail!("expected root block 0 for empty index, got {root_block}");
+        }
+        let rbl = root_buffer
+            .as_struct_mut::<RootBlockList>(0)
+            .context("initialize_index_storage: root header")?;
+        rbl.magic = ROOT_MAGIC;
+        rbl.version = VERSION;
+        rbl.wal_block = pg_sys::InvalidBlockNumber;
+        rbl.num_segments = 0;
+        rbl.segment_list_head = pg_sys::InvalidBlockNumber;
+        rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_block = pg_sys::InvalidBlockNumber;
+        rbl.tombstone_bytes = 0;
+        rbl.pending_block = pg_sys::InvalidBlockNumber;
+        root_block
+    };
+
+    let pending_block = {
+        let pending_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        pending_buffer.block_number()
+    };
+    pending::init_pending(rel, pending_block).context("initialize_index_storage: init pending")?;
+
+    let wal_block = {
+        let mut wal_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        let wal_block = wal_buffer.block_number();
+        let wal = wal_buffer
+            .as_struct_mut::<WALHeader>(0)
+            .context("initialize_index_storage: wal header")?;
+        wal.magic = WAL_MAGIC;
+        wal.bytes_used = 0;
+        wal.head_block = pg_sys::InvalidBlockNumber;
+        wal.tail_block = pg_sys::InvalidBlockNumber;
+        wal.free_head = pg_sys::InvalidBlockNumber;
+        wal.free_max_block = pg_sys::InvalidBlockNumber;
+        wal.high_water_block = root_block.max(wal_block).max(pending_block);
+        wal_block
+    };
+
+    {
+        let mut root_buffer = pgbuffer::BlockBuffer::aquire_mut(rel, root_block)
+            .context("initialize_index_storage: reacquire root")?;
+        let rbl = root_buffer
+            .as_struct_mut::<RootBlockList>(0)
+            .context("initialize_index_storage: update root header")?;
+        rbl.wal_block = wal_block;
+        rbl.pending_block = pending_block;
+    }
+
+    Ok(IndexBootstrapBlocks {
+        root_block,
+        wal_block,
+        pending_block,
+    })
 }
 
 fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {

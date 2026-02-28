@@ -113,6 +113,15 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
 }
 
 fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
+    {
+        let root =
+            BlockBuffer::acquire(rel, root_block).context("ensure_pending_list: read root")?;
+        let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
+        if rbl.version >= super::VERSION && rbl.pending_block != INVALID_BLOCK {
+            return Ok(rbl.pending_block);
+        }
+    }
+
     let mut root =
         BlockBuffer::aquire_mut(rel, root_block).context("ensure_pending_list: acquire root")?;
     let rbl = root
@@ -121,7 +130,6 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     if rbl.version >= super::VERSION && rbl.pending_block != INVALID_BLOCK {
         return Ok(rbl.pending_block);
     }
-
     let header_block = super::allocate_block(rel).block_number();
     init_pending(rel, header_block).context("ensure_pending_list: init header")?;
     rbl.pending_block = header_block;

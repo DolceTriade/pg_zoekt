@@ -443,74 +443,10 @@ pub extern "C-unwind" fn ambuild(
 ) -> *mut pg_sys::IndexBuildResult {
     // IMPORTANT: do not hold an exclusive lock on the root buffer throughout the
     // heap scan; callbacks need to acquire it to append segment records.
-    let root_block = {
-        info!("Allocating root");
-        let mut root_buffer = BlockBuffer::allocate(index_relation);
-        let root_block = root_buffer.block_number();
-        let rbl = root_buffer
-            .as_struct_mut::<crate::storage::RootBlockList>(0)
-            .expect("Root should always be in bounds");
-        rbl.magic = crate::storage::ROOT_MAGIC;
-        rbl.num_segments = 0;
-        rbl.version = crate::storage::VERSION;
-        rbl.segment_list_head = pg_sys::InvalidBlockNumber;
-        rbl.segment_list_tail = pg_sys::InvalidBlockNumber;
-        rbl.tombstone_block = pg_sys::InvalidBlockNumber;
-        rbl.tombstone_bytes = 0;
-        rbl.wal_block = pg_sys::InvalidBlockNumber;
-        rbl.pending_block = pg_sys::InvalidBlockNumber;
-        root_block
-    };
-
-    let wal_block = {
-        let mut wal_buffer = BlockBuffer::allocate(index_relation);
-        let wal_block = wal_buffer.block_number();
-        let wal = wal_buffer
-            .as_struct_mut::<crate::storage::WALHeader>(0)
-            .expect("WAL should always be in bounds");
-        wal.magic = crate::storage::WAL_MAGIC;
-        wal.bytes_used = 0;
-        wal.head_block = pg_sys::InvalidBlockNumber;
-        wal.tail_block = pg_sys::InvalidBlockNumber;
-        wal.free_head = pg_sys::InvalidBlockNumber;
-        wal.free_max_block = pg_sys::InvalidBlockNumber;
-        wal.high_water_block = wal_block;
-        wal_block
-    };
-
-    info!("Allocating pending");
-    let pending_block_number = {
-        let pending_block = BlockBuffer::allocate(index_relation);
-        pending_block.block_number()
-    };
-    crate::storage::pending::init_pending(index_relation, pending_block_number)
-        .unwrap_or_else(|e| error!("failed to init pending list: {e:#?}"));
-
-    {
-        let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
-            Ok(root_buffer) => root_buffer,
-            Err(e) => {
-                error!("failed to acquire root buffer: {e:#?}");
-            }
-        };
-        let rbl = root_buffer
-            .as_struct_mut::<crate::storage::RootBlockList>(0)
-            .expect("root header");
-        rbl.wal_block = wal_block;
-        rbl.pending_block = pending_block_number;
-    }
-    {
-        let mut wal_buffer = match BlockBuffer::aquire_mut(index_relation, wal_block) {
-            Ok(wal_buffer) => wal_buffer,
-            Err(e) => {
-                error!("failed to acquire wal buffer: {e:#?}");
-            }
-        };
-        let wal = wal_buffer
-            .as_struct_mut::<crate::storage::WALHeader>(0)
-            .expect("wal header");
-        wal.high_water_block = root_block.max(wal_block).max(pending_block_number);
-    }
+    info!("Allocating root/pending/wal");
+    let crate::storage::IndexBootstrapBlocks { root_block, .. } =
+        crate::storage::initialize_index_storage(index_relation, false)
+            .unwrap_or_else(|e| error!("failed to initialize index storage: {e:#?}"));
     let flush_threshold = flush_threshold_bytes();
     let maintenance_budget_bytes = maintenance_work_mem_bytes();
     let seen = try_parallel_build(
