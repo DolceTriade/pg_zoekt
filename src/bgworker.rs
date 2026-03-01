@@ -214,15 +214,16 @@ fn enumerate_candidates(
                WHERE a.amname = 'pg_zoekt' AND i.indisvalid AND i.indisready \
                ORDER BY i.indexrelid";
 
-    let index_oids: Vec<pg_sys::Oid> = Spi::connect_mut(|client| -> spi::Result<Vec<pg_sys::Oid>> {
-        let mut out = Vec::new();
-        for row in client.select(sql, None, &[])? {
-            if let Some(oid) = row.get::<pg_sys::Oid>(1)? {
-                out.push(oid);
+    let index_oids: Vec<pg_sys::Oid> =
+        Spi::connect_mut(|client| -> spi::Result<Vec<pg_sys::Oid>> {
+            let mut out = Vec::new();
+            for row in client.select(sql, None, &[])? {
+                if let Some(oid) = row.get::<pg_sys::Oid>(1)? {
+                    out.push(oid);
+                }
             }
-        }
-        Ok(out)
-    })?;
+            Ok(out)
+        })?;
 
     let mut candidates = Vec::new();
     for oid in index_oids {
@@ -285,24 +286,28 @@ fn run_worker_cycle() {
     for candidate in select_candidates(&candidates, max_indexes, mode) {
         let start = std::time::Instant::now();
         let result = match candidate.reason {
-            WorkReason::SealBacklog => PgTryBuilder::new(|| crate::am::bgworker_try_seal(candidate.index_oid))
-                .catch_others(|e| {
-                    warning!(
-                        "pg_zoekt bgworker seal failed for index {}: {e:?}",
-                        candidate.index_oid
-                    );
-                    Err(anyhow::anyhow!("bgworker seal failed"))
-                })
-                .execute(),
-            WorkReason::SegmentPressure => PgTryBuilder::new(|| crate::am::bgworker_try_merge(candidate.index_oid))
-                .catch_others(|e| {
-                    warning!(
-                        "pg_zoekt bgworker merge failed for index {}: {e:?}",
-                        candidate.index_oid
-                    );
-                    Err(anyhow::anyhow!("bgworker merge failed"))
-                })
-                .execute(),
+            WorkReason::SealBacklog => {
+                PgTryBuilder::new(|| crate::am::bgworker_try_seal(candidate.index_oid))
+                    .catch_others(|e| {
+                        warning!(
+                            "pg_zoekt bgworker seal failed for index {}: {e:?}",
+                            candidate.index_oid
+                        );
+                        Err(anyhow::anyhow!("bgworker seal failed"))
+                    })
+                    .execute()
+            }
+            WorkReason::SegmentPressure => {
+                PgTryBuilder::new(|| crate::am::bgworker_try_merge(candidate.index_oid))
+                    .catch_others(|e| {
+                        warning!(
+                            "pg_zoekt bgworker merge failed for index {}: {e:?}",
+                            candidate.index_oid
+                        );
+                        Err(anyhow::anyhow!("bgworker merge failed"))
+                    })
+                    .execute()
+            }
         };
 
         match result {

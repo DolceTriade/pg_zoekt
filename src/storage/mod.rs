@@ -170,7 +170,11 @@ pub fn segment_merge_eligible(
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-pub fn test_set_large_segment_policy(large_bytes: u64, dead_ratio_bps: u32, min_reclaim_bytes: u64) {
+pub fn test_set_large_segment_policy(
+    large_bytes: u64,
+    dead_ratio_bps: u32,
+    min_reclaim_bytes: u64,
+) {
     LARGE_SEGMENT_BYTES.store(large_bytes, Ordering::Relaxed);
     LARGE_SEGMENT_DEAD_RATIO_BPS.store(dead_ratio_bps, Ordering::Relaxed);
     LARGE_SEGMENT_MIN_RECLAIM_BYTES.store(min_reclaim_bytes, Ordering::Relaxed);
