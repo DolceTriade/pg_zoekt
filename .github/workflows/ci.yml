@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  pgrx-test:
+    runs-on: ubuntu-24.04
+    container:
+      image: node:trixie
+    env:
+      CARGO_HOME: /github/home/.cargo
+      DEBIAN_FRONTEND: noninteractive
+      PGRX_HOME: /github/home/.pgrx
+      RUSTUP_HOME: /github/home/.rustup
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            gnupg
+          install -d /usr/share/postgresql-common/pgdg
+          curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            git \
+            libclang-dev \
+            libssl-dev \
+            pkg-config \
+            postgresql-18 \
+            postgresql-server-dev-18 \
+            sudo
+          if ! id postgres >/dev/null 2>&1; then
+            useradd --system --create-home --shell /bin/bash postgres
+          fi
+          install -d -o postgres -g postgres /var/tmp/pg_zoekt-pgdata
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install cargo-pgrx
+        run: |
+          if ! command -v cargo-pgrx >/dev/null 2>&1; then
+            cargo install cargo-pgrx --version 0.17.0 --locked
+          fi
+
+      - name: Initialize pgrx for PostgreSQL 18
+        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+
+      - name: Run extension tests
+        run: cargo pgrx test pg18 --runas postgres --pgdata /var/tmp/pg_zoekt-pgdata
+
+      - name: Get logs
+        if: 'always()'
+        run: nproc ; free -h ; df -h
