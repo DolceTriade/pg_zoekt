@@ -258,6 +258,20 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     Ok(())
 }
 
+pub fn bytes_used(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
+    let header_block =
+        ensure_pending_list(rel, root_block).context("bytes_used: ensure pending list")?;
+    let header_buf =
+        BlockBuffer::acquire(rel, header_block).context("bytes_used: acquire header block")?;
+    let header = header_buf
+        .as_struct::<PendingHeader>(0)
+        .context("bytes_used: pending header")?;
+    if header.magic != PENDING_MAGIC {
+        bail!("invalid pending header magic");
+    }
+    Ok(header.bytes_used)
+}
+
 pub fn detach_pending(rel: pg_sys::Relation, root_block: u32) -> Result<Option<u32>> {
     let header_block = ensure_pending_list(rel, root_block)?;
     let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)?;

@@ -10,6 +10,11 @@ mod implementation {
     use super::*;
     use anyhow::{Result as AnyResult, anyhow};
     use pgrx::iter::TableIterator;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub(super) const DEFAULT_AUTO_SEAL_PENDING_BYTES: u32 = 32 * 1024 * 1024;
+    pub(super) static AUTO_SEAL_PENDING_BYTES: AtomicU32 =
+        AtomicU32::new(DEFAULT_AUTO_SEAL_PENDING_BYTES);
 
     #[derive(Clone, Copy, Debug)]
     enum MaintenanceMode {
@@ -88,6 +93,45 @@ mod implementation {
         blk >= nblocks
     }
 
+    fn auto_seal_pending_bytes() -> u32 {
+        AUTO_SEAL_PENDING_BYTES.load(Ordering::Relaxed)
+    }
+
+    fn maybe_auto_seal(index_relation: pg_sys::Relation) {
+        if index_relation.is_null() {
+            return;
+        }
+
+        let pending_bytes = match crate::storage::pending::bytes_used(index_relation, 0) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warning!("auto seal skipped: failed to read pending bytes: {e:#}");
+                return;
+            }
+        };
+        let threshold = auto_seal_pending_bytes();
+        if pending_bytes < threshold {
+            return;
+        }
+
+        let index_oid = unsafe { (*index_relation).rd_id };
+        let (seen, appended_segments, skipped) =
+            seal_index(index_oid, crate::storage::MaintenanceLockMode::Try);
+        if skipped {
+            info!(
+                "auto seal skipped: index_oid={} pending_bytes={} threshold={} reason=maintenance_lock_busy",
+                index_oid, pending_bytes, threshold
+            );
+            return;
+        }
+        if seen > 0 {
+            info!(
+                "auto seal completed: index_oid={} pending_bytes={} threshold={} sealed_tuples={} appended_segments={}",
+                index_oid, pending_bytes, threshold, seen, appended_segments
+            );
+        }
+    }
+
     // --- Required callbacks -------------------------------------------------
 
     unsafe extern "C-unwind" fn ambuildempty(index_relation: pg_sys::Relation) {
@@ -143,6 +187,7 @@ mod implementation {
 
         crate::storage::pending::append_tid(_index_relation, 0, ctid)
             .unwrap_or_else(|err| error!("failed to append pending tid: {err:#?}"));
+        maybe_auto_seal(_index_relation);
         true
     }
 
@@ -346,20 +391,41 @@ mod implementation {
             return Ok(false);
         }
 
-        let victims: Vec<crate::storage::Segment> = existing
+        let mut victims: Vec<crate::storage::Segment> = existing
             .iter()
             .copied()
             .filter(|seg| victim_set.contains(seg))
             .collect();
+        let selected_before_gating = victims.len();
+        victims.retain(|seg| {
+            crate::storage::segment_merge_eligible(rel, seg, &tombstones).unwrap_or_else(|e| {
+                let seg_block = seg.block;
+                warning!(
+                    "merge skipped segment block {} during eligibility check: {e:#}",
+                    seg_block
+                );
+                false
+            })
+        });
+        if victims.len() < 2 {
+            info!(
+                "merge skipped after large-segment gating: selected_before={} selected_after={} required_victims={}",
+                selected_before_gating,
+                victims.len(),
+                required_victims
+            );
+            return Ok(false);
+        }
         let victim_total_bytes = victims
             .iter()
             .fold(0u64, |acc, seg| acc.saturating_add(seg.size));
         info!(
-            "merge_segments decision: seg_count={} target={} recent_hint={} required_victims={} selected_victims={} selected_victim_bytes={}",
+            "merge_segments decision: seg_count={} target={} recent_hint={} required_victims={} selected_before_gating={} selected_victims={} selected_victim_bytes={}",
             seg_count,
             target,
             recent_segments_hint,
             required_victims,
+            selected_before_gating,
             victims.len(),
             victim_total_bytes
         );
@@ -367,7 +433,7 @@ mod implementation {
         let mut rewritten: Vec<crate::storage::Segment> = existing
             .iter()
             .copied()
-            .filter(|seg| !victim_set.contains(seg))
+            .filter(|seg| !victims.contains(seg))
             .collect();
         if replacement.block != pg_sys::InvalidBlockNumber {
             rewritten.push(replacement);
@@ -941,6 +1007,16 @@ mod implementation {
     }
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+fn test_set_auto_seal_pending_bytes(value: u32) {
+    implementation::AUTO_SEAL_PENDING_BYTES.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+fn test_reset_auto_seal_pending_bytes() {
+    test_set_auto_seal_pending_bytes(implementation::DEFAULT_AUTO_SEAL_PENDING_BYTES);
+}
+
 #[cfg(feature = "pg18")]
 #[allow(unused_imports)]
 pub use implementation::pg_zoekt_handler;
@@ -968,6 +1044,15 @@ unsafe fn test_amvacuumcleanup(
 mod tests {
     use pgrx::prelude::*;
     use std::collections::HashSet;
+
+    struct TestConfigGuard;
+
+    impl Drop for TestConfigGuard {
+        fn drop(&mut self) {
+            super::test_reset_auto_seal_pending_bytes();
+            crate::storage::test_reset_large_segment_policy();
+        }
+    }
 
     fn de_bruijn(k: &[u8], n: usize) -> String {
         // Classic de Bruijn sequence generator: returns a string where every length-n
@@ -3368,6 +3453,117 @@ mod tests {
 
             client.update("RESET enable_seqscan", None, &[])?;
             client.update("DROP TABLE adaptive_regex_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
+    pub fn test_auto_seal_makes_insert_visible() -> spi::Result<()> {
+        let _guard = TestConfigGuard;
+        super::test_set_auto_seal_pending_bytes(8);
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE auto_seal_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_auto_seal_docs_text_zoekt ON auto_seal_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO auto_seal_docs (text) VALUES ('auto seal needle')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO auto_seal_docs (text) VALUES ('auto seal followup')",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+            let count = client
+                .select(
+                    "SELECT count(*) FROM auto_seal_docs WHERE text LIKE '%needle%'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                count, 1,
+                "expected a later insert to auto-seal previously pending rows"
+            );
+            client.update("RESET enable_seqscan", None, &[])?;
+            client.update("DROP TABLE auto_seal_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
+    pub fn test_merge_skips_large_segments_without_deadness() -> spi::Result<()> {
+        let _guard = TestConfigGuard;
+        crate::storage::test_set_large_segment_policy(1, 9_000, 1);
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE gate_merge_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_gate_merge_docs_text_zoekt ON gate_merge_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            for i in 0..12 {
+                let sql = format!(
+                    "INSERT INTO gate_merge_docs (text) VALUES ('gate merge doc {}')",
+                    i
+                );
+                client.update(&sql, None, &[])?;
+                client.update(
+                    "SELECT * FROM pg_zoekt_maintain('idx_gate_merge_docs_text_zoekt'::regclass, 'seal', true)",
+                    None,
+                    &[],
+                )?;
+            }
+
+            let before = client
+                .select(
+                    "SELECT count(*) FROM pg_zoekt_index_segments('idx_gate_merge_docs_text_zoekt'::regclass)",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert!(
+                before as usize > crate::storage::TARGET_SEGMENTS,
+                "expected enough segments to trigger merge gating"
+            );
+
+            client.update(
+                "SELECT * FROM pg_zoekt_maintain('idx_gate_merge_docs_text_zoekt'::regclass, 'merge', true)",
+                None,
+                &[],
+            )?;
+
+            let after = client
+                .select(
+                    "SELECT count(*) FROM pg_zoekt_index_segments('idx_gate_merge_docs_text_zoekt'::regclass)",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(after, before, "expected large-segment gating to skip merge");
+
+            client.update("DROP TABLE gate_merge_docs", None, &[])?;
             Ok(())
         })
     }

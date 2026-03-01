@@ -4,9 +4,21 @@ use pgrx::prelude::*;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 pub const TARGET_SEGMENTS: usize = 10;
+pub const DEFAULT_LARGE_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_LARGE_SEGMENT_DEAD_RATIO_BPS: u32 = 2_500;
+pub const DEFAULT_LARGE_SEGMENT_MIN_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+pub const SEGMENT_DEADNESS_SAMPLE_ENTRIES: usize = 32;
+pub const SEGMENT_DEADNESS_SAMPLE_DOCS_PER_ENTRY: usize = 128;
+
+static LARGE_SEGMENT_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_LARGE_SEGMENT_BYTES);
+static LARGE_SEGMENT_DEAD_RATIO_BPS: AtomicU32 =
+    AtomicU32::new(DEFAULT_LARGE_SEGMENT_DEAD_RATIO_BPS);
+static LARGE_SEGMENT_MIN_RECLAIM_BYTES: AtomicU64 =
+    AtomicU64::new(DEFAULT_LARGE_SEGMENT_MIN_RECLAIM_BYTES);
 
 pub mod decode;
 pub mod encode;
@@ -26,6 +38,152 @@ pub const SEGMENT_LIST_MAGIC: u32 = u32::from_ne_bytes(*b"lZKT");
 pub const SEGMENT_EXTENT_MAGIC: u32 = u32::from_ne_bytes(*b"eZKT");
 pub const TOMBSTONE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"tZKT");
 pub const FREE_PAGE_MAGIC: u32 = u32::from_ne_bytes(*b"fZKT");
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeadnessEstimate {
+    pub sampled_docs: u64,
+    pub sampled_dead_docs: u64,
+    pub estimated_dead_ratio: f64,
+    pub estimated_reclaim_bytes: u64,
+}
+
+pub fn large_segment_bytes() -> u64 {
+    LARGE_SEGMENT_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn large_segment_dead_ratio() -> f64 {
+    LARGE_SEGMENT_DEAD_RATIO_BPS.load(Ordering::Relaxed) as f64 / 10_000.0
+}
+
+pub fn large_segment_min_reclaim_bytes() -> u64 {
+    LARGE_SEGMENT_MIN_RECLAIM_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn estimate_segment_deadness(
+    rel: pg_sys::Relation,
+    segment: &Segment,
+    tombstones: &tombstone::Snapshot,
+) -> Result<DeadnessEstimate> {
+    let segment_block = segment.block;
+    let segment_size = segment.size;
+    let entries = read_segment_entries(rel, segment)?;
+    if entries.is_empty() {
+        return Ok(DeadnessEstimate::default());
+    }
+
+    let sample_count = entries.len().min(SEGMENT_DEADNESS_SAMPLE_ENTRIES);
+    let mut sampled_docs = 0u64;
+    let mut sampled_dead_docs = 0u64;
+    let mut last_idx: Option<usize> = None;
+
+    for sample_idx in 0..sample_count {
+        let idx = if sample_count == 1 {
+            0
+        } else {
+            sample_idx.saturating_mul(entries.len().saturating_sub(1)) / (sample_count - 1)
+        };
+        if last_idx == Some(idx) {
+            continue;
+        }
+        last_idx = Some(idx);
+
+        let entry = &entries[idx];
+        let mut cursor = match unsafe { decode::PostingCursor::new(rel, entry) } {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                warning!(
+                    "estimate_segment_deadness: failed to open posting cursor for segment block {}: {e:#}",
+                    segment_block
+                );
+                continue;
+            }
+        };
+
+        let mut per_entry_docs = 0usize;
+        while per_entry_docs < SEGMENT_DEADNESS_SAMPLE_DOCS_PER_ENTRY {
+            match cursor.advance() {
+                Ok(true) => {
+                    let Some(doc) = cursor.current() else {
+                        continue;
+                    };
+                    sampled_docs = sampled_docs.saturating_add(1);
+                    if tombstones.contains(doc.tid) {
+                        sampled_dead_docs = sampled_dead_docs.saturating_add(1);
+                    }
+                    per_entry_docs += 1;
+                }
+                Ok(false) => break,
+                Err(e) => {
+                    warning!(
+                        "estimate_segment_deadness: failed to advance posting cursor for segment block {}: {e:#}",
+                        segment_block
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    if sampled_docs == 0 {
+        return Ok(DeadnessEstimate::default());
+    }
+
+    let estimated_dead_ratio = sampled_dead_docs as f64 / sampled_docs as f64;
+    let estimated_reclaim_bytes = ((segment_size as f64) * estimated_dead_ratio) as u64;
+    Ok(DeadnessEstimate {
+        sampled_docs,
+        sampled_dead_docs,
+        estimated_dead_ratio,
+        estimated_reclaim_bytes,
+    })
+}
+
+pub fn segment_merge_eligible(
+    rel: pg_sys::Relation,
+    segment: &Segment,
+    tombstones: &tombstone::Snapshot,
+) -> Result<bool> {
+    let segment_block = segment.block;
+    let segment_size = segment.size;
+    if segment_size < large_segment_bytes() {
+        return Ok(true);
+    }
+
+    let estimate = estimate_segment_deadness(rel, segment, tombstones)?;
+    let ratio_threshold = large_segment_dead_ratio();
+    let reclaim_threshold = large_segment_min_reclaim_bytes();
+    let eligible = estimate.estimated_dead_ratio >= ratio_threshold
+        && estimate.estimated_reclaim_bytes >= reclaim_threshold;
+    info!(
+        "segment_merge_eligible: block={} size={} sampled_docs={} sampled_dead_docs={} estimated_dead_ratio={:.4} ratio_threshold={:.4} estimated_reclaim_bytes={} reclaim_threshold={} eligible={}",
+        segment_block,
+        segment_size,
+        estimate.sampled_docs,
+        estimate.sampled_dead_docs,
+        estimate.estimated_dead_ratio,
+        ratio_threshold,
+        estimate.estimated_reclaim_bytes,
+        reclaim_threshold,
+        eligible
+    );
+    Ok(eligible)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn test_set_large_segment_policy(large_bytes: u64, dead_ratio_bps: u32, min_reclaim_bytes: u64) {
+    LARGE_SEGMENT_BYTES.store(large_bytes, Ordering::Relaxed);
+    LARGE_SEGMENT_DEAD_RATIO_BPS.store(dead_ratio_bps, Ordering::Relaxed);
+    LARGE_SEGMENT_MIN_RECLAIM_BYTES.store(min_reclaim_bytes, Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn test_reset_large_segment_policy() {
+    test_set_large_segment_policy(
+        DEFAULT_LARGE_SEGMENT_BYTES,
+        DEFAULT_LARGE_SEGMENT_DEAD_RATIO_BPS,
+        DEFAULT_LARGE_SEGMENT_MIN_RECLAIM_BYTES,
+    );
+}
 
 #[derive(Debug, TryFromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
 #[repr(C, packed)]

@@ -73,6 +73,14 @@ struct Args {
     /// TOAST compression setting for bench_realworld.doc
     #[arg(long, value_enum, default_value_t = ToastCompression::Default)]
     toast_compression: ToastCompression,
+
+    /// Fraction of rows to tombstone+delete before running reclaim maintenance.
+    #[arg(long, default_value_t = 0.0)]
+    delete_fraction: f64,
+
+    /// Run reclaim maintenance after creating tombstones and deleting rows.
+    #[arg(long, default_value_t = false)]
+    run_reclaim: bool,
 }
 
 struct ConnectionMetadata {
@@ -105,6 +113,16 @@ struct QueryResult {
     runtime_ms: f64,
     match_count: u64,
     plan: String,
+}
+
+struct ReclaimResult {
+    delete_fraction: f64,
+    deleted_rows: u64,
+    maintenance_ms: f64,
+    index_bytes_before: i64,
+    index_bytes_after: i64,
+    reclaimed_bytes: i64,
+    skipped_busy: bool,
 }
 
 fn main() -> Result<()> {
@@ -215,6 +233,12 @@ fn run_benchmark(
         index_duration_ms
     );
 
+    let reclaim_result = if args.run_reclaim && args.delete_fraction > 0.0 {
+        Some(run_reclaim_phase(client, args.rows, args.delete_fraction)?)
+    } else {
+        None
+    };
+
     let mut query_results = Vec::new();
     for spec in QUERY_SPECS {
         eprintln!("Running {} query", spec.name);
@@ -257,6 +281,7 @@ fn run_benchmark(
         args.toast_compression,
         index_duration_ms,
         conn_meta,
+        reclaim_result.as_ref(),
         &query_results,
     );
     eprintln!(
@@ -268,10 +293,65 @@ fn run_benchmark(
             args.toast_compression,
             index_duration_ms,
             conn_meta,
+            reclaim_result.as_ref(),
             &query_results
         )
     );
     Ok((report, index_duration_ms))
+}
+
+fn run_reclaim_phase(client: &mut Client, total_rows: u64, delete_fraction: f64) -> Result<ReclaimResult> {
+    let bounded_fraction = delete_fraction.clamp(0.0, 1.0);
+    let deleted_rows = ((total_rows as f64) * bounded_fraction).round() as u64;
+    if deleted_rows == 0 {
+        return Ok(ReclaimResult {
+            delete_fraction: bounded_fraction,
+            deleted_rows: 0,
+            maintenance_ms: 0.0,
+            index_bytes_before: 0,
+            index_bytes_after: 0,
+            reclaimed_bytes: 0,
+            skipped_busy: false,
+        });
+    }
+
+    let index_bytes_before: i64 = client
+        .query_one("SELECT pg_relation_size('idx_bench_realworld_zoekt'::regclass)", &[])?
+        .get(0);
+    let delete_limit = deleted_rows as i64;
+    let tombstone_sql = format!(
+        "SELECT pg_zoekt_tombstone(
+            'idx_bench_realworld_zoekt'::regclass,
+            array(SELECT ctid FROM bench_realworld WHERE id <= {delete_limit})
+        )"
+    );
+    client.batch_execute(&tombstone_sql)?;
+    let delete_sql = format!("DELETE FROM bench_realworld WHERE id <= {delete_limit}");
+    client.batch_execute(&delete_sql)?;
+
+    let maintenance_start = Instant::now();
+    let skipped_busy: bool = client
+        .query_one(
+            "SELECT skipped_busy
+             FROM pg_zoekt_maintain('idx_bench_realworld_zoekt'::regclass, 'merge', true)",
+            &[],
+        )?
+        .get(0);
+    let maintenance_ms = maintenance_start.elapsed().as_secs_f64() * 1000.0;
+    let index_bytes_after: i64 = client
+        .query_one("SELECT pg_relation_size('idx_bench_realworld_zoekt'::regclass)", &[])?
+        .get(0);
+    let reclaimed_bytes = index_bytes_before.saturating_sub(index_bytes_after);
+
+    Ok(ReclaimResult {
+        delete_fraction: bounded_fraction,
+        deleted_rows,
+        maintenance_ms,
+        index_bytes_before,
+        index_bytes_after,
+        reclaimed_bytes,
+        skipped_busy,
+    })
 }
 
 fn build_document(base: &str, idx: u64, total_rows: u64, make_long: bool) -> String {
@@ -340,6 +420,7 @@ fn format_markdown_report(
     toast_compression: ToastCompression,
     index_duration_ms: f64,
     conn_meta: &ConnectionMetadata,
+    reclaim_result: Option<&ReclaimResult>,
     query_results: &[QueryResult],
 ) -> String {
     let now: DateTime<Utc> = Utc::now();
@@ -363,6 +444,16 @@ fn format_markdown_report(
         "**Index build + seal:** {:.3} ms\n\n",
         index_duration_ms
     ));
+    if let Some(reclaim) = reclaim_result {
+        report.push_str(&format!(
+            "**Reclaim phase:** delete_fraction={:.3}, deleted_rows={}, maintenance={:.3} ms, reclaimed_bytes={}, skipped_busy={}\n\n",
+            reclaim.delete_fraction,
+            reclaim.deleted_rows,
+            reclaim.maintenance_ms,
+            reclaim.reclaimed_bytes,
+            reclaim.skipped_busy
+        ));
+    }
 
     report.push_str("| Query | Plan Rows | Loops | Total Runtime (ms) | Actual Matches |\n");
     report.push_str("| --- | --- | --- | --- | --- |\n");
@@ -417,7 +508,47 @@ fn format_markdown_report(
         slowest_label, slowest_ms
     ));
     report.push_str(&format!("| Total matched rows | {} |\n", total_matches));
+    if let Some(reclaim) = reclaim_result {
+        report.push_str(&format!("| Reclaim deleted rows | {} |\n", reclaim.deleted_rows));
+        report.push_str(&format!(
+            "| Reclaim bytes recovered | {} |\n",
+            reclaim.reclaimed_bytes
+        ));
+        report.push_str(&format!(
+            "| Reclaim maintenance | {:.3} ms |\n",
+            reclaim.maintenance_ms
+        ));
+    }
     report.push_str("\n");
+
+    if let Some(reclaim) = reclaim_result {
+        report.push_str("## Reclaim Phase\n\n");
+        report.push_str(&format!(
+            "- **Delete fraction:** {:.3}\n",
+            reclaim.delete_fraction
+        ));
+        report.push_str(&format!("- **Deleted rows:** {}\n", reclaim.deleted_rows));
+        report.push_str(&format!(
+            "- **Maintenance runtime:** {:.3} ms\n",
+            reclaim.maintenance_ms
+        ));
+        report.push_str(&format!(
+            "- **Index bytes before:** {}\n",
+            reclaim.index_bytes_before
+        ));
+        report.push_str(&format!(
+            "- **Index bytes after:** {}\n",
+            reclaim.index_bytes_after
+        ));
+        report.push_str(&format!(
+            "- **Reclaimed bytes:** {}\n",
+            reclaim.reclaimed_bytes
+        ));
+        report.push_str(&format!(
+            "- **Skipped due to busy lock:** {}\n\n",
+            reclaim.skipped_busy
+        ));
+    }
 
     for result in query_results {
         report.push_str(&format!("## {} Query\n\n", result.name));
@@ -445,6 +576,7 @@ fn format_stderr_summary(
     toast_compression: ToastCompression,
     index_duration_ms: f64,
     conn_meta: &ConnectionMetadata,
+    reclaim_result: Option<&ReclaimResult>,
     query_results: &[QueryResult],
 ) -> String {
     let total_queries = query_results.len() as u64;
@@ -494,6 +626,16 @@ fn format_stderr_summary(
         toast_compression.label()
     ));
     out.push_str(&format!("Index build + seal: {:.3} ms\n", index_duration_ms));
+    if let Some(reclaim) = reclaim_result {
+        out.push_str(&format!(
+            "Reclaim: delete_fraction={:.3} deleted_rows={} runtime={:.3} ms reclaimed_bytes={} skipped_busy={}\n",
+            reclaim.delete_fraction,
+            reclaim.deleted_rows,
+            reclaim.maintenance_ms,
+            reclaim.reclaimed_bytes,
+            reclaim.skipped_busy
+        ));
+    }
     out.push_str(&format!(
         "Queries: {}  Total runtime: {:.3} ms  Avg: {:.3} ms\n",
         total_queries, total_runtime, average_runtime
