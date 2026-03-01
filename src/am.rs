@@ -46,13 +46,13 @@ mod implementation {
     }
 
     #[derive(Clone, Debug)]
-    struct MaintenanceResult {
+    pub(crate) struct MaintenanceResult {
         index_oid: pg_sys::Oid,
         mode: MaintenanceMode,
-        sealed_tuples: i64,
-        segments_before: i32,
-        segments_after: i32,
-        skipped_busy: bool,
+        pub(crate) sealed_tuples: i64,
+        pub(crate) segments_before: i32,
+        pub(crate) segments_after: i32,
+        pub(crate) skipped_busy: bool,
     }
 
     impl MaintenanceResult {
@@ -698,6 +698,36 @@ mod implementation {
         }
     }
 
+    pub(crate) fn bgworker_pending_bytes(index: pg_sys::Oid) -> AnyResult<u32> {
+        unsafe {
+            let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+            let bytes = crate::storage::pending::bytes_used(rel, 0)
+                .map_err(|e| anyhow!("failed to read pending bytes: {e:#}"));
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            bytes
+        }
+    }
+
+    pub(crate) fn bgworker_segment_count(index: pg_sys::Oid) -> i32 {
+        segment_count(index)
+    }
+
+    pub(crate) fn bgworker_try_seal(index: pg_sys::Oid) -> AnyResult<MaintenanceResult> {
+        run_maintenance(
+            index,
+            MaintenanceMode::Seal,
+            crate::storage::MaintenanceLockMode::Try,
+        )
+    }
+
+    pub(crate) fn bgworker_try_merge(index: pg_sys::Oid) -> AnyResult<MaintenanceResult> {
+        run_maintenance(
+            index,
+            MaintenanceMode::Merge,
+            crate::storage::MaintenanceLockMode::Try,
+        )
+    }
+
     fn truncate_index(
         index: pg_sys::Oid,
         lock_mode: crate::storage::MaintenanceLockMode,
@@ -1020,6 +1050,11 @@ fn test_reset_auto_seal_pending_bytes() {
 #[cfg(feature = "pg18")]
 #[allow(unused_imports)]
 pub use implementation::pg_zoekt_handler;
+
+#[cfg(feature = "pg18")]
+pub(crate) use implementation::{
+    bgworker_pending_bytes, bgworker_segment_count, bgworker_try_merge, bgworker_try_seal,
+};
 
 #[cfg(any(test, feature = "pg_test"))]
 unsafe fn test_ambulkdelete(

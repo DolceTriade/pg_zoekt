@@ -1,4 +1,7 @@
+use pgrx::pg_guard;
+
 mod am;
+mod bgworker;
 mod build;
 mod context;
 mod introspect;
@@ -10,6 +13,11 @@ mod storage;
 mod trgm;
 
 ::pgrx::pg_module_magic!(name, version);
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    bgworker::init();
+}
 
 /// This module is required by `cargo pgrx test` invocations.
 /// It must be visible at the root of your extension crate.
