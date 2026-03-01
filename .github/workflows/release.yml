@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      tarball_name: ${{ steps.meta.outputs.tarball_name }}
+    env:
+      CARGO_HOME: /github/home/.cargo
+      DEBIAN_FRONTEND: noninteractive
+      PGRX_HOME: /github/home/.pgrx
+      RUSTUP_HOME: /github/home/.rustup
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Derive artifact metadata
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            IMAGE_TAG="$GITHUB_REF_NAME"
+          else
+            IMAGE_TAG="sha-$(printf '%s' "$GITHUB_SHA" | cut -c 1-7)"
+          fi
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "tarball_name=pg_zoekt-${VERSION}-pg18-trixie.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            gnupg
+          install -d /usr/share/postgresql-common/pgdg
+          curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            git \
+            libclang-dev \
+            libssl-dev \
+            pkg-config \
+            postgresql-18 \
+            postgresql-server-dev-18
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install cargo-pgrx
+        run: |
+          if ! command -v cargo-pgrx >/dev/null 2>&1; then
+            cargo install cargo-pgrx --version 0.17.0 --locked
+          fi
+
+      - name: Initialize pgrx for PostgreSQL 18
+        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+
+      - name: Build packaged extension
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config --out-dir dist/package
+
+      - name: Create release tarball
+        run: tar -C dist/package -czf "dist/${{ steps.meta.outputs.tarball_name }}" .
+
+      - name: Upload packaged extension tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-extension-root
+          path: dist/package
+
+      - name: Upload release tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.tarball_name }}
+          path: dist/${{ steps.meta.outputs.tarball_name }}
+
+      - name: Attach tarball to GitHub release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.meta.outputs.tarball_name }}
+
+  container-image:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download packaged extension tree
+        uses: actions/download-artifact@v4
+        with:
+          name: packaged-extension-root
+          path: dist/package
+
+      - name: Compute image name
+        id: image
+        run: |
+          REPOSITORY="$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build OCI image archive
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/release-image.Dockerfile
+          outputs: type=oci,dest=/tmp/pg_zoekt-postgres18-${{ needs.package.outputs.image_tag }}.tar
+          tags: ${{ steps.image.outputs.name }}:${{ needs.package.outputs.image_tag }}
+
+      - name: Upload OCI image archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg_zoekt-postgres18-${{ needs.package.outputs.image_tag }}.tar
+          path: /tmp/pg_zoekt-postgres18-${{ needs.package.outputs.image_tag }}.tar
+
+      - name: Log in to GHCR
+        if: github.event_name == 'release'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push release image to GHCR
+        if: github.event_name == 'release'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/release-image.Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ needs.package.outputs.image_tag }}
