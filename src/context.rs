@@ -1,6 +1,8 @@
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
+use pgrx::JsonB;
 use regex::RegexBuilder;
+use serde_json::json;
 
 #[pg_extern]
 pub fn pg_zoekt_extract_context_with_highlight(
@@ -12,11 +14,12 @@ pub fn pg_zoekt_extract_context_with_highlight(
     'static,
     (
         name!(match_line_number, i32),
+        name!(snippet_start_line_number, i32),
         name!(context_snippet, String),
+        name!(match_spans, JsonB),
     ),
 > {
-    let pattern = format!("({})", p_substring);
-    let regex = RegexBuilder::new(&pattern)
+    let regex = RegexBuilder::new(p_substring)
         .case_insensitive(!p_case_sensitive)
         .build()
         .unwrap_or_else(|e| error!("invalid regex: {e}"));
@@ -64,16 +67,49 @@ pub fn pg_zoekt_extract_context_with_highlight(
                 snippet.push('\n');
             }
             let (line_start, line_end) = lines[line_idx];
-            let line = &p_text[line_start..line_end];
-            if line_idx == match_idx {
-                let highlighted = regex.replace_all(line, "<mark>$1</mark>");
-                snippet.push_str(&highlighted);
+            snippet.push_str(&p_text[line_start..line_end]);
+        }
+
+        let snippet_start_line_number = (start_idx + 1) as i32;
+        let match_line_number = (match_idx + 1) as i32;
+        let match_line = &p_text[lines[match_idx].0..lines[match_idx].1];
+        let line_offset_bytes = if match_idx == start_idx {
+            0usize
+        } else {
+            let previous_start = lines[start_idx].0;
+            let previous_end = lines[match_idx - 1].1;
+            previous_end - previous_start + 1
+        };
+
+        let mut spans = Vec::new();
+        let mut search_start = 0usize;
+        while search_start <= match_line.len() {
+            let Some(found) = regex.find_at(match_line, search_start) else {
+                break;
+            };
+
+            spans.push(json!({
+                "start": line_offset_bytes + found.start(),
+                "end": line_offset_bytes + found.end(),
+            }));
+
+            if found.end() <= found.start() {
+                if let Some(next_ch) = match_line[found.start()..].chars().next() {
+                    search_start = found.start() + next_ch.len_utf8();
+                } else {
+                    break;
+                }
             } else {
-                snippet.push_str(line);
+                search_start = found.end();
             }
         }
 
-        results.push(((match_idx + 1) as i32, snippet));
+        results.push((
+            match_line_number,
+            snippet_start_line_number,
+            snippet,
+            JsonB(serde_json::Value::Array(spans)),
+        ));
     }
 
     TableIterator::new(results.into_iter())
@@ -89,18 +125,20 @@ mod tests {
         let text = "alpha\nneedle here\nbeta\nneedle again\nomega";
         Spi::connect_mut(|client| -> spi::Result<()> {
             let rows = client.select(
-                "SELECT match_line_number, context_snippet \
+                "SELECT match_line_number, snippet_start_line_number, context_snippet, match_spans::text \
                  FROM pg_zoekt_extract_context_with_highlight($1, $2, $3, $4) \
                  ORDER BY match_line_number",
                 None,
                 &[text.into(), "needle".into(), 1.into(), true.into()],
             )?;
-            let results: Vec<(i32, String)> = rows
+            let results: Vec<(i32, i32, String, String)> = rows
                 .into_iter()
                 .map(|row| {
                     Ok((
                         row.get::<i32>(1)?.expect("line number"),
-                        row.get::<String>(2)?.expect("snippet"),
+                        row.get::<i32>(2)?.expect("snippet start line number"),
+                        row.get::<String>(3)?.expect("snippet"),
+                        row.get::<String>(4)?.expect("match spans"),
                     ))
                 })
                 .collect::<spi::Result<_>>()?;
@@ -108,11 +146,21 @@ mod tests {
             assert_eq!(results.len(), 2);
             assert_eq!(
                 results[0],
-                (2, "alpha\n<mark>needle</mark> here\nbeta".to_string())
+                (
+                    2,
+                    1,
+                    "alpha\nneedle here\nbeta".to_string(),
+                    "[{\"end\": 12, \"start\": 6}]".to_string(),
+                )
             );
             assert_eq!(
                 results[1],
-                (4, "beta\n<mark>needle</mark> again\nomega".to_string())
+                (
+                    4,
+                    3,
+                    "beta\nneedle again\nomega".to_string(),
+                    "[{\"end\": 11, \"start\": 5}]".to_string(),
+                )
             );
             Ok(())
         })
@@ -122,17 +170,24 @@ mod tests {
     fn test_extract_context_highlight_case_insensitive() -> spi::Result<()> {
         let text = "First line\nNeedle in caps\nLast line";
         Spi::connect_mut(|client| -> spi::Result<()> {
-            let snippet = client
+            let row = client
                 .select(
-                    "SELECT context_snippet \
+                    "SELECT match_line_number, snippet_start_line_number, context_snippet, match_spans::text \
                      FROM pg_zoekt_extract_context_with_highlight($1, $2, $3, $4)",
                     None,
                     &[text.into(), "needle".into(), 0.into(), false.into()],
                 )?
-                .first()
-                .get::<String>(1)?
-                .unwrap_or_default();
-            assert_eq!(snippet, "<mark>Needle</mark> in caps");
+                .first();
+            assert_eq!(row.get::<i32>(1)?.unwrap_or_default(), 2);
+            assert_eq!(row.get::<i32>(2)?.unwrap_or_default(), 2);
+            assert_eq!(
+                row.get::<String>(3)?.unwrap_or_default(),
+                "Needle in caps".to_string()
+            );
+            assert_eq!(
+                row.get::<String>(4)?.unwrap_or_default(),
+                "[{\"end\": 6, \"start\": 0}]".to_string()
+            );
             Ok(())
         })
     }
@@ -141,17 +196,47 @@ mod tests {
     fn test_extract_context_highlight_negative_context() -> spi::Result<()> {
         let text = "line one\nmatch me\nline three";
         Spi::connect_mut(|client| -> spi::Result<()> {
-            let snippet = client
+            let row = client
                 .select(
-                    "SELECT context_snippet \
+                    "SELECT match_line_number, snippet_start_line_number, context_snippet, match_spans::text \
                      FROM pg_zoekt_extract_context_with_highlight($1, $2, $3, $4)",
                     None,
                     &[text.into(), "match".into(), (-5).into(), true.into()],
                 )?
-                .first()
-                .get::<String>(1)?
-                .unwrap_or_default();
-            assert_eq!(snippet, "<mark>match</mark> me");
+                .first();
+            assert_eq!(row.get::<i32>(1)?.unwrap_or_default(), 2);
+            assert_eq!(row.get::<i32>(2)?.unwrap_or_default(), 2);
+            assert_eq!(row.get::<String>(3)?.unwrap_or_default(), "match me");
+            assert_eq!(
+                row.get::<String>(4)?.unwrap_or_default(),
+                "[{\"end\": 5, \"start\": 0}]".to_string()
+            );
+            Ok(())
+        })
+    }
+
+    #[pg_test]
+    fn test_extract_context_highlight_multiple_spans_same_line() -> spi::Result<()> {
+        let text = "zero\nneedle and needle\nlast";
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            let row = client
+                .select(
+                    "SELECT match_line_number, snippet_start_line_number, context_snippet, match_spans::text \
+                     FROM pg_zoekt_extract_context_with_highlight($1, $2, $3, $4)",
+                    None,
+                    &[text.into(), "needle".into(), 1.into(), true.into()],
+                )?
+                .first();
+            assert_eq!(row.get::<i32>(1)?.unwrap_or_default(), 2);
+            assert_eq!(row.get::<i32>(2)?.unwrap_or_default(), 1);
+            assert_eq!(
+                row.get::<String>(3)?.unwrap_or_default(),
+                "zero\nneedle and needle\nlast".to_string()
+            );
+            assert_eq!(
+                row.get::<String>(4)?.unwrap_or_default(),
+                "[{\"end\": 11, \"start\": 5}, {\"end\": 22, \"start\": 16}]".to_string()
+            );
             Ok(())
         })
     }

@@ -988,6 +988,7 @@ dependencies = [
  "pgrx-tests",
  "regex",
  "roaring",
+ "serde_json",
  "stream-vbyte",
  "zerocopy",
 ]

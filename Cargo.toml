@@ -29,6 +29,7 @@ delta-encoding = "0.4.10"
 pgrx = "0.17.0"
 regex = "1.11.2"
 roaring = "0.10.3"
+serde_json = "1.0"
 stream-vbyte = { version = "0.4.1", features = ["x86_ssse3", "x86_sse41"] }
 zerocopy = { version = "0.8.31", features = ["derive", "simd", "std"] }
 
