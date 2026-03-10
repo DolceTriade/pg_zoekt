@@ -337,6 +337,30 @@ mod implementation {
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
         let existing = crate::storage::segment_list_read(rel, rbl)?;
+        let mut valid_existing = Vec::with_capacity(existing.len());
+        let mut dropped_invalid = 0usize;
+        for seg in existing {
+            match crate::storage::validate_segment_root(rel, &seg) {
+                Ok(()) => valid_existing.push(seg),
+                Err(e) => {
+                    dropped_invalid = dropped_invalid.saturating_add(1);
+                    let seg_block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(seg.block)) };
+                    warning!(
+                        "merge dropped invalid segment root block {} before merge: {e:#}",
+                        seg_block
+                    );
+                }
+            }
+        }
+        if dropped_invalid > 0 {
+            crate::storage::segment_list_rewrite(rel, rbl, &valid_existing)?;
+            warning!(
+                "merge scrubbed {} invalid segment roots before merge; remaining_segments={}",
+                dropped_invalid,
+                valid_existing.len()
+            );
+        }
+        let existing = valid_existing;
         if existing.is_empty() {
             return Ok(false);
         }
@@ -1118,6 +1142,14 @@ mod tests {
             out.extend_from_slice(&prefix);
         }
         String::from_utf8(out).expect("ascii alphabet")
+    }
+
+    fn acquire_heavy_maintenance_test_lock() -> spi::Result<()> {
+        // pgrx runs pg_tests concurrently against one shared Postgres instance.
+        // Serialize the largest maintenance stress tests in CI so they do not
+        // crash the shared CI postmaster when both backends peak at once.
+        Spi::run("SELECT pg_advisory_xact_lock(2147483001)")?;
+        Ok(())
     }
 
     fn lookup_index_oid(relname: &str) -> spi::Result<pg_sys::Oid> {
@@ -2762,6 +2794,7 @@ mod tests {
 
     #[pg_test]
     pub fn test_maintain_merge_caps_segments() -> spi::Result<()> {
+        acquire_heavy_maintenance_test_lock()?;
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
                 "CREATE TABLE maintain_merge_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
@@ -3115,6 +3148,7 @@ mod tests {
 
     #[pg_test]
     pub fn test_parallel_full_maintenance_converges_segments() -> spi::Result<()> {
+        acquire_heavy_maintenance_test_lock()?;
         let max_parallel_workers =
             Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
                 .unwrap_or(0);

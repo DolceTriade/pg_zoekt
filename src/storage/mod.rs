@@ -1713,6 +1713,15 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
     Ok(all_entries)
 }
 
+pub fn validate_segment_root(rel: pg_sys::Relation, segment: &Segment) -> Result<()> {
+    let buf = pgbuffer::BlockBuffer::acquire(rel, segment.block)?;
+    let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+    if header.magic != BLOCK_MAGIC {
+        anyhow::bail!("invalid block magic while validating segment root");
+    }
+    Ok(())
+}
+
 pub fn resolve_leaf_for_trigram(
     rel: pg_sys::Relation,
     root_block: u32,
