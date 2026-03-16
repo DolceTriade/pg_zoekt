@@ -3,12 +3,19 @@ use pgrx::pg_sys::PgTryBuilder;
 use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockState {
+    Pinned,
+    Shared,
+    Exclusive,
+}
+
 #[derive(Debug)]
 pub struct BlockBuffer {
     buffer: pg_sys::Buffer,
     page: pg_sys::Page,
     wal: Option<GenericWAL>,
-    locked: bool,
+    lock_state: LockState,
 }
 
 pub const SPECIAL_SIZE: usize = align_down(
@@ -32,7 +39,11 @@ impl RelationExtensionLockGuard {
 
 impl Drop for RelationExtensionLockGuard {
     fn drop(&mut self) {
-        unsafe { pg_sys::UnlockRelationForExtension(self.rel, self.lockmode) };
+        unsafe {
+            if pg_sys::IsTransactionState() {
+                pg_sys::UnlockRelationForExtension(self.rel, self.lockmode);
+            }
+        };
     }
 }
 
@@ -40,23 +51,27 @@ const fn align_down(val: usize, align: usize) -> usize {
     val & !(align - 1)
 }
 
-fn ensure_block_in_range(rel: pg_sys::Relation, num: u32) -> Result<()> {
-    if rel.is_null() {
-        return Err(anyhow!("attempted to read buffer with null relation"));
+fn debug_assert_block_in_range(rel: pg_sys::Relation, num: u32) {
+    if !(cfg!(debug_assertions) || cfg!(feature = "pg_test")) {
+        return;
     }
-    if num == pg_sys::InvalidBlockNumber {
-        return Err(anyhow!("attempted to read invalid block number"));
-    }
+
+    assert!(
+        !rel.is_null(),
+        "attempted to read buffer with null relation"
+    );
+    assert!(
+        num != pg_sys::InvalidBlockNumber,
+        "attempted to read invalid block number"
+    );
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    if num >= nblocks {
-        return Err(anyhow!(
-            "block number out of range: {} (nblocks={})",
-            num,
-            nblocks
-        ));
-    }
-    Ok(())
+    assert!(
+        num < nblocks,
+        "block number out of range: {} (nblocks={})",
+        num,
+        nblocks
+    );
 }
 
 fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
@@ -67,20 +82,35 @@ fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
 }
 
 impl BlockBuffer {
-    pub fn acquire(rel: pg_sys::Relation, num: u32) -> Result<Self> {
-        ensure_block_in_range(rel, num)?;
+    pub fn acquire_pinned(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+        debug_assert_block_in_range(rel, num);
         let buffer = read_buffer(rel, num)?;
         let page = unsafe { pg_sys::BufferGetPage(buffer) };
         Ok(Self {
             buffer,
             page,
             wal: None,
-            locked: false,
+            lock_state: LockState::Pinned,
+        })
+    }
+
+    pub fn acquire(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+        debug_assert_block_in_range(rel, num);
+        let buffer = read_buffer(rel, num)?;
+        unsafe {
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        }
+        let page = unsafe { pg_sys::BufferGetPage(buffer) };
+        Ok(Self {
+            buffer,
+            page,
+            wal: None,
+            lock_state: LockState::Shared,
         })
     }
 
     pub fn aquire_mut(rel: pg_sys::Relation, num: u32) -> Result<Self> {
-        ensure_block_in_range(rel, num)?;
+        debug_assert_block_in_range(rel, num);
         let buffer = read_buffer(rel, num)?;
         unsafe {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
@@ -91,7 +121,7 @@ impl BlockBuffer {
             buffer,
             page,
             wal: Some(wal),
-            locked: true,
+            lock_state: LockState::Exclusive,
         })
     }
 
@@ -116,7 +146,7 @@ impl BlockBuffer {
             buffer,
             page,
             wal: Some(wal),
-            locked: true,
+            lock_state: LockState::Exclusive,
         }
     }
 
@@ -225,12 +255,15 @@ impl BlockBuffer {
 
 impl Drop for BlockBuffer {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            // Postgres cleans up buffer pins/locks during ERROR handling; avoid double release.
-            return;
+        unsafe {
+            if !pg_sys::IsTransactionState() {
+                // During transaction abort/commit Postgres owns buffer cleanup.
+                self.wal = None;
+                return;
+            }
         }
-        // Ensure generic WAL finishes before we release the buffer.
         if self.wal.is_some() {
+            // Finish generic WAL before releasing the buffer on the normal path.
             _ = self.wal.take();
             unsafe {
                 pg_sys::MarkBufferDirty(self.buffer);
@@ -238,12 +271,16 @@ impl Drop for BlockBuffer {
         }
         unsafe {
             if pg_sys::BufferIsValid(self.buffer) {
-                if self.locked {
-                    pg_sys::UnlockReleaseBuffer(self.buffer);
-                } else {
-                    pg_sys::ReleaseBuffer(self.buffer);
+                match self.lock_state {
+                    LockState::Pinned => {
+                        pg_sys::ReleaseBuffer(self.buffer);
+                    }
+                    LockState::Shared | LockState::Exclusive => {
+                        pg_sys::UnlockReleaseBuffer(self.buffer);
+                    }
                 }
             }
+            return;
         }
     }
 }
@@ -293,6 +330,12 @@ impl GenericWAL {
 
 impl Drop for GenericWAL {
     fn drop(&mut self) {
+        unsafe {
+            if !pg_sys::IsTransactionState() {
+                _ = self.state.take();
+                return;
+            }
+        }
         if let Some(state) = self.state
             && !state.is_null()
         {
@@ -347,7 +390,7 @@ mod tests {
     }
 
     #[pg_test]
-    pub fn test_acquire_does_not_hold_buffer_lock() -> spi::Result<()> {
+    pub fn test_acquire_holds_shared_buffer_lock() -> spi::Result<()> {
         let sql = "
             CREATE TABLE lock_probe (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
         ";
@@ -366,13 +409,68 @@ mod tests {
         };
 
         let buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
-        let buffer_id = buff.buffer;
-        unsafe {
-            // If acquire left a share lock, conditional exclusive lock would fail.
-            assert!(pg_sys::ConditionalLockBuffer(buffer_id));
-            pg_sys::LockBuffer(buffer_id, pg_sys::BUFFER_LOCK_UNLOCK as i32);
-        }
+        assert_eq!(
+            buff.lock_state,
+            LockState::Shared,
+            "acquire should record a shared content lock"
+        );
         drop(buff);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_acquire_pinned_records_pinned_state() -> spi::Result<()> {
+        let sql = "
+            CREATE TABLE pinned_probe (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
+        ";
+        Spi::run(sql)?;
+
+        let table = "public.pinned_probe";
+        let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
+        let blkno = {
+            let mut buff = BlockBuffer::allocate(relation.as_ptr());
+            let block = buff.block_number();
+            let s = CString::new("probe").expect("string made");
+            unsafe {
+                std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
+            }
+            block
+        };
+
+        let buff = BlockBuffer::acquire_pinned(relation.as_ptr(), blkno).expect("acquire buffer");
+        assert_eq!(
+            buff.lock_state,
+            LockState::Pinned,
+            "acquire_pinned should record a pinned buffer"
+        );
+        drop(buff);
+
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_acquire_panics_for_out_of_range_block_in_pg_test() -> spi::Result<()> {
+        let sql = "
+            CREATE TABLE panic_probe (id SERIAL PRIMARY KEY, text TEXT NOT NULL);
+        ";
+        Spi::run(sql)?;
+
+        let table = "public.panic_probe";
+        let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
+        let nblocks = unsafe {
+            pg_sys::RelationGetNumberOfBlocksInFork(
+                relation.as_ptr(),
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            )
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = BlockBuffer::acquire(relation.as_ptr(), nblocks);
+        }));
+        assert!(
+            panic.is_err(),
+            "out-of-range acquire should panic in pg_test"
+        );
 
         Ok(())
     }

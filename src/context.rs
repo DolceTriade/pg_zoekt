@@ -1,6 +1,6 @@
+use pgrx::JsonB;
 use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
-use pgrx::JsonB;
 use regex::RegexBuilder;
 use serde_json::json;
 

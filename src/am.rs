@@ -331,12 +331,20 @@ mod implementation {
                 return Ok(true);
             }
         };
-        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
-            .map_err(|e| anyhow!("{e}"))?;
-        let rbl = root
-            .as_struct_mut::<crate::storage::RootBlockList>(0)
-            .map_err(|e| anyhow!("{e}"))?;
-        let existing = crate::storage::segment_list_read(rel, rbl)?;
+        let (existing, tombstones) = {
+            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)
+                .map_err(|e| anyhow!("{e}"))?;
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .map_err(|e| anyhow!("{e}"))?;
+            let existing = crate::storage::segment_list_read(rel, rbl)?;
+            let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
+                .unwrap_or_else(|e| {
+                    warning!("failed to load tombstones during merge: {e:#?}");
+                    crate::storage::tombstone::Snapshot::default()
+                });
+            (existing, tombstones)
+        };
         let mut valid_existing = Vec::with_capacity(existing.len());
         let mut dropped_invalid = 0usize;
         for seg in existing {
@@ -344,7 +352,8 @@ mod implementation {
                 Ok(()) => valid_existing.push(seg),
                 Err(e) => {
                     dropped_invalid = dropped_invalid.saturating_add(1);
-                    let seg_block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(seg.block)) };
+                    let seg_block =
+                        unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(seg.block)) };
                     warning!(
                         "merge dropped invalid segment root block {} before merge: {e:#}",
                         seg_block
@@ -353,6 +362,11 @@ mod implementation {
             }
         }
         if dropped_invalid > 0 {
+            let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+                .map_err(|e| anyhow!("{e}"))?;
+            let rbl = root
+                .as_struct_mut::<crate::storage::RootBlockList>(0)
+                .map_err(|e| anyhow!("{e}"))?;
             crate::storage::segment_list_rewrite(rel, rbl, &valid_existing)?;
             warning!(
                 "merge scrubbed {} invalid segment roots before merge; remaining_segments={}",
@@ -364,11 +378,6 @@ mod implementation {
         if existing.is_empty() {
             return Ok(false);
         }
-        let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
-            .unwrap_or_else(|e| {
-                warning!("failed to load tombstones during merge: {e:#?}");
-                crate::storage::tombstone::Snapshot::default()
-            });
 
         let target = crate::storage::TARGET_SEGMENTS;
         let seg_count = existing.len();
@@ -463,6 +472,11 @@ mod implementation {
             rewritten.push(replacement);
         }
 
+        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rbl = root
+            .as_struct_mut::<crate::storage::RootBlockList>(0)
+            .map_err(|e| anyhow!("{e}"))?;
         crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
         info!(
             "merge_segments publish: kept_segments={} deferred_reclaim_segments={}",
@@ -1148,7 +1162,7 @@ mod tests {
         // pgrx runs pg_tests concurrently against one shared Postgres instance.
         // Serialize the largest maintenance stress tests in CI so they do not
         // crash the shared CI postmaster when both backends peak at once.
-        Spi::run("SELECT pg_advisory_xact_lock(2147483001)")?;
+        //Spi::run("SELECT pg_advisory_xact_lock(2147483001)")?;
         Ok(())
     }
 

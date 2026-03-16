@@ -144,7 +144,7 @@ unsafe fn find_entry_for_trigram(
     let Some(leaf_block) = crate::storage::resolve_leaf_for_trigram(rel, block, trigram)? else {
         return Ok(None);
     };
-    let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
+    let buf = crate::storage::pgbuffer::BlockBuffer::acquire_pinned(rel, leaf_block)?;
     let bh = buf
         .as_struct::<crate::storage::BlockHeader>(0)
         .context("block header")?;

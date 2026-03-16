@@ -431,8 +431,11 @@ const fn segment_list_capacity(version: u16) -> usize {
     (pgbuffer::SPECIAL_SIZE - header) / seg
 }
 
-fn segment_list_init_page(rel: pg_sys::Relation) -> Result<pgbuffer::BlockBuffer> {
-    let mut page = allocate_block(rel);
+fn segment_list_init_page(
+    rel: pg_sys::Relation,
+    root: &RootBlockList,
+) -> Result<pgbuffer::BlockBuffer> {
+    let mut page = allocate_block_with_root(rel, root);
     let hdr = page
         .as_struct_mut::<SegmentListPageHeader>(0)
         .context("segment list header")?;
@@ -457,7 +460,7 @@ pub fn segment_list_append(
 
     // Ensure we have a head/tail page.
     if root.segment_list_head == pg_sys::InvalidBlockNumber {
-        let page = segment_list_init_page(rel)?;
+        let page = segment_list_init_page(rel, root)?;
         let blk = page.block_number();
         root.segment_list_head = blk;
         root.segment_list_tail = blk;
@@ -479,7 +482,7 @@ pub fn segment_list_append(
         let avail = cap.saturating_sub(used);
         if avail == 0 {
             // Allocate next page and link it.
-            let next_page = segment_list_init_page(rel)?;
+            let next_page = segment_list_init_page(rel, root)?;
             let next_blk = next_page.block_number();
             {
                 let hdr = tail
@@ -734,7 +737,7 @@ pub fn segment_list_rewrite(
     segment_list_append(rel, root, segments)?;
     if old_head != pg_sys::InvalidBlockNumber {
         let old_pages = collect_segment_list_pages(rel, old_head)?;
-        free_blocks(rel, &old_pages)?;
+        free_blocks_with_meta(rel, root_meta(root), &old_pages)?;
     }
     Ok(())
 }
@@ -856,17 +859,37 @@ fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
     (block, offset, data_length)
 }
 
-fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
-    let root = match pgbuffer::BlockBuffer::acquire(rel, 0) {
-        Ok(root) => root,
-        Err(_) => return Ok(None),
-    };
+#[derive(Clone, Copy)]
+struct RootMeta {
+    magic: u32,
+    version: u16,
+    wal_block: u32,
+    pending_block: u32,
+    tombstone_block: u32,
+}
+
+fn root_meta(root: &RootBlockList) -> RootMeta {
+    RootMeta {
+        magic: root.magic,
+        version: root.version,
+        wal_block: root.wal_block,
+        pending_block: root.pending_block,
+        tombstone_block: root.tombstone_block,
+    }
+}
+
+fn read_root_meta(rel: pg_sys::Relation) -> Result<RootMeta> {
+    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
-    if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+    Ok(root_meta(rbl))
+}
+
+fn pop_free_block_with_meta(rel: pg_sys::Relation, meta: RootMeta) -> Result<Option<u32>> {
+    if meta.magic != ROOT_MAGIC || meta.wal_block == pg_sys::InvalidBlockNumber {
         return Ok(None);
     }
 
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, meta.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
@@ -908,7 +931,7 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
             wal.free_max_block = pg_sys::InvalidBlockNumber;
             break;
         }
-        if rbl.version >= 5 && wal.free_max_block == head {
+        if meta.version >= 5 && wal.free_max_block == head {
             wal.free_max_block = pg_sys::InvalidBlockNumber;
         }
         wal.free_head = free_hdr.next_block;
@@ -917,8 +940,8 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     Ok(None)
 }
 
-pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
-    match pop_free_block(rel) {
+fn allocate_block_with_meta(rel: pg_sys::Relation, meta: RootMeta) -> pgbuffer::BlockBuffer {
+    match pop_free_block_with_meta(rel, meta) {
         Ok(Some(block)) => {
             let mut page = match pgbuffer::BlockBuffer::aquire_mut(rel, block) {
                 Ok(page) => page,
@@ -930,11 +953,25 @@ pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
         _ => {
             let page = pgbuffer::BlockBuffer::allocate(rel);
             let block = page.block_number();
-            if let Err(err) = update_high_water_block(rel, block) {
+            if let Err(err) = update_high_water_block_with_meta(rel, meta, block) {
                 warning!("failed to update high-water mark: {err:#?}");
             }
             page
         }
+    }
+}
+
+pub(crate) fn allocate_block_with_root(
+    rel: pg_sys::Relation,
+    root: &RootBlockList,
+) -> pgbuffer::BlockBuffer {
+    allocate_block_with_meta(rel, root_meta(root))
+}
+
+pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
+    match read_root_meta(rel) {
+        Ok(meta) => allocate_block_with_meta(rel, meta),
+        Err(_) => pgbuffer::BlockBuffer::allocate(rel),
     }
 }
 
@@ -947,23 +984,20 @@ pub(crate) fn allocate_block_tracked(
     page
 }
 
-pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
+fn free_blocks_with_meta(rel: pg_sys::Relation, meta: RootMeta, blocks: &[u32]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
     }
-
-    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
-    let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
-    if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+    if meta.magic != ROOT_MAGIC || meta.wal_block == pg_sys::InvalidBlockNumber {
         return Ok(());
     }
 
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, meta.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
     let mut head = wal.free_head;
-    let mut free_max = if rbl.version >= 5 {
+    let mut free_max = if meta.version >= 5 {
         wal.free_max_block
     } else {
         pg_sys::InvalidBlockNumber
@@ -971,9 +1005,9 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
 
     for block in blocks {
         if *block == 0
-            || *block == rbl.wal_block
-            || *block == rbl.pending_block
-            || *block == rbl.tombstone_block
+            || *block == meta.wal_block
+            || *block == meta.pending_block
+            || *block == meta.tombstone_block
         {
             continue;
         }
@@ -984,15 +1018,20 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         header.magic = FREE_PAGE_MAGIC;
         header.next_block = head;
         head = *block;
-        if rbl.version >= 5 && (free_max == pg_sys::InvalidBlockNumber || *block > free_max) {
+        if meta.version >= 5 && (free_max == pg_sys::InvalidBlockNumber || *block > free_max) {
             free_max = *block;
         }
     }
     wal.free_head = head;
-    if rbl.version >= 5 {
+    if meta.version >= 5 {
         wal.free_max_block = free_max;
     }
     Ok(())
+}
+
+pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
+    let meta = read_root_meta(rel)?;
+    free_blocks_with_meta(rel, meta, blocks)
 }
 
 pub(crate) fn initialize_index_storage(
@@ -1059,13 +1098,16 @@ pub(crate) fn initialize_index_storage(
     })
 }
 
-fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {
-    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
-    let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
-    if rbl.magic != ROOT_MAGIC || rbl.version < 5 || rbl.wal_block == pg_sys::InvalidBlockNumber {
+fn update_high_water_block_with_meta(
+    rel: pg_sys::Relation,
+    meta: RootMeta,
+    block: u32,
+) -> Result<()> {
+    if meta.magic != ROOT_MAGIC || meta.version < 5 || meta.wal_block == pg_sys::InvalidBlockNumber
+    {
         return Ok(());
     }
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, meta.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
@@ -1083,7 +1125,7 @@ pub(crate) fn collect_segment_tree_blocks(
     if !out.insert(block) {
         return Ok(());
     }
-    let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+    let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, block)?;
     let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
     if header.magic != BLOCK_MAGIC {
         anyhow::bail!("invalid block magic while freeing segment");
@@ -1117,7 +1159,7 @@ pub(crate) fn collect_posting_blocks(
         if !out.insert(block) {
             break;
         }
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, block)?;
         let header = buf
             .as_struct::<PostingPageHeader>(0)
             .context("posting page header")?;
@@ -1157,7 +1199,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
         collect_segment_tree_blocks(rel, seg.block, &mut blocks)?;
         let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
         for leaf in leaf_blocks {
-            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
                 anyhow::bail!("invalid block magic while freeing segment");
@@ -1262,7 +1304,7 @@ fn collect_reachable_blocks(
         collect_segment_tree_blocks(rel, seg.block, &mut used)?;
         let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
         for leaf in leaf_blocks {
-            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
                 anyhow::bail!("invalid block magic while collecting reachable blocks");
@@ -1606,7 +1648,7 @@ impl SegmentCursor {
     }
 
     fn read_child_block(&self, block: u32, idx: usize) -> Result<u32> {
-        let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+        let buf = pgbuffer::BlockBuffer::acquire_pinned(self.rel, block)?;
         let header = Self::read_block_header(&buf)?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic while merging");
@@ -1617,7 +1659,7 @@ impl SegmentCursor {
 
     fn descend_leftmost(&mut self, mut block: u32) -> Result<()> {
         loop {
-            let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+            let buf = pgbuffer::BlockBuffer::acquire_pinned(self.rel, block)?;
             let header = Self::read_block_header(&buf)?;
             if header.magic != BLOCK_MAGIC {
                 anyhow::bail!("invalid block magic while merging");
@@ -1694,7 +1736,7 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
     let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
     let mut all_entries = Vec::new();
     for leaf_block in leaf_blocks {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
+        let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, leaf_block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic while merging");
@@ -1714,7 +1756,7 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
 }
 
 pub fn validate_segment_root(rel: pg_sys::Relation, segment: &Segment) -> Result<()> {
-    let buf = pgbuffer::BlockBuffer::acquire(rel, segment.block)?;
+    let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, segment.block)?;
     let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
     if header.magic != BLOCK_MAGIC {
         anyhow::bail!("invalid block magic while validating segment root");
@@ -1729,7 +1771,7 @@ pub fn resolve_leaf_for_trigram(
 ) -> Result<Option<u32>> {
     let mut block = root_block;
     loop {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic");
@@ -1761,7 +1803,7 @@ pub fn resolve_leaf_for_trigram(
 
 pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec<u32>> {
     fn collect(rel: pg_sys::Relation, block: u32, out: &mut Vec<u32>) -> Result<()> {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             anyhow::bail!("invalid block magic");

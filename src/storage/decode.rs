@@ -74,7 +74,7 @@ impl PostingReader {
                 nblocks
             );
         }
-        let buf = BlockBuffer::acquire(rel, block)?;
+        let buf = BlockBuffer::acquire_pinned(rel, block)?;
         let header_copy = {
             let header = buf
                 .as_struct::<super::PostingPageHeader>(0)
@@ -146,7 +146,7 @@ impl PostingReader {
                 nblocks
             );
         }
-        let next_buf = BlockBuffer::acquire(self.rel, next_block)?;
+        let next_buf = BlockBuffer::acquire_pinned(self.rel, next_block)?;
         let header_copy = {
             let header = next_buf
                 .as_struct::<super::PostingPageHeader>(0)

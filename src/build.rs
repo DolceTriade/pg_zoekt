@@ -345,6 +345,7 @@ fn finalize_segment_list(
         .expect("root header");
     crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
         .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    drop(root_buffer);
     if merged != existing {
         let cleanup_start = std::time::Instant::now();
         info!(
@@ -354,6 +355,15 @@ fn finalize_segment_list(
         );
         crate::storage::free_segments(index_relation, &existing)
             .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+        let root_buffer = match BlockBuffer::acquire(index_relation, root_block) {
+            Ok(root_buffer) => root_buffer,
+            Err(e) => {
+                error!("failed to acquire root buffer: {e:#?}");
+            }
+        };
+        let rbl = root_buffer
+            .as_struct::<crate::storage::RootBlockList>(0)
+            .expect("root header");
         crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
             .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
         info!(
