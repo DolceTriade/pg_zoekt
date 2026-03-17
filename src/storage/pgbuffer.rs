@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::PgTryBuilder;
 use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
@@ -61,8 +62,69 @@ fn ensure_block_in_range(rel: pg_sys::Relation, num: u32) -> Result<()> {
 
 fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
     PgTryBuilder::new(|| Ok(unsafe { pg_sys::ReadBuffer(rel, num) }))
-        .catch_others(|_| Err(anyhow!("ReadBuffer failed for block {}", num)))
-        .catch_rust_panic(|_| Err(anyhow!("ReadBuffer panicked for block {}", num)))
+        .catch_others(|error: CaughtError| {
+            let relid = if rel.is_null() {
+                0
+            } else {
+                unsafe { u32::from((*rel).rd_id) }
+            };
+            let nblocks = if rel.is_null() {
+                0
+            } else {
+                unsafe {
+                    pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                }
+            };
+            match error {
+                CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => Err(
+                    anyhow!(
+                        "ReadBuffer failed for rel {} block {} (nblocks={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
+                        relid,
+                        num,
+                        nblocks,
+                        report.message(),
+                        report.detail(),
+                        report.hint(),
+                        report.sql_error_code(),
+                        report.file(),
+                        report.line_number(),
+                    ),
+                ),
+                CaughtError::RustPanic { ereport, .. } => Err(anyhow!(
+                    "ReadBuffer failed for rel {} block {} (nblocks={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
+                    relid,
+                    num,
+                    nblocks,
+                    ereport.message(),
+                    ereport.detail(),
+                    ereport.hint(),
+                    ereport.sql_error_code(),
+                    ereport.file(),
+                    ereport.line_number(),
+                )),
+            }
+        })
+        .catch_rust_panic(|error: CaughtError| {
+            let relid = if rel.is_null() {
+                0
+            } else {
+                unsafe { u32::from((*rel).rd_id) }
+            };
+            let nblocks = if rel.is_null() {
+                0
+            } else {
+                unsafe {
+                    pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                }
+            };
+            Err(anyhow!(
+                "ReadBuffer panicked for rel {} block {} (nblocks={}): {:?}",
+                relid,
+                num,
+                nblocks,
+                error
+            ))
+        })
         .execute()
 }
 
