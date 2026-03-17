@@ -30,6 +30,10 @@ pub mod pg_test {
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         // return any postgresql.conf settings that are required for your tests
-        vec![]
+        vec![
+            // Raise the test cluster buffer pool so we can distinguish a real
+            // merge correctness bug from buffer-pin exhaustion under pgrx tests.
+            "shared_buffers = '1GB'",
+        ]
     }
 }
