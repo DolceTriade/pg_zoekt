@@ -144,9 +144,12 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
 
     while !cursor.is_empty() {
         let block = if let Some(blk) = existing.pop() {
+            super::log_block_event(rel, "reuse", blk, "tombstone_page");
             blk
         } else {
-            super::allocate_block_with_root(rel, root).block_number()
+            let block = super::allocate_block_with_root(rel, root).block_number();
+            super::log_block_event(rel, "init", block, "tombstone_page");
+            block
         };
         let chunk_len = cursor.len().min(chunk_cap);
         {

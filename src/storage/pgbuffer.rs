@@ -76,8 +76,14 @@ fn debug_assert_block_in_range(rel: pg_sys::Relation, num: u32) {
 
 fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
     PgTryBuilder::new(|| Ok(unsafe { pg_sys::ReadBuffer(rel, num) }))
-        .catch_others(|_| Err(anyhow!("ReadBuffer failed for block {}", num)))
-        .catch_rust_panic(|_| Err(anyhow!("ReadBuffer panicked for block {}", num)))
+        .catch_others(|_| {
+            warning!("buffer_read_failed: block={} path=postgres_error", num);
+            Err(anyhow!("ReadBuffer failed for block {}", num))
+        })
+        .catch_rust_panic(|_| {
+            warning!("buffer_read_failed: block={} path=rust_panic", num);
+            Err(anyhow!("ReadBuffer panicked for block {}", num))
+        })
         .execute()
 }
 

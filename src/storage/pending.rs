@@ -99,10 +99,12 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
         header.free = page_capacity() as u16;
         header.next_block = INVALID_BLOCK;
         *free_head = next;
+        super::log_block_event(rel, "reuse", block, "pending_page");
         return Ok(block);
     }
 
     let mut page = super::allocate_block(rel);
+    super::log_block_event(rel, "init", page.block_number(), "pending_page");
     let header = page
         .as_struct_mut::<PendingBucket>(0)
         .context("pending page header")?;
@@ -131,6 +133,7 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
         return Ok(rbl.pending_block);
     }
     let header_block = super::allocate_block(rel).block_number();
+    super::log_block_event(rel, "init", header_block, "pending_header");
     init_pending(rel, header_block).context("ensure_pending_list: init header")?;
     rbl.pending_block = header_block;
     if rbl.version < super::VERSION {
@@ -453,6 +456,7 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         page_header.free = page_capacity() as u16;
         page_header.next_block = header.free_head;
         header.free_head = *block;
+        super::log_block_event(rel, "free", *block, "pending_page");
     }
     Ok(())
 }

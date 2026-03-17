@@ -52,6 +52,7 @@ impl Encoder {
             }
             let mut leaf = super::allocate_block_tracked(rel, tracker_ptr);
             let leaf_block = leaf.block_number();
+            super::log_block_event(rel, "init", leaf_block, "segment_leaf_page");
             const BH_SIZE: usize = std::mem::size_of::<super::BlockHeader>();
             let bh = leaf
                 .as_struct_mut::<super::BlockHeader>(0)
@@ -217,6 +218,7 @@ pub(crate) fn build_segment_root(
         for chunk in current.chunks(per_page) {
             let mut page = super::allocate_block_tracked(rel, tracker);
             let block_no = page.block_number();
+            super::log_block_event(rel, "init", block_no, "segment_internal_page");
             let bh = page
                 .as_struct_mut::<super::BlockHeader>(0)
                 .context("block header")?;
@@ -549,6 +551,7 @@ impl PageWriter {
 
     fn allocate_page(&mut self) {
         let mut page = super::allocate_block_tracked(self.rel, self.tracker);
+        super::log_block_event(self.rel, "init", page.block_number(), "posting_page");
         let header = page
             .as_struct_mut::<super::PostingPageHeader>(0)
             .expect("header should fit");
@@ -563,6 +566,7 @@ impl PageWriter {
     fn allocate_next_page(&mut self) {
         let mut next_page = super::allocate_block_tracked(self.rel, self.tracker);
         let next_block = next_page.block_number();
+        super::log_block_event(self.rel, "init", next_block, "posting_page");
         if let Some(mut old) = self.buff.take() {
             let header = old
                 .as_struct_mut::<super::PostingPageHeader>(0)

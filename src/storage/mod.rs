@@ -421,6 +421,23 @@ pub(crate) fn record_block(tracker: Option<*mut BlockExtentTracker>, block: u32)
     }
 }
 
+pub(crate) fn log_block_event(
+    rel: pg_sys::Relation,
+    event: &'static str,
+    block: u32,
+    kind: &'static str,
+) {
+    let relid = if rel.is_null() {
+        0
+    } else {
+        unsafe { u32::from((*rel).rd_id) }
+    };
+    info!(
+        "block_event: rel={} event={} block={} kind={}",
+        relid, event, block, kind
+    );
+}
+
 const fn segment_list_capacity(version: u16) -> usize {
     let header = std::mem::size_of::<SegmentListPageHeader>();
     let seg = if version >= 6 {
@@ -436,6 +453,7 @@ fn segment_list_init_page(
     root: &RootBlockList,
 ) -> Result<pgbuffer::BlockBuffer> {
     let mut page = allocate_block_with_root(rel, root);
+    log_block_event(rel, "init", page.block_number(), "segment_list_page");
     let hdr = page
         .as_struct_mut::<SegmentListPageHeader>(0)
         .context("segment list header")?;
@@ -616,6 +634,7 @@ fn segment_extent_list_write(rel: pg_sys::Relation, extents: &[SegmentExtent]) -
     while !remaining.is_empty() {
         let mut page = allocate_block(rel);
         let blk = page.block_number();
+        log_block_event(rel, "init", blk, "segment_extent_page");
         let hdr = page
             .as_struct_mut::<SegmentExtentListPageHeader>(0)
             .context("segment extent list header")?;
@@ -935,6 +954,7 @@ fn pop_free_block_with_meta(rel: pg_sys::Relation, meta: RootMeta) -> Result<Opt
             wal.free_max_block = pg_sys::InvalidBlockNumber;
         }
         wal.free_head = free_hdr.next_block;
+        log_block_event(rel, "reuse", head, "generic_block");
         return Ok(Some(head));
     }
     Ok(None)
@@ -948,11 +968,13 @@ fn allocate_block_with_meta(rel: pg_sys::Relation, meta: RootMeta) -> pgbuffer::
                 Err(_) => return pgbuffer::BlockBuffer::allocate(rel),
             };
             page.init_page();
+            log_block_event(rel, "reinit", block, "generic_block");
             page
         }
         _ => {
             let page = pgbuffer::BlockBuffer::allocate(rel);
             let block = page.block_number();
+            log_block_event(rel, "extend", block, "generic_block");
             if let Err(err) = update_high_water_block_with_meta(rel, meta, block) {
                 warning!("failed to update high-water mark: {err:#?}");
             }
@@ -1018,6 +1040,7 @@ fn free_blocks_with_meta(rel: pg_sys::Relation, meta: RootMeta, blocks: &[u32]) 
         header.magic = FREE_PAGE_MAGIC;
         header.next_block = head;
         head = *block;
+        log_block_event(rel, "free", *block, "generic_block");
         if meta.version >= 5 && (free_max == pg_sys::InvalidBlockNumber || *block > free_max) {
             free_max = *block;
         }
@@ -1041,6 +1064,7 @@ pub(crate) fn initialize_index_storage(
     let root_block = {
         let mut root_buffer = pgbuffer::BlockBuffer::allocate(rel);
         let root_block = root_buffer.block_number();
+        log_block_event(rel, "extend", root_block, "root_page");
         if expect_root_block_zero && root_block != 0 {
             anyhow::bail!("expected root block 0 for empty index, got {root_block}");
         }
@@ -1061,13 +1085,16 @@ pub(crate) fn initialize_index_storage(
 
     let pending_block = {
         let pending_buffer = pgbuffer::BlockBuffer::allocate(rel);
-        pending_buffer.block_number()
+        let pending_block = pending_buffer.block_number();
+        log_block_event(rel, "extend", pending_block, "pending_header");
+        pending_block
     };
     pending::init_pending(rel, pending_block).context("initialize_index_storage: init pending")?;
 
     let wal_block = {
         let mut wal_buffer = pgbuffer::BlockBuffer::allocate(rel);
         let wal_block = wal_buffer.block_number();
+        log_block_event(rel, "extend", wal_block, "wal_page");
         let wal = wal_buffer
             .as_struct_mut::<WALHeader>(0)
             .context("initialize_index_storage: wal header")?;
