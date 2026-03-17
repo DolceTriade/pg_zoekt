@@ -64,6 +64,7 @@ struct PostingReader {
 impl PostingReader {
     unsafe fn new(rel: pg_sys::Relation, entry: &IndexEntry) -> anyhow::Result<Self> {
         let (block, offset, data_length) = entry_fields(entry);
+        let relid = unsafe { u32::from((*rel).rd_id) };
         let nblocks = unsafe {
             pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
         };
@@ -74,6 +75,10 @@ impl PostingReader {
                 nblocks
             );
         }
+        info!(
+            "posting_reader_open: rel={} block={} offset={} data_length={} nblocks={}",
+            relid, block, offset, data_length, nblocks
+        );
         let buf = BlockBuffer::acquire_pinned(rel, block)?;
         let header_copy = {
             let header = buf
@@ -133,12 +138,24 @@ impl PostingReader {
 
     fn advance_page(&mut self) -> anyhow::Result<()> {
         let next_block = self.header.next_block;
+        let current_block = self.buf.block_number();
         if next_block == pg_sys::InvalidBlockNumber {
             anyhow::bail!("posting chain truncated");
         }
         let nblocks = unsafe {
             pg_sys::RelationGetNumberOfBlocksInFork(self.rel, pg_sys::ForkNumber::MAIN_FORKNUM)
         };
+        let relid = unsafe { u32::from((*self.rel).rd_id) };
+        info!(
+            "posting_reader_advance: rel={} current_block={} next_block={} remaining={} cursor={} page_free={} nblocks={}",
+            relid,
+            current_block,
+            next_block,
+            self.remaining,
+            self.cursor,
+            self.page_free,
+            nblocks
+        );
         if next_block >= nblocks {
             anyhow::bail!(
                 "posting next block out of range: {} (nblocks={})",

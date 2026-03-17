@@ -438,6 +438,19 @@ pub(crate) fn log_block_event(
     );
 }
 
+fn sample_blocks(blocks: &[u32]) -> String {
+    const LIMIT: usize = 8;
+    let mut parts = blocks
+        .iter()
+        .take(LIMIT)
+        .map(u32::to_string)
+        .collect::<Vec<_>>();
+    if blocks.len() > LIMIT {
+        parts.push(format!("...(+{})", blocks.len() - LIMIT));
+    }
+    format!("[{}]", parts.join(","))
+}
+
 const fn segment_list_capacity(version: u16) -> usize {
     let header = std::mem::size_of::<SegmentListPageHeader>();
     let seg = if version >= 6 {
@@ -1368,12 +1381,31 @@ pub fn reclaim_orphan_blocks(
     } else {
         Vec::new()
     };
+    let mut used_blocks = used.iter().copied().collect::<Vec<_>>();
+    used_blocks.sort_unstable();
+    info!(
+        "reclaim_orphan_blocks scan: rel={} relation_blocks={} reachable_blocks={} reachable_sample={} free_list_blocks={} free_list_sample={}",
+        unsafe { u32::from((*rel).rd_id) },
+        nblocks,
+        used.len(),
+        sample_blocks(&used_blocks),
+        free_list_blocks.len(),
+        sample_blocks(&free_list_blocks),
+    );
     let free: HashSet<u32> = free_list_blocks.into_iter().collect();
     let mut orphans = Vec::new();
     for blk in 1..nblocks {
         if !used.contains(&blk) && !free.contains(&blk) {
             orphans.push(blk);
         }
+    }
+    if !orphans.is_empty() {
+        info!(
+            "reclaim_orphan_blocks victims: rel={} orphan_blocks={} orphan_sample={}",
+            unsafe { u32::from((*rel).rd_id) },
+            orphans.len(),
+            sample_blocks(&orphans),
+        );
     }
     free_blocks(rel, &orphans)?;
     info!(
@@ -1401,7 +1433,12 @@ pub fn maybe_truncate_relation(
     _segments: &[Segment],
 ) -> Result<()> {
     let start = std::time::Instant::now();
-    info!("maybe_truncate_relation start");
+    let wal_block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(rbl.wal_block)) };
+    info!(
+        "maybe_truncate_relation start: rel={} wal_block={}",
+        unsafe { u32::from((*rel).rd_id) },
+        wal_block
+    );
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
     if nblocks <= 1 {
@@ -1469,13 +1506,23 @@ pub fn maybe_truncate_relation(
     }
     let freelist_rewrite_elapsed_ms = freelist_rewrite_start.elapsed().as_millis();
     info!(
-        "maybe_truncate_relation phase=free_list keep_blocks={} collect_elapsed_ms={} rewrite_elapsed_ms={}",
+        "maybe_truncate_relation phase=free_list rel={} keep_blocks={} keep_sample={} collect_elapsed_ms={} rewrite_elapsed_ms={}",
+        unsafe { u32::from((*rel).rd_id) },
         keep.len(),
+        sample_blocks(&keep),
         freelist_collect_elapsed_ms,
         freelist_rewrite_elapsed_ms
     );
 
     let truncate_start = std::time::Instant::now();
+    let truncated_tail = (new_nblocks..nblocks.min(new_nblocks.saturating_add(8))).collect::<Vec<_>>();
+    info!(
+        "maybe_truncate_relation phase=truncate_decision rel={} old_nblocks={} new_nblocks={} truncated_tail_sample={}",
+        unsafe { u32::from((*rel).rd_id) },
+        nblocks,
+        new_nblocks,
+        sample_blocks(&truncated_tail),
+    );
     unsafe {
         pg_sys::RelationTruncate(rel, new_nblocks);
     }
@@ -1760,7 +1807,17 @@ impl SegmentCursor {
 }
 
 pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<Vec<IndexEntry>> {
-    let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
+    let segment_block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(segment.block)) };
+    let segment_size = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(segment.size)) };
+    let leaf_blocks = collect_leaf_blocks(rel, segment_block)?;
+    info!(
+        "read_segment_entries: rel={} segment_root={} segment_size={} leaf_blocks={} leaf_sample={}",
+        unsafe { u32::from((*rel).rd_id) },
+        segment_block,
+        segment_size,
+        leaf_blocks.len(),
+        sample_blocks(&leaf_blocks),
+    );
     let mut all_entries = Vec::new();
     for leaf_block in leaf_blocks {
         let buf = pgbuffer::BlockBuffer::acquire_pinned(rel, leaf_block)?;
@@ -1771,13 +1828,35 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
         if header.level != 0 {
             anyhow::bail!("expected leaf page while merging");
         }
+        let num_entries = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(header.num_entries)) };
         let entries = buf
             .as_struct_with_elems::<IndexList>(
                 std::mem::size_of::<BlockHeader>(),
-                header.num_entries as usize,
+                num_entries as usize,
             )
             .context("index entries")?;
-        all_entries.extend_from_slice(&entries.entries[..header.num_entries as usize]);
+        let leaf_entries = &entries.entries[..num_entries as usize];
+        let posting_sample = leaf_entries
+            .iter()
+            .take(4)
+            .map(|entry| {
+                let block = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.block)) };
+                let offset = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.offset)) };
+                let len =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.data_length)) };
+                format!("{block}:{offset}:{len}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            "read_segment_entries leaf: rel={} segment_root={} leaf_block={} entries={} posting_sample=[{}]",
+            unsafe { u32::from((*rel).rd_id) },
+            segment_block,
+            leaf_block,
+            num_entries,
+            posting_sample,
+        );
+        all_entries.extend_from_slice(leaf_entries);
     }
     Ok(all_entries)
 }

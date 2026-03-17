@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::PgTryBuilder;
 use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
@@ -74,15 +75,85 @@ fn debug_assert_block_in_range(rel: pg_sys::Relation, num: u32) {
     );
 }
 
+fn relation_oid(rel: pg_sys::Relation) -> u32 {
+    if rel.is_null() {
+        0
+    } else {
+        unsafe { u32::from((*rel).rd_id) }
+    }
+}
+
+fn relation_nblocks(rel: pg_sys::Relation) -> u32 {
+    if rel.is_null() {
+        0
+    } else {
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) }
+    }
+}
+
 fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
     PgTryBuilder::new(|| Ok(unsafe { pg_sys::ReadBuffer(rel, num) }))
-        .catch_others(|_| {
-            warning!("buffer_read_failed: block={} path=postgres_error", num);
-            Err(anyhow!("ReadBuffer failed for block {}", num))
+        .catch_others(|error: CaughtError| {
+            let relid = relation_oid(rel);
+            let nblocks = relation_nblocks(rel);
+            match error {
+                CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => {
+                    warning!(
+                        "buffer_read_failed: rel={} block={} nblocks={} path=postgres_error sqlstate={} message={} detail={:?} hint={:?} location={}:{}",
+                        relid,
+                        num,
+                        nblocks,
+                        report.sql_error_code(),
+                        report.message(),
+                        report.detail(),
+                        report.hint(),
+                        report.file(),
+                        report.line_number(),
+                    );
+                    Err(anyhow!(
+                        "ReadBuffer failed for rel {} block {} (nblocks={}): {}",
+                        relid,
+                        num,
+                        nblocks,
+                        report.message()
+                    ))
+                }
+                CaughtError::RustPanic { ereport, .. } => {
+                    warning!(
+                        "buffer_read_failed: rel={} block={} nblocks={} path=postgres_error_rustpanic sqlstate={} message={} detail={:?} hint={:?} location={}:{}",
+                        relid,
+                        num,
+                        nblocks,
+                        ereport.sql_error_code(),
+                        ereport.message(),
+                        ereport.detail(),
+                        ereport.hint(),
+                        ereport.file(),
+                        ereport.line_number(),
+                    );
+                    Err(anyhow!(
+                        "ReadBuffer failed for rel {} block {} (nblocks={}): {}",
+                        relid,
+                        num,
+                        nblocks,
+                        ereport.message()
+                    ))
+                }
+            }
         })
-        .catch_rust_panic(|_| {
-            warning!("buffer_read_failed: block={} path=rust_panic", num);
-            Err(anyhow!("ReadBuffer panicked for block {}", num))
+        .catch_rust_panic(|error: CaughtError| {
+            let relid = relation_oid(rel);
+            let nblocks = relation_nblocks(rel);
+            warning!(
+                "buffer_read_failed: rel={} block={} nblocks={} path=rust_panic error={:?}",
+                relid, num, nblocks, error
+            );
+            Err(anyhow!(
+                "ReadBuffer panicked for rel {} block {} (nblocks={})",
+                relid,
+                num,
+                nblocks
+            ))
         })
         .execute()
 }
