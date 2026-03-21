@@ -515,30 +515,35 @@ fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
 fn extract_pattern_segments(pattern: &str) -> Vec<SegmentPattern> {
     let mut segments = Vec::new();
     for seg in extract_literal_segments(pattern) {
-        let len: u32 = match u32::try_from(seg.len()) {
-            Ok(len) => len,
-            Err(_) => {
-                continue;
-            }
-        };
-        let mut trigms = Vec::new();
-        for (trgm, pos) in crate::trgm::Extractor::extract(&seg) {
-            if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
-                trigms.push(PatternTrgm {
-                    trigram: ct.trgm(),
-                    pos: pos as u32,
-                    flags: ct.flags(),
-                });
-            }
-        }
-        if !trigms.is_empty() {
-            segments.push(SegmentPattern {
-                trigrams: trigms,
-                len,
-            });
+        if let Some(pattern) = build_literal_segment_pattern(&seg) {
+            segments.push(pattern);
         }
     }
     segments
+}
+
+fn build_literal_segment_pattern(seg: &str) -> Option<SegmentPattern> {
+    let len: u32 = match u32::try_from(seg.len()) {
+        Ok(len) => len,
+        Err(_) => return None,
+    };
+    let mut trigms = Vec::new();
+    for (trgm, pos) in crate::trgm::Extractor::extract(seg) {
+        if let Ok(ct) = crate::trgm::CompactTrgm::try_from(trgm) {
+            trigms.push(PatternTrgm {
+                trigram: ct.trgm(),
+                pos: pos as u32,
+                flags: ct.flags(),
+            });
+        }
+    }
+    if trigms.is_empty() {
+        return None;
+    }
+    Some(SegmentPattern {
+        trigrams: trigms,
+        len,
+    })
 }
 
 fn pattern_has_trigram(pattern: &str) -> bool {
@@ -1012,6 +1017,104 @@ fn add_matches_from_segment_occurrences_line_oriented(
     }
 }
 
+#[derive(Debug, Clone)]
+struct RegexBranchPattern {
+    leading_anchor: bool,
+    segments: Vec<SegmentPattern>,
+}
+
+fn build_regex_branch_patterns(
+    pattern: &str,
+    case_sensitive: bool,
+    collation: pg_sys::Oid,
+) -> anyhow::Result<Option<Vec<RegexBranchPattern>>> {
+    let Some(branches) =
+        crate::regex_plan::branch_literal_plans(pattern, case_sensitive, collation)?
+    else {
+        return Ok(None);
+    };
+
+    let compiled: Vec<RegexBranchPattern> = branches
+        .into_iter()
+        .filter_map(|branch| {
+            let segments: Vec<SegmentPattern> = branch
+                .literals
+                .iter()
+                .filter_map(|literal| build_literal_segment_pattern(literal))
+                .collect();
+            if segments.is_empty() {
+                None
+            } else {
+                Some(RegexBranchPattern {
+                    leading_anchor: branch.leading_anchor,
+                    segments,
+                })
+            }
+        })
+        .collect();
+
+    if compiled.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(compiled))
+}
+
+fn add_matches_from_regex_branches(
+    state: &mut ScanState,
+    rel: pg_sys::Relation,
+    index_segments: &[crate::storage::Segment],
+    branches: &[RegexBranchPattern],
+    case_sensitive: bool,
+    line_oriented: bool,
+) -> anyhow::Result<()> {
+    for branch in branches {
+        let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> = Vec::new();
+        let segment_lengths: Vec<u32> = branch.segments.iter().map(|seg| seg.len).collect();
+
+        for seg_pattern in &branch.segments {
+            let occs = stream_segment_occurrences_adaptive(
+                rel,
+                index_segments,
+                seg_pattern,
+                case_sensitive,
+            )?;
+            if occs.is_empty() {
+                segment_occurrences.clear();
+                break;
+            }
+            segment_occurrences.push(occs);
+        }
+
+        if segment_occurrences.is_empty() {
+            continue;
+        }
+
+        if line_oriented && segment_occurrences.len() > 1 {
+            let mut candidates = std::collections::BTreeSet::new();
+            for (tid, _) in &segment_occurrences[0] {
+                candidates.insert(*tid);
+            }
+            let newlines = collect_newline_positions(rel, index_segments, &candidates)?;
+            add_matches_from_segment_occurrences_line_oriented(
+                state,
+                &segment_occurrences,
+                &segment_lengths,
+                !branch.leading_anchor,
+                &newlines,
+            );
+        } else {
+            add_matches_from_segment_occurrences(
+                state,
+                &segment_occurrences,
+                !branch.leading_anchor,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 unsafe fn build_scan_state(
     index_relation: pg_sys::Relation,
     keys: pg_sys::ScanKey,
@@ -1026,16 +1129,18 @@ unsafe fn build_scan_state(
 
     let case_sensitive = is_case_sensitive(keys);
     let is_regex = is_regex_strategy(keys);
-    let wildcard_pattern = if is_regex {
-        regex_to_wildcard_pattern(&pattern_str)
+    let collation = if keys.is_null() {
+        pg_sys::DEFAULT_COLLATION_OID
     } else {
-        pattern_str.clone()
+        unsafe { (*keys).sk_collation }
     };
-    let segments = extract_pattern_segments(&wildcard_pattern);
-    if segments.is_empty() {
-        if is_regex {
-            return build_full_regex_scan_state(index_relation);
-        }
+    let wildcard_pattern = pattern_str.clone();
+    let segments = if is_regex {
+        Vec::new()
+    } else {
+        extract_pattern_segments(&wildcard_pattern)
+    };
+    if !is_regex && segments.is_empty() {
         return ScanState::default();
     }
     let (leading_wildcard, has_single_char_wildcard) = if is_regex {
@@ -1060,73 +1165,31 @@ unsafe fn build_scan_state(
             });
 
         if is_regex {
-            let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> =
-                Vec::new();
             let can_order = regex_safe_for_ordering(&pattern_str);
             let line_oriented = regex_is_line_oriented(&pattern_str);
-            let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
-            let mut unordered_candidates: Option<
-                std::collections::BTreeSet<crate::storage::ItemPointer>,
-            > = None;
-            for seg_pattern in &segments {
-                match stream_segment_occurrences_adaptive(
-                    index_relation,
-                    &index_segments,
-                    seg_pattern,
-                    case_sensitive,
-                ) {
-                    Ok(occs) if !occs.is_empty() => {
-                        if can_order {
-                            segment_occurrences.push(occs);
-                        } else {
-                            let tids: std::collections::BTreeSet<crate::storage::ItemPointer> =
-                                occs.into_iter().map(|(tid, _)| tid).collect();
-                            unordered_candidates = Some(match unordered_candidates.take() {
-                                None => tids,
-                                Some(mut prev) => {
-                                    prev.extend(tids);
-                                    prev
-                                }
-                            });
-                        }
-                    }
-                    Ok(_) => return state,
-                    Err(e) => {
-                        warning!("failed to stream segment postings: {e:#}");
-                        return state;
-                    }
-                }
+            if !can_order {
+                return build_full_regex_scan_state(index_relation);
             }
-            if can_order {
-                if line_oriented && segment_occurrences.len() > 1 {
-                    let mut candidates = std::collections::BTreeSet::new();
-                    for (tid, _) in &segment_occurrences[0] {
-                        candidates.insert(*tid);
+
+            let branch_patterns =
+                match build_regex_branch_patterns(&pattern_str, case_sensitive, collation) {
+                    Ok(Some(patterns)) => patterns,
+                    Ok(None) => return build_full_regex_scan_state(index_relation),
+                    Err(e) => {
+                        warning!("failed to plan regex branches: {e:#}");
+                        return build_full_regex_scan_state(index_relation);
                     }
-                    match collect_newline_positions(index_relation, &index_segments, &candidates) {
-                        Ok(newlines) => add_matches_from_segment_occurrences_line_oriented(
-                            &mut state,
-                            &segment_occurrences,
-                            &segment_lengths,
-                            true,
-                            &newlines,
-                        ),
-                        Err(e) => {
-                            warning!("failed to load newline postings: {e:#}");
-                            add_matches_from_segment_occurrences(
-                                &mut state,
-                                &segment_occurrences,
-                                true,
-                            );
-                        }
-                    }
-                } else {
-                    add_matches_from_segment_occurrences(&mut state, &segment_occurrences, true);
-                }
-            } else if let Some(candidates) = unordered_candidates {
-                for tid in candidates {
-                    state.push_match(tid);
-                }
+                };
+            if let Err(e) = add_matches_from_regex_branches(
+                &mut state,
+                index_relation,
+                &index_segments,
+                &branch_patterns,
+                case_sensitive,
+                line_oriented,
+            ) {
+                warning!("failed to evaluate regex branches: {e:#}");
+                return build_full_regex_scan_state(index_relation);
             }
             state.sort_dedup();
             return state;
@@ -1661,5 +1724,25 @@ mod tests {
         assert!(!regex_safe_for_ordering("a*b"));
         assert!(regex_safe_for_ordering("a.*b"));
         assert!(regex_safe_for_ordering("a\\*b"));
+    }
+
+    #[test]
+    fn test_build_literal_segment_pattern() {
+        let seg = build_literal_segment_pattern("catfish").expect("segment pattern");
+        let texts: Vec<String> = seg
+            .trigrams
+            .iter()
+            .map(|pt| CompactTrgm(pt.trigram).txt())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "cat".to_string(),
+                "atf".to_string(),
+                "tfi".to_string(),
+                "fis".to_string(),
+                "ish".to_string()
+            ]
+        );
     }
 }

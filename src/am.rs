@@ -3451,6 +3451,42 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_regex_branch_planner_extracts_alternation_paths() -> spi::Result<()> {
+        let branches = crate::regex_plan::branch_literal_plans(
+            "(cat|dog)fish",
+            true,
+            pg_sys::DEFAULT_COLLATION_OID,
+        )
+        .expect("plan result");
+        let branches = branches.expect("branch literal plans");
+        let literals: Vec<Vec<String>> =
+            branches.into_iter().map(|branch| branch.literals).collect();
+        assert_eq!(
+            literals,
+            vec![vec!["catfish".to_string()], vec!["dogfish".to_string()]]
+        );
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_regex_branch_planner_preserves_anchor() -> spi::Result<()> {
+        let branches = crate::regex_plan::branch_literal_plans(
+            "^foo.*bar$",
+            true,
+            pg_sys::DEFAULT_COLLATION_OID,
+        )
+        .expect("plan result");
+        let branches = branches.expect("branch literal plans");
+        assert_eq!(branches.len(), 1);
+        assert!(branches[0].leading_anchor, "expected start anchor");
+        assert_eq!(
+            branches[0].literals,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_adaptive_trigram_regex_matches() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(

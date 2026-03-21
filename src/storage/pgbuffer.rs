@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
-use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::PgTryBuilder;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 

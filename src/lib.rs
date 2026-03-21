@@ -8,6 +8,8 @@ mod introspect;
 mod metrics;
 mod operators;
 mod query;
+mod regex_ffi;
+mod regex_plan;
 mod seal;
 mod storage;
 mod trgm;
