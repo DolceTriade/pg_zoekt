@@ -3529,6 +3529,65 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_ordered_regex_respects_newline_boundaries() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE positional_regex_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO positional_regex_docs (text) VALUES
+                ('foo middle bar'),
+                ('foo
+bar'),
+                ('bar before foo'),
+                ('fooXbar'),
+                ('fooXXbar')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_positional_regex_docs_text_zoekt ON positional_regex_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Spi::run("SELECT pg_zoekt_seal('idx_positional_regex_docs_text_zoekt'::regclass)")?;
+
+            let dotstar_count = client
+                .select(
+                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '^foo.*bar'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                dotstar_count, 4,
+                "expected ordered regex matches with default dot semantics"
+            );
+
+            let single_gap_count = client
+                .select(
+                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '^foo.bar$'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                single_gap_count, 2,
+                "expected one-character gap regex matches with default dot semantics"
+            );
+
+            client.update("DROP TABLE positional_regex_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
     pub fn test_auto_seal_makes_insert_visible() -> spi::Result<()> {
         let _guard = TestConfigGuard;
         super::test_set_auto_seal_pending_bytes(8);
