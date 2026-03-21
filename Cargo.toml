@@ -2,6 +2,7 @@
 name = "pg_zoekt"
 version = "0.0.1"
 edition = "2024"
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -35,6 +36,10 @@ zerocopy = { version = "0.8.31", features = ["derive", "simd", "std"] }
 
 [dev-dependencies]
 pgrx-tests = "0.17.0"
+
+[build-dependencies]
+cc = "1.2"
+pgrx-pg-config = "0.17.0"
 
 [profile.dev]
 panic = "unwind"
