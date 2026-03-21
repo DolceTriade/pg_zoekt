@@ -8,10 +8,15 @@ type PostingCursor = crate::storage::decode::PostingCursor;
 
 #[derive(Debug)]
 struct ScanState {
-    matches: Vec<pg_sys::ItemPointerData>,
+    matches: Vec<MatchEntry>,
     cursor: usize,
-    lossy: bool,
     tombstones: crate::storage::tombstone::Snapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatchEntry {
+    tid: pg_sys::ItemPointerData,
+    recheck: bool,
 }
 
 impl Default for ScanState {
@@ -19,14 +24,13 @@ impl Default for ScanState {
         Self {
             matches: Vec::new(),
             cursor: 0,
-            lossy: false,
             tombstones: crate::storage::tombstone::Snapshot::default(),
         }
     }
 }
 
 impl ScanState {
-    fn push_match(&mut self, item: crate::storage::ItemPointer) {
+    fn push_match(&mut self, item: crate::storage::ItemPointer, recheck: bool) {
         if self.tombstones.contains(item) {
             return;
         }
@@ -37,26 +41,35 @@ impl ScanState {
         tid.ip_blkid.bi_hi = blk_hi;
         tid.ip_blkid.bi_lo = blk_lo;
         tid.ip_posid = item.offset;
-        self.matches.push(tid);
+        self.matches.push(MatchEntry { tid, recheck });
     }
 
     fn sort_dedup(&mut self) {
         self.matches.sort_by(|a, b| {
-            let a_blk = (a.ip_blkid.bi_hi as u32) << 16 | a.ip_blkid.bi_lo as u32;
-            let b_blk = (b.ip_blkid.bi_hi as u32) << 16 | b.ip_blkid.bi_lo as u32;
+            let a_blk = (a.tid.ip_blkid.bi_hi as u32) << 16 | a.tid.ip_blkid.bi_lo as u32;
+            let b_blk = (b.tid.ip_blkid.bi_hi as u32) << 16 | b.tid.ip_blkid.bi_lo as u32;
             match a_blk.cmp(&b_blk) {
-                Ordering::Equal => a.ip_posid.cmp(&b.ip_posid),
+                Ordering::Equal => a.tid.ip_posid.cmp(&b.tid.ip_posid),
                 other => other,
             }
         });
-        self.matches.dedup_by(|a, b| {
-            a.ip_posid == b.ip_posid
-                && a.ip_blkid.bi_hi == b.ip_blkid.bi_hi
-                && a.ip_blkid.bi_lo == b.ip_blkid.bi_lo
-        });
+        let mut deduped: Vec<MatchEntry> = Vec::with_capacity(self.matches.len());
+        for entry in self.matches.drain(..) {
+            if let Some(prev) = deduped.last_mut() {
+                if prev.tid.ip_posid == entry.tid.ip_posid
+                    && prev.tid.ip_blkid.bi_hi == entry.tid.ip_blkid.bi_hi
+                    && prev.tid.ip_blkid.bi_lo == entry.tid.ip_blkid.bi_lo
+                {
+                    prev.recheck &= entry.recheck;
+                    continue;
+                }
+            }
+            deduped.push(entry);
+        }
+        self.matches = deduped;
     }
 
-    fn next(&mut self) -> Option<pg_sys::ItemPointerData> {
+    fn next(&mut self) -> Option<MatchEntry> {
         if self.cursor >= self.matches.len() {
             None
         } else {
@@ -453,6 +466,7 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
 fn regex_is_line_oriented(pattern: &str) -> bool {
     let mut chars = pattern.chars().peekable();
     let mut escaped = false;
+    let mut newline_sensitive = false;
     while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
@@ -473,11 +487,18 @@ fn regex_is_line_oriented(pattern: &str) -> bool {
             }
             flags.push(c);
         }
+        if (flags.contains('n') || flags.contains('m') || flags.contains('p'))
+            && !flags.contains("-n")
+            && !flags.contains("-m")
+            && !flags.contains("-p")
+        {
+            newline_sensitive = true;
+        }
         if flags.contains('s') && !flags.contains("-s") {
-            return false;
+            newline_sensitive = false;
         }
     }
-    true
+    newline_sensitive
 }
 
 fn pattern_wildcard_info(pattern: &str) -> (bool, bool) {
@@ -867,23 +888,30 @@ fn stream_segment_occurrences_adaptive(
 fn add_matches_from_segment_occurrences(
     state: &mut ScanState,
     segment_occurrences: &[Vec<(crate::storage::ItemPointer, Vec<u32>)>],
-    leading_wildcard: bool,
+    segment_lengths: &[u32],
+    gaps: &[RegexGap],
+    branch: &RegexBranchPattern,
+    newlines: &std::collections::BTreeMap<crate::storage::ItemPointer, Vec<u32>>,
 ) {
-    if segment_occurrences.is_empty() {
+    if segment_occurrences.is_empty()
+        || segment_occurrences.len() != segment_lengths.len()
+        || segment_occurrences.len().saturating_sub(1) != gaps.len()
+    {
         return;
     }
     let first = &segment_occurrences[0];
     'tid_loop: for (tid, starts) in first {
-        let start_candidates: Vec<u32> = if leading_wildcard {
+        let start_candidates: Vec<u32> = if !branch.leading_anchor {
             starts.clone()
         } else if starts.contains(&0) {
             vec![0]
         } else {
             continue;
         };
+        let newline_positions = newlines.get(tid).map(|v| v.as_slice()).unwrap_or(&[]);
 
         for start in start_candidates {
-            let mut prev_start = start;
+            let mut prev_end = start.saturating_add(segment_lengths[0]);
             let mut ok = true;
             for seg_idx in 1..segment_occurrences.len() {
                 let Some(starts_next) = segment_occurrences[seg_idx]
@@ -894,20 +922,43 @@ fn add_matches_from_segment_occurrences(
                     ok = false;
                     break;
                 };
-                if let Some(next_start) = starts_next
-                    .iter()
-                    .copied()
-                    .filter(|s| *s >= prev_start)
-                    .min()
-                {
-                    prev_start = next_start;
-                } else {
-                    ok = false;
+                let mut found = None;
+                for next_start in starts_next.iter().copied() {
+                    let matches_gap = match &gaps[seg_idx - 1] {
+                        RegexGap::Adjacent => next_start == prev_end,
+                        RegexGap::ZeroOrMore => {
+                            next_start >= prev_end
+                                && (!branch.line_oriented
+                                    || !has_newline_between(
+                                        newline_positions,
+                                        prev_end,
+                                        next_start,
+                                    ))
+                        }
+                        RegexGap::AtLeastOneByte => {
+                            next_start > prev_end
+                                && (!branch.line_oriented
+                                    || !has_newline_between(
+                                        newline_positions,
+                                        prev_end,
+                                        next_start,
+                                    ))
+                        }
+                    };
+                    if !matches_gap {
+                        continue;
+                    }
+                    found = Some(next_start);
                     break;
                 }
+                let Some(next_start) = found else {
+                    ok = false;
+                    break;
+                };
+                prev_end = next_start.saturating_add(segment_lengths[seg_idx]);
             }
             if ok {
-                state.push_match(*tid);
+                state.push_match(*tid, !branch.exact);
                 continue 'tid_loop;
             }
         }
@@ -958,69 +1009,174 @@ fn collect_newline_positions(
     Ok(out)
 }
 
-fn add_matches_from_segment_occurrences_line_oriented(
-    state: &mut ScanState,
-    segment_occurrences: &[Vec<(crate::storage::ItemPointer, Vec<u32>)>],
-    segment_lengths: &[u32],
-    leading_wildcard: bool,
-    newlines: &std::collections::BTreeMap<crate::storage::ItemPointer, Vec<u32>>,
-) {
-    if segment_occurrences.is_empty() || segment_occurrences.len() != segment_lengths.len() {
-        return;
-    }
-    let first = &segment_occurrences[0];
-    'tid_loop: for (tid, starts) in first {
-        let start_candidates: Vec<u32> = if leading_wildcard {
-            starts.clone()
-        } else if starts.contains(&0) {
-            vec![0]
-        } else {
-            continue;
-        };
-        let newline_positions = newlines.get(tid).map(|v| v.as_slice()).unwrap_or(&[]);
-        for start in start_candidates {
-            let mut prev_start = start;
-            let mut prev_end = prev_start.saturating_add(segment_lengths[0]);
-            let mut ok = true;
-            for seg_idx in 1..segment_occurrences.len() {
-                let Some(starts_next) = segment_occurrences[seg_idx]
-                    .iter()
-                    .find(|(t, _)| t == tid)
-                    .map(|(_, s)| s)
-                else {
-                    ok = false;
-                    break;
-                };
-                let mut found = None;
-                for next_start in starts_next.iter().copied() {
-                    if next_start < prev_end {
-                        continue;
-                    }
-                    if has_newline_between(newline_positions, prev_end, next_start) {
-                        continue;
-                    }
-                    found = Some(next_start);
-                    break;
-                }
-                let Some(next_start) = found else {
-                    ok = false;
-                    break;
-                };
-                prev_start = next_start;
-                prev_end = prev_start.saturating_add(segment_lengths[seg_idx]);
-            }
-            if ok {
-                state.push_match(*tid);
-                continue 'tid_loop;
-            }
-        }
-    }
+#[derive(Debug, Clone)]
+enum RegexGap {
+    Adjacent,
+    ZeroOrMore,
+    AtLeastOneByte,
 }
 
 #[derive(Debug, Clone)]
 struct RegexBranchPattern {
     leading_anchor: bool,
+    exact: bool,
+    line_oriented: bool,
     segments: Vec<SegmentPattern>,
+    segment_lengths: Vec<u32>,
+    gaps: Vec<RegexGap>,
+}
+
+fn regex_has_inline_flags(pattern: &str) -> bool {
+    pattern.contains("(?")
+}
+
+fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<RegexBranchPattern> {
+    if !regex_safe_for_ordering(pattern) {
+        return None;
+    }
+
+    let mut chars = pattern.chars().peekable();
+    let mut leading_anchor = false;
+    let mut trailing_anchor = false;
+    let line_oriented = regex_is_line_oriented(pattern);
+    let mut exact = !regex_has_inline_flags(pattern);
+    let mut current = String::new();
+    let mut literals = Vec::new();
+    let mut gaps = Vec::new();
+    let mut saw_leading_gap = false;
+
+    let flush_current = |current: &mut String,
+                         literals: &mut Vec<String>,
+                         gaps: &mut Vec<RegexGap>,
+                         pending_gap: RegexGap| {
+        if !current.is_empty() {
+            literals.push(std::mem::take(current));
+            if literals.len() > 1 {
+                gaps.push(pending_gap);
+            }
+        }
+    };
+
+    let mut pending_gap = RegexGap::Adjacent;
+    let mut saw_content = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '^' if !saw_content && current.is_empty() && literals.is_empty() => {
+                leading_anchor = true;
+            }
+            '$' if chars.peek().is_none() => {
+                trailing_anchor = true;
+            }
+            '\\' => {
+                let next = chars.next()?;
+                match next {
+                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                    | '\\' => {
+                        current.push(next);
+                        saw_content = true;
+                    }
+                    _ => {
+                        if literals.is_empty()
+                            && !current.is_empty()
+                            && !matches!(pending_gap, RegexGap::Adjacent)
+                        {
+                            saw_leading_gap = true;
+                        }
+                        flush_current(&mut current, &mut literals, &mut gaps, pending_gap.clone());
+                        pending_gap = RegexGap::AtLeastOneByte;
+                        exact = false;
+                        saw_content = true;
+                    }
+                }
+            }
+            '.' => {
+                if literals.is_empty() && current.is_empty() {
+                    saw_leading_gap = true;
+                }
+                flush_current(&mut current, &mut literals, &mut gaps, pending_gap.clone());
+                if chars.peek().copied() == Some('*') {
+                    _ = chars.next();
+                    pending_gap = RegexGap::ZeroOrMore;
+                } else {
+                    pending_gap = RegexGap::AtLeastOneByte;
+                    exact = false;
+                }
+                saw_content = true;
+            }
+            '[' => {
+                if literals.is_empty() && current.is_empty() {
+                    saw_leading_gap = true;
+                }
+                flush_current(&mut current, &mut literals, &mut gaps, pending_gap.clone());
+                let mut escaped = false;
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match c {
+                        '\\' => escaped = true,
+                        ']' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                pending_gap = RegexGap::AtLeastOneByte;
+                exact = false;
+                saw_content = true;
+            }
+            '(' | ')' | '|' | '?' | '+' | '{' | '}' => return None,
+            other => {
+                current.push(other);
+                saw_content = true;
+            }
+        }
+    }
+
+    flush_current(&mut current, &mut literals, &mut gaps, pending_gap);
+
+    let segments: Vec<SegmentPattern> = literals
+        .iter()
+        .filter_map(|literal| build_literal_segment_pattern(literal))
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
+    let segment_count = segments.len();
+    let gaps = if segment_count > 1 {
+        if gaps.len() != segment_count - 1 {
+            return None;
+        }
+        gaps
+    } else {
+        Vec::new()
+    };
+
+    if trailing_anchor {
+        exact = false;
+    }
+    if saw_leading_gap {
+        exact = false;
+        leading_anchor = false;
+    }
+
+    Some(RegexBranchPattern {
+        leading_anchor,
+        exact,
+        line_oriented,
+        segments,
+        segment_lengths,
+        gaps,
+    })
 }
 
 fn build_regex_branch_patterns(
@@ -1028,6 +1184,10 @@ fn build_regex_branch_patterns(
     case_sensitive: bool,
     collation: pg_sys::Oid,
 ) -> anyhow::Result<Option<Vec<RegexBranchPattern>>> {
+    if let Some(branch) = parse_ordered_regex_branch(pattern, case_sensitive) {
+        return Ok(Some(vec![branch]));
+    }
+
     let Some(branches) =
         crate::regex_plan::branch_literal_plans(pattern, case_sensitive, collation)?
     else {
@@ -1047,6 +1207,10 @@ fn build_regex_branch_patterns(
             } else {
                 Some(RegexBranchPattern {
                     leading_anchor: branch.leading_anchor,
+                    exact: false,
+                    line_oriented: false,
+                    segment_lengths: segments.iter().map(|seg| seg.len).collect(),
+                    gaps: vec![RegexGap::ZeroOrMore; segments.len().saturating_sub(1)],
                     segments,
                 })
             }
@@ -1066,11 +1230,9 @@ fn add_matches_from_regex_branches(
     index_segments: &[crate::storage::Segment],
     branches: &[RegexBranchPattern],
     case_sensitive: bool,
-    line_oriented: bool,
 ) -> anyhow::Result<()> {
     for branch in branches {
         let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> = Vec::new();
-        let segment_lengths: Vec<u32> = branch.segments.iter().map(|seg| seg.len).collect();
 
         for seg_pattern in &branch.segments {
             let occs = stream_segment_occurrences_adaptive(
@@ -1090,26 +1252,28 @@ fn add_matches_from_regex_branches(
             continue;
         }
 
-        if line_oriented && segment_occurrences.len() > 1 {
+        let needs_newlines = branch.line_oriented
+            && branch
+                .gaps
+                .iter()
+                .any(|gap| !matches!(gap, RegexGap::Adjacent));
+        let newlines = if needs_newlines {
             let mut candidates = std::collections::BTreeSet::new();
             for (tid, _) in &segment_occurrences[0] {
                 candidates.insert(*tid);
             }
-            let newlines = collect_newline_positions(rel, index_segments, &candidates)?;
-            add_matches_from_segment_occurrences_line_oriented(
-                state,
-                &segment_occurrences,
-                &segment_lengths,
-                !branch.leading_anchor,
-                &newlines,
-            );
+            collect_newline_positions(rel, index_segments, &candidates)?
         } else {
-            add_matches_from_segment_occurrences(
-                state,
-                &segment_occurrences,
-                !branch.leading_anchor,
-            );
-        }
+            std::collections::BTreeMap::new()
+        };
+        add_matches_from_segment_occurrences(
+            state,
+            &segment_occurrences,
+            &branch.segment_lengths,
+            &branch.gaps,
+            branch,
+            &newlines,
+        );
     }
 
     Ok(())
@@ -1151,13 +1315,6 @@ unsafe fn build_scan_state(
 
     if let Ok(index_segments) = unsafe { read_segments(index_relation) } {
         let mut state = ScanState::default();
-        state.lossy = if is_regex {
-            true
-        } else {
-            has_single_char_wildcard
-                || pattern_has_lossy_trigram(&segments)
-                || has_short_literal_segment(&pattern_str)
-        };
         state.tombstones =
             crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
                 warning!("failed to load tombstones: {e:#}");
@@ -1166,7 +1323,6 @@ unsafe fn build_scan_state(
 
         if is_regex {
             let can_order = regex_safe_for_ordering(&pattern_str);
-            let line_oriented = regex_is_line_oriented(&pattern_str);
             if !can_order {
                 return build_full_regex_scan_state(index_relation);
             }
@@ -1186,7 +1342,6 @@ unsafe fn build_scan_state(
                 &index_segments,
                 &branch_patterns,
                 case_sensitive,
-                line_oriented,
             ) {
                 warning!("failed to evaluate regex branches: {e:#}");
                 return build_full_regex_scan_state(index_relation);
@@ -1209,7 +1364,7 @@ unsafe fn build_scan_state(
                         match cur.advance_check_position(pt.pos, pt.flags, case_sensitive) {
                             Ok(Some((tid, ok))) => {
                                 if ok {
-                                    state.push_match(tid);
+                                    state.push_match(tid, false);
                                 }
                             }
                             Ok(None) => break,
@@ -1226,11 +1381,14 @@ unsafe fn build_scan_state(
             return state;
         }
         let mut segment_occurrences: Vec<Vec<(crate::storage::ItemPointer, Vec<u32>)>> = Vec::new();
+        let mut nonregex_recheck = has_single_char_wildcard
+            || pattern_has_lossy_trigram(&segments)
+            || has_short_literal_segment(&pattern_str);
 
         for seg_pattern in &segments {
             let use_adaptive = seg_pattern.trigrams.len() > ADAPTIVE_INITIAL_TRIGRAMS;
             let occs = if use_adaptive {
-                state.lossy = true;
+                nonregex_recheck = true;
                 stream_segment_occurrences_adaptive(
                     index_relation,
                     &index_segments,
@@ -1259,7 +1417,22 @@ unsafe fn build_scan_state(
             return state;
         }
 
-        add_matches_from_segment_occurrences(&mut state, &segment_occurrences, leading_wildcard);
+        let branch = RegexBranchPattern {
+            leading_anchor: !leading_wildcard,
+            exact: !nonregex_recheck,
+            line_oriented: false,
+            segment_lengths: segments.iter().map(|seg| seg.len).collect(),
+            gaps: vec![RegexGap::ZeroOrMore; segment_occurrences.len().saturating_sub(1)],
+            segments: segments.clone(),
+        };
+        add_matches_from_segment_occurrences(
+            &mut state,
+            &segment_occurrences,
+            &branch.segment_lengths,
+            &branch.gaps,
+            &branch,
+            &std::collections::BTreeMap::new(),
+        );
 
         state.sort_dedup();
         state
@@ -1270,7 +1443,6 @@ unsafe fn build_scan_state(
 
 fn build_full_regex_scan_state(index_relation: pg_sys::Relation) -> ScanState {
     let mut state = ScanState::default();
-    state.lossy = true;
     state.tombstones =
         crate::storage::tombstone::load_snapshot(index_relation).unwrap_or_else(|e| {
             warning!("failed to load tombstones: {e:#}");
@@ -1301,7 +1473,7 @@ fn build_full_regex_scan_state(index_relation: pg_sys::Relation) -> ScanState {
                 match cur.advance() {
                     Ok(true) => {
                         if let Some(tid) = cur.current_tid() {
-                            state.push_match(tid);
+                            state.push_match(tid, true);
                         }
                     }
                     Ok(false) => break,
@@ -1371,10 +1543,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
     let Some(state) = (unsafe { state_ptr.as_mut() }) else {
         return false;
     };
-    if let Some(tid) = state.next() {
+    if let Some(entry) = state.next() {
         unsafe {
-            (*scan).xs_heaptid = tid;
-            (*scan).xs_recheck = state.lossy; // Recheck for regex and other lossy matches.
+            (*scan).xs_heaptid = entry.tid;
+            (*scan).xs_recheck = entry.recheck;
         }
         true
     } else {
@@ -1403,16 +1575,26 @@ pub unsafe extern "C-unwind" fn amgetbitmap(
     };
     let state = unsafe { &mut *state_ref };
     let mut added = 0_i64;
-    for chunk in state.matches.chunks(128) {
+    let mut idx = 0usize;
+    while idx < state.matches.len() {
+        let recheck = state.matches[idx].recheck;
+        let mut chunk_tids = Vec::with_capacity(128);
+        while idx < state.matches.len()
+            && state.matches[idx].recheck == recheck
+            && chunk_tids.len() < 128
+        {
+            chunk_tids.push(state.matches[idx].tid);
+            idx += 1;
+        }
         unsafe {
             pg_sys::tbm_add_tuples(
                 tbm,
-                chunk.as_ptr() as pg_sys::ItemPointer,
-                chunk.len() as i32,
-                state.lossy,
+                chunk_tids.as_ptr() as pg_sys::ItemPointer,
+                chunk_tids.len() as i32,
+                recheck,
             );
         }
-        added += chunk.len() as i64;
+        added += chunk_tids.len() as i64;
     }
     added
 }
@@ -1744,5 +1926,32 @@ mod tests {
                 "ish".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_exact_for_dotstar() {
+        let branch = parse_ordered_regex_branch("^foo.*bar", true).expect("branch");
+        assert!(branch.leading_anchor);
+        assert!(branch.exact);
+        assert!(!branch.line_oriented);
+        assert_eq!(branch.segment_lengths, vec![3, 3]);
+        assert_eq!(branch.gaps.len(), 1);
+        assert!(matches!(branch.gaps[0], RegexGap::ZeroOrMore));
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_lossy_for_single_char_gap() {
+        let branch = parse_ordered_regex_branch("foo.bar", true).expect("branch");
+        assert!(!branch.exact);
+        assert_eq!(branch.segment_lengths, vec![3, 3]);
+        assert_eq!(branch.gaps.len(), 1);
+        assert!(matches!(branch.gaps[0], RegexGap::AtLeastOneByte));
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_drops_exact_anchor_for_prefix_dotstar() {
+        let branch = parse_ordered_regex_branch("^.*foo", true).expect("branch");
+        assert!(!branch.leading_anchor);
+        assert!(!branch.exact);
     }
 }
