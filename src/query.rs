@@ -1,9 +1,9 @@
+use crate::storage::pgbuffer::{BufferPage, PinnedBuffer};
 use anyhow::Context;
 use pgrx::datum::FromDatum;
 use pgrx::list::PgList;
 use pgrx::prelude::*;
 use std::cmp::Ordering;
-use crate::storage::pgbuffer::{BufferPage, PinnedBuffer};
 
 type PostingCursor = crate::storage::decode::PostingCursor;
 
@@ -263,6 +263,36 @@ fn quantifier_is_optional(spec: &str) -> bool {
     }
 }
 
+fn try_consume_braced_quantifier(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    let mut probe = chars.clone();
+    let mut spec = String::new();
+    let mut saw_comma = false;
+    let mut saw_content = false;
+
+    while let Some(ch) = probe.next() {
+        match ch {
+            '0'..='9' => {
+                spec.push(ch);
+                saw_content = true;
+            }
+            ',' if !saw_comma => {
+                spec.push(ch);
+                saw_comma = true;
+                saw_content = true;
+            }
+            '}' if saw_content => {
+                *chars = probe;
+                return Some(spec);
+            }
+            _ => return None,
+        }
+    }
+
+    None
+}
+
 fn regex_to_wildcard_pattern(pattern: &str) -> String {
     let mut out = String::new();
     let mut current = String::new();
@@ -419,11 +449,13 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
     let mut escaped = false;
     let mut in_class = false;
     let mut prev_dot_wildcard = false;
+    let mut prev_gap_atom = false;
 
     while let Some(ch) = chars.next() {
         if escaped {
             escaped = false;
             prev_dot_wildcard = false;
+            prev_gap_atom = false;
             continue;
         }
         if in_class {
@@ -431,18 +463,34 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
                 escaped = true;
             } else if ch == ']' {
                 in_class = false;
+                prev_gap_atom = true;
             }
             prev_dot_wildcard = false;
             continue;
         }
         match ch {
             '\\' => {
-                escaped = true;
-                prev_dot_wildcard = false;
+                let Some(next) = chars.next() else {
+                    return false;
+                };
+                match next {
+                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                    | '\\' => {
+                        prev_dot_wildcard = false;
+                        prev_gap_atom = false;
+                    }
+                    'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | 'f' | 'v' | 'x' | 'u'
+                    | 'p' | 'P' => {
+                        prev_dot_wildcard = false;
+                        prev_gap_atom = true;
+                    }
+                    _ => return false,
+                }
             }
             '[' => {
                 in_class = true;
                 prev_dot_wildcard = false;
+                prev_gap_atom = false;
             }
             '(' => {
                 if chars.peek().copied() == Some('?') {
@@ -454,23 +502,79 @@ fn regex_safe_for_ordering(pattern: &str) -> bool {
                     }
                 }
                 prev_dot_wildcard = false;
+                prev_gap_atom = false;
             }
-            '|' | '?' | '+' | '{' => return false,
+            '|' => return false,
+            '?' | '+' | '{' => {
+                if ch == '{' && try_consume_braced_quantifier(&mut chars).is_none() {
+                    prev_gap_atom = false;
+                    prev_dot_wildcard = false;
+                    continue;
+                }
+                if !prev_gap_atom {
+                    return false;
+                }
+                prev_gap_atom = false;
+                prev_dot_wildcard = false;
+            }
             '*' => {
-                if !prev_dot_wildcard {
+                if !prev_dot_wildcard && !prev_gap_atom {
                     return false;
                 }
                 prev_dot_wildcard = false;
+                prev_gap_atom = false;
             }
             '.' => {
                 prev_dot_wildcard = true;
+                prev_gap_atom = true;
             }
             _ => {
                 prev_dot_wildcard = false;
+                prev_gap_atom = false;
             }
         }
     }
     true
+}
+
+fn consume_gap_quantifier(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<RegexGap> {
+    match chars.peek().copied() {
+        Some('*') => {
+            _ = chars.next();
+            Some(RegexGap::ZeroOrMore)
+        }
+        Some('+') => {
+            _ = chars.next();
+            Some(RegexGap::AtLeastOneByte)
+        }
+        Some('?') => {
+            _ = chars.next();
+            Some(RegexGap::ZeroOrMore)
+        }
+        Some('{') => {
+            _ = chars.next();
+            let mut spec = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                spec.push(c);
+            }
+            if !closed {
+                return None;
+            }
+            Some(if quantifier_is_optional(&spec) {
+                RegexGap::ZeroOrMore
+            } else {
+                RegexGap::AtLeastOneByte
+            })
+        }
+        _ => Some(RegexGap::AtLeastOneByte),
+    }
 }
 
 fn regex_is_line_oriented(pattern: &str) -> bool {
@@ -1138,7 +1242,8 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
                         current.push(next);
                         saw_content = true;
                     }
-                    _ => {
+                    'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | 'f' | 'v' | 'x' | 'u'
+                    | 'p' | 'P' => {
                         if literals.is_empty()
                             && !current.is_empty()
                             && !matches!(pending_gap, RegexGap::Adjacent)
@@ -1146,9 +1251,12 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
                             saw_leading_gap = true;
                         }
                         flush_current(&mut current, &mut literals, &mut gaps, pending_gap.clone());
-                        pending_gap = RegexGap::AtLeastOneByte;
+                        pending_gap = consume_gap_quantifier(&mut chars)?;
                         exact = false;
                         saw_content = true;
+                    }
+                    _ => {
+                        return None;
                     }
                 }
             }
@@ -1157,11 +1265,8 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
                     saw_leading_gap = true;
                 }
                 flush_current(&mut current, &mut literals, &mut gaps, pending_gap.clone());
-                if chars.peek().copied() == Some('*') {
-                    _ = chars.next();
-                    pending_gap = RegexGap::ZeroOrMore;
-                } else {
-                    pending_gap = RegexGap::AtLeastOneByte;
+                pending_gap = consume_gap_quantifier(&mut chars)?;
+                if !matches!(pending_gap, RegexGap::ZeroOrMore) {
                     exact = false;
                 }
                 saw_content = true;
@@ -1190,11 +1295,33 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
                 if !closed {
                     return None;
                 }
-                pending_gap = RegexGap::AtLeastOneByte;
+                pending_gap = consume_gap_quantifier(&mut chars)?;
                 exact = false;
                 saw_content = true;
             }
-            '(' | ')' | '|' | '?' | '+' | '{' | '}' => return None,
+            '(' => {
+                if chars.peek().copied() != Some('?') {
+                    return None;
+                }
+                _ = chars.next();
+                while let Some(c) = chars.next() {
+                    if c == ')' || c == ':' {
+                        break;
+                    }
+                }
+            }
+            ')' | '|' | '?' | '+' => return None,
+            '{' => {
+                if try_consume_braced_quantifier(&mut chars).is_some() {
+                    return None;
+                }
+                current.push('{');
+                saw_content = true;
+            }
+            '}' => {
+                current.push('}');
+                saw_content = true;
+            }
             other => {
                 current.push(other);
                 saw_content = true;
@@ -1204,9 +1331,14 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
 
     flush_current(&mut current, &mut literals, &mut gaps, pending_gap);
 
-    let segments: Vec<SegmentPattern> = literals
+    let retained_segments: Vec<(usize, SegmentPattern)> = literals
         .iter()
-        .filter_map(|literal| build_literal_segment_pattern(literal))
+        .enumerate()
+        .filter_map(|(idx, literal)| build_literal_segment_pattern(literal).map(|seg| (idx, seg)))
+        .collect();
+    let segments: Vec<SegmentPattern> = retained_segments
+        .iter()
+        .map(|(_, seg)| seg.clone())
         .collect();
     if segments.is_empty() {
         return None;
@@ -1214,11 +1346,39 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
 
     let segment_lengths: Vec<u32> = segments.iter().map(|seg| seg.len).collect();
     let segment_count = segments.len();
+    let first_retained = retained_segments.first().map(|(idx, _)| *idx).unwrap_or(0);
+    let last_retained = retained_segments.last().map(|(idx, _)| *idx).unwrap_or(0);
+    if first_retained > 0 {
+        exact = false;
+        leading_anchor = false;
+    }
+    if last_retained + 1 < literals.len() {
+        exact = false;
+        trailing_anchor = false;
+    }
     let gaps = if segment_count > 1 {
-        if gaps.len() != segment_count - 1 {
-            return None;
+        let mut collapsed = Vec::with_capacity(segment_count - 1);
+        for pair in retained_segments.windows(2) {
+            let prev_idx = pair[0].0;
+            let next_idx = pair[1].0;
+            let mut gap = if next_idx > prev_idx + 1 {
+                exact = false;
+                RegexGap::AtLeastOneByte
+            } else {
+                RegexGap::Adjacent
+            };
+            for original_gap in &gaps[prev_idx..next_idx] {
+                match original_gap {
+                    RegexGap::AtLeastOneByte => gap = RegexGap::AtLeastOneByte,
+                    RegexGap::ZeroOrMore if !matches!(gap, RegexGap::AtLeastOneByte) => {
+                        gap = RegexGap::ZeroOrMore
+                    }
+                    RegexGap::Adjacent | RegexGap::ZeroOrMore => {}
+                }
+            }
+            collapsed.push(gap);
         }
-        gaps
+        collapsed
     } else {
         Vec::new()
     };
@@ -1982,6 +2142,8 @@ mod tests {
         assert!(regex_safe_for_ordering("deep.*learning"));
         assert!(regex_safe_for_ordering("(?m)^.*deep.*learning.*$"));
         assert!(regex_safe_for_ordering("(?:|^)(.*)deep.*learning(.*)($)"));
+        assert!(regex_safe_for_ordering("foo\\s+bar"));
+        assert!(regex_safe_for_ordering("(?m).*unsafe \\s* {"));
         assert!(!regex_safe_for_ordering("foo|bar"));
         assert!(!regex_safe_for_ordering("ab?c"));
         assert!(!regex_safe_for_ordering("ab+c"));
@@ -1989,6 +2151,7 @@ mod tests {
         assert!(!regex_safe_for_ordering("a*b"));
         assert!(regex_safe_for_ordering("a.*b"));
         assert!(regex_safe_for_ordering("a\\*b"));
+        assert!(!regex_safe_for_ordering("foo\\bbar"));
     }
 
     #[test]
@@ -2029,6 +2192,28 @@ mod tests {
         assert_eq!(branch.segment_lengths, vec![3, 3]);
         assert_eq!(branch.gaps.len(), 1);
         assert!(matches!(branch.gaps[0], RegexGap::AtLeastOneByte));
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_supports_escaped_whitespace_gap() {
+        let branch = parse_ordered_regex_branch("foo\\s+bar", true).expect("branch");
+        assert!(!branch.exact);
+        assert_eq!(branch.segment_lengths, vec![3, 3]);
+        assert_eq!(branch.gaps.len(), 1);
+        assert!(matches!(branch.gaps[0], RegexGap::AtLeastOneByte));
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_supports_literal_brace_suffix() {
+        let branch = parse_ordered_regex_branch("(?m).*unsafe \\s* {", true).expect("branch");
+        assert!(!branch.exact);
+        assert_eq!(branch.segment_lengths, vec![7]);
+        assert!(branch.gaps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ordered_regex_branch_rejects_word_boundary_escape() {
+        assert!(parse_ordered_regex_branch("foo\\bbar", true).is_none());
     }
 
     #[test]

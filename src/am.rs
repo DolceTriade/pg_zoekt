@@ -8,8 +8,8 @@ compile_error!("pg_zoekt currently targets Postgres 18; enable the `pg18` featur
 #[cfg(feature = "pg18")]
 mod implementation {
     use super::*;
-    use anyhow::{Result as AnyResult, anyhow};
     use crate::storage::pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer};
+    use anyhow::{Result as AnyResult, anyhow};
     use pgrx::iter::TableIterator;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -333,8 +333,7 @@ mod implementation {
                 return Ok(true);
             }
         };
-        let mut root = ExclusiveBuffer::read_mut(rel, 0)
-            .map_err(|e| anyhow!("{e}"))?;
+        let mut root = ExclusiveBuffer::read_mut(rel, 0).map_err(|e| anyhow!("{e}"))?;
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
@@ -437,8 +436,7 @@ mod implementation {
         );
         root.close();
         let replacement = crate::storage::merge(rel, &victims, flush_threshold, &tombstones)?;
-        let mut root = ExclusiveBuffer::read_mut(rel, 0)
-            .map_err(|e| anyhow!("{e}"))?;
+        let mut root = ExclusiveBuffer::read_mut(rel, 0).map_err(|e| anyhow!("{e}"))?;
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
@@ -1093,9 +1091,9 @@ unsafe fn test_amvacuumcleanup(
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use crate::storage::pgbuffer::{BufferPage, MutableBufferPage};
     use pgrx::prelude::*;
     use std::collections::HashSet;
-    use crate::storage::pgbuffer::{BufferPage, MutableBufferPage};
 
     struct TestConfigGuard;
 
@@ -3513,6 +3511,82 @@ mod tests {
             assert_eq!(count_alt, 2, "expected alternation regex matches");
 
             client.update("DROP TABLE regex_docs", None, &[])?;
+            Ok(())
+        })
+    }
+
+    #[pg_test]
+    pub fn test_regex_character_class_escapes() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE regex_escape_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO regex_escape_docs (text) VALUES
+                 ('foo bar'),
+                 (E'foo\\tbar'),
+                 ('foo-bar'),
+                 ('unsafe {'),
+                 ('unsafe    {'),
+                 ('unsafe nope'),
+                 ('item 42'),
+                 ('item 007'),
+                 ('item abc')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_regex_escape_docs_text_zoekt ON regex_escape_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            client.update("SET enable_seqscan = OFF", None, &[])?;
+
+            let whitespace_count = client
+                .select(
+                    "SELECT count(*) FROM regex_escape_docs WHERE text ~ 'foo\\s+bar'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                whitespace_count, 2,
+                "expected \\s escape to match space and tab separated tokens"
+            );
+
+            let digit_count = client
+                .select(
+                    "SELECT count(*) FROM regex_escape_docs WHERE text ~ 'item\\s+\\d+'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                digit_count, 2,
+                "expected \\d escape to match numeric suffixes"
+            );
+
+            let unsafe_block_count = client
+                .select(
+                    "SELECT count(*) FROM regex_escape_docs WHERE text ~* '(?m).*unsafe \\s* {'",
+                    None,
+                    &[],
+                )?
+                .first()
+                .get::<i64>(1)?
+                .unwrap_or(0);
+            assert_eq!(
+                unsafe_block_count, 1,
+                "expected literal brace pattern with \\s* to stay indexable and match unsafe blocks"
+            );
+
+            client.update("DROP TABLE regex_escape_docs", None, &[])?;
             Ok(())
         })
     }
