@@ -1,7 +1,7 @@
 {
   rustPlatform,
   buildPgrxExtension,
-  cargo-pgrx_0_16_1,
+  cargo-pgrx_0_17_0,
   postgresql,
   fetchFromGitHub,
   lib,
@@ -29,7 +29,7 @@ in
     ];
 
     inherit postgresql;
-    cargo-pgrx = cargo-pgrx_0_16_1;
+    cargo-pgrx = cargo-pgrx_0_17_0;
 
     meta = {
       homepage = "https://github.com/DolceTriade/pg_zoekt";
