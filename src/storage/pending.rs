@@ -56,9 +56,8 @@ fn write_struct<T: Copy>(bytes: &mut [u8], value: T) {
 }
 
 pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
-    let mut header_buf =
-        ExclusiveBuffer::read_mut(rel, header_block)
-            .context("init_pending: acquire header block")?;
+    let mut header_buf = ExclusiveBuffer::read_mut(rel, header_block)
+        .context("init_pending: acquire header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -120,8 +119,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
 
 fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     {
-        let root =
-            PinnedBuffer::read(rel, root_block).context("ensure_pending_list: read root")?;
+        let root = PinnedBuffer::read(rel, root_block).context("ensure_pending_list: read root")?;
         let (version, pending_block) = {
             let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
             (rbl.version, rbl.pending_block)
@@ -134,8 +132,7 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     }
 
     let mut root =
-        ExclusiveBuffer::read_mut(rel, root_block)
-            .context("ensure_pending_list: acquire root")?;
+        ExclusiveBuffer::read_mut(rel, root_block).context("ensure_pending_list: acquire root")?;
     let rbl = root
         .as_struct_mut::<RootBlockList>(0)
         .context("root header")?;
@@ -163,8 +160,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     let header_block =
         ensure_pending_list(rel, root_block).context("append_tid: ensure pending list")?;
     let mut header_buf =
-        ExclusiveBuffer::read_mut(rel, header_block)
-            .context("append_tid: acquire header block")?;
+        ExclusiveBuffer::read_mut(rel, header_block).context("append_tid: acquire header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;

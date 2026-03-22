@@ -1612,7 +1612,11 @@ impl SegmentCursor {
         Ok(header)
     }
 
-    fn read_block_pointer<B: BufferPage>(buf: &B, idx: usize, count: usize) -> Result<BlockPointer> {
+    fn read_block_pointer<B: BufferPage>(
+        buf: &B,
+        idx: usize,
+        count: usize,
+    ) -> Result<BlockPointer> {
         if idx >= count {
             anyhow::bail!("block pointer index out of range");
         }

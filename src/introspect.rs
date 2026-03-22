@@ -401,11 +401,10 @@ pub fn pg_zoekt_wal_stats(
             error!("invalid root magic");
         }
         if rbl.wal_block != pg_sys::InvalidBlockNumber {
-            let wal_buf = PinnedBuffer::read(rel, rbl.wal_block)
-                .unwrap_or_else(|e| {
-                    pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
-                    error!("failed to read wal block: {e:#?}");
-                });
+            let wal_buf = PinnedBuffer::read(rel, rbl.wal_block).unwrap_or_else(|e| {
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!("failed to read wal block: {e:#?}");
+            });
             let wal = wal_buf.as_struct::<WALHeader>(0).unwrap_or_else(|e| {
                 pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
                 error!("failed to read wal header: {e:#?}");

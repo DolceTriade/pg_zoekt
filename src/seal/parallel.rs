@@ -1,10 +1,10 @@
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::storage::pgbuffer::{ExclusiveBuffer, MutableBufferPage};
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{self, Oid};
 use pgrx::prelude::*;
-use crate::storage::pgbuffer::{ExclusiveBuffer, MutableBufferPage};
 
 const PARALLEL_SEAL_MAIN: *const c_char = c"_pg_zoekt_seal_main".as_ptr();
 const EXTENSION_NAME: &[u8] = b"pg_zoekt\0";
