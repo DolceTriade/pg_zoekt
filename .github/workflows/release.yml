@@ -5,6 +5,7 @@ on:
     types:
       - published
   workflow_dispatch:
+  push:
 
 permissions:
   contents: write
@@ -14,7 +15,7 @@ jobs:
   package:
     runs-on: ubuntu-24.04
     container:
-      image: debian:trixie
+      image: node:trixie
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       tarball_name: ${{ steps.meta.outputs.tarball_name }}
@@ -107,6 +108,10 @@ jobs:
         with:
           files: dist/${{ steps.meta.outputs.tarball_name }}
 
+      - name: Get logs
+        if: 'always()'
+        run: nproc ; free -h ; df -h
+
   container-image:
     needs: package
     runs-on: ubuntu-24.04
@@ -162,3 +167,7 @@ jobs:
           file: .github/docker/release-image.Dockerfile
           push: true
           tags: ${{ steps.image.outputs.name }}:${{ needs.package.outputs.image_tag }}
+
+      - name: Get logs
+        if: 'always()'
+        run: nproc ; free -h ; df -h
