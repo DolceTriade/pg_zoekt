@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pgrx::prelude::*;
 
-use crate::storage::pgbuffer::BlockBuffer;
+use crate::storage::pgbuffer::{ExclusiveBuffer, MutableBufferPage};
 
 mod parallel;
 
@@ -72,7 +72,7 @@ fn flush_segments(
     drop(trgms);
     match res {
         Ok(segs) => {
-            let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0) {
+            let mut root = match ExclusiveBuffer::read_mut(rel, 0) {
                 Ok(root) => root,
                 Err(e) => {
                     error!("failed to acquire root buffer: {e:#?}");
@@ -287,7 +287,7 @@ fn finalize_segment_list(
     let _lock = crate::storage::maintenance_lock_blocking(index_relation)
         .unwrap_or_else(|| error!("failed to acquire maintenance lock"));
     let existing = {
-        let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+        let mut root_buffer = match ExclusiveBuffer::read_mut(index_relation, root_block) {
             Ok(root_buffer) => root_buffer,
             Err(e) => {
                 error!("failed to acquire root buffer: {e:#?}");
@@ -337,7 +337,7 @@ fn finalize_segment_list(
         merged.len(),
         merge_start.elapsed().as_millis()
     );
-    let mut root_buffer = match BlockBuffer::aquire_mut(index_relation, root_block) {
+    let mut root_buffer = match ExclusiveBuffer::read_mut(index_relation, root_block) {
         Ok(root_buffer) => root_buffer,
         Err(e) => {
             error!("failed to acquire root buffer: {e:#?}");

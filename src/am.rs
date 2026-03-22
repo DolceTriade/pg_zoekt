@@ -9,6 +9,7 @@ compile_error!("pg_zoekt currently targets Postgres 18; enable the `pg18` featur
 mod implementation {
     use super::*;
     use anyhow::{Result as AnyResult, anyhow};
+    use crate::storage::pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer};
     use pgrx::iter::TableIterator;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -332,7 +333,7 @@ mod implementation {
                 return Ok(true);
             }
         };
-        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+        let mut root = ExclusiveBuffer::read_mut(rel, 0)
             .map_err(|e| anyhow!("{e}"))?;
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
@@ -436,7 +437,7 @@ mod implementation {
         );
         root.close();
         let replacement = crate::storage::merge(rel, &victims, flush_threshold, &tombstones)?;
-        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+        let mut root = ExclusiveBuffer::read_mut(rel, 0)
             .map_err(|e| anyhow!("{e}"))?;
         let rbl = root
             .as_struct_mut::<crate::storage::RootBlockList>(0)
@@ -470,7 +471,7 @@ mod implementation {
         match res {
             Ok(segs) => {
                 let count = segs.len();
-                let mut root = match crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0) {
+                let mut root = match ExclusiveBuffer::read_mut(rel, 0) {
                     Ok(root) => root,
                     Err(e) => {
                         error!("failed to acquire root buffer: {e:#?}");
@@ -681,7 +682,7 @@ mod implementation {
     fn segment_count(index: pg_sys::Oid) -> i32 {
         unsafe {
             let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
-            let root = match crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0) {
+            let root = match PinnedBuffer::read(rel, 0) {
                 Ok(root) => root,
                 Err(e) => {
                     pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
@@ -757,7 +758,7 @@ mod implementation {
                 }
             };
             let res: AnyResult<()> = (|| {
-                let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0)
+                let root = PinnedBuffer::read(rel, 0)
                     .map_err(|e| anyhow!("failed to acquire root buffer: {e:#?}"))?;
                 let rbl = root
                     .as_struct::<crate::storage::RootBlockList>(0)
@@ -1094,6 +1095,7 @@ unsafe fn test_amvacuumcleanup(
 mod tests {
     use pgrx::prelude::*;
     use std::collections::HashSet;
+    use crate::storage::pgbuffer::{BufferPage, MutableBufferPage};
 
     struct TestConfigGuard;
 
@@ -1964,8 +1966,7 @@ mod tests {
 
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
-            let root =
-                crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("acquire root");
+            let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("acquire root");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
@@ -2391,7 +2392,6 @@ mod tests {
             )?;
             Ok(())
         })?;
-
         let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
             let mut rows = client
                 .select(
@@ -2407,7 +2407,7 @@ mod tests {
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
             let segments = crate::query::read_segments(rel).expect("failed to read segments");
-            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
+            let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("root buffer");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
@@ -2415,7 +2415,7 @@ mod tests {
             // Clear free list to force extension on allocate_block.
             if rbl.wal_block != pg_sys::InvalidBlockNumber {
                 let mut wal_buf =
-                    crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
+                    crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, rbl.wal_block)
                         .expect("wal buffer");
                 let wal = wal_buf
                     .as_struct_mut::<crate::storage::WALHeader>(0)
@@ -2431,7 +2431,8 @@ mod tests {
             let mut extra = Vec::new();
             for _ in 0..8 {
                 let page = crate::storage::allocate_block(rel);
-                extra.push(page.block_number());
+                extra.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
             }
 
             let nblocks_after_alloc =
@@ -2478,7 +2479,6 @@ mod tests {
             )?;
             Ok(())
         })?;
-
         let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
             let mut rows = client
                 .select(
@@ -2493,14 +2493,14 @@ mod tests {
 
         let (expected_free_max, expected_high_water) = unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
-            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
+            let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("root buffer");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
 
             if rbl.wal_block != pg_sys::InvalidBlockNumber {
                 let mut wal_buf =
-                    crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)
+                    crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, rbl.wal_block)
                         .expect("wal buffer");
                 let wal = wal_buf
                     .as_struct_mut::<crate::storage::WALHeader>(0)
@@ -2513,7 +2513,8 @@ mod tests {
             let mut allocated = Vec::new();
             for _ in 0..3 {
                 let page = crate::storage::allocate_block(rel);
-                allocated.push(page.block_number());
+                allocated.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
             }
             let freed = vec![allocated[0], allocated[1]];
             crate::storage::free_blocks(rel, &freed).expect("failed to free blocks");
@@ -2635,7 +2636,7 @@ mod tests {
     fn tombstone_bytes(index_oid: pg_sys::Oid) -> u32 {
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
-            let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).expect("root buffer");
+            let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("root buffer");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
@@ -2666,7 +2667,6 @@ mod tests {
             )?;
             Ok(())
         })?;
-
         let index_oid: pg_sys::Oid = Spi::connect_mut(|client| -> spi::Result<_> {
             let mut rows = client
                 .select(

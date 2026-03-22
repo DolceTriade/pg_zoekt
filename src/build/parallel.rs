@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{self, Oid};
 use pgrx::prelude::*;
+use crate::storage::pgbuffer::{ExclusiveBuffer, MutableBufferPage};
 
 const PARALLEL_BUILD_MAIN: *const c_char = c"_pg_zoekt_build_main".as_ptr();
 const EXTENSION_NAME: &[u8] = b"pg_zoekt\0";
@@ -321,7 +322,7 @@ pub(super) unsafe fn build_parallel(
 
         // Now append all collected segments to the main index at once
         let mut root =
-            match crate::storage::pgbuffer::BlockBuffer::aquire_mut(index_relation, root_block) {
+            match ExclusiveBuffer::read_mut(index_relation, root_block) {
                 Ok(root) => root,
                 Err(e) => {
                     error!("failed to acquire root buffer: {e:#?}");

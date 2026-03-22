@@ -26,6 +26,7 @@ mod parallel_merge;
 pub mod pending;
 pub mod pgbuffer;
 pub mod tombstone;
+use pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer};
 
 pub const VERSION: u16 = 6;
 pub const ROOT_MAGIC: u32 = u32::from_ne_bytes(*b"pZKT");
@@ -432,7 +433,7 @@ const fn segment_list_capacity(version: u16) -> usize {
     (pgbuffer::SPECIAL_SIZE - header) / seg
 }
 
-fn segment_list_init_page(rel: pg_sys::Relation) -> Result<pgbuffer::BlockBuffer> {
+fn segment_list_init_page(rel: pg_sys::Relation) -> Result<pgbuffer::ExclusiveBuffer> {
     let mut page = allocate_block(rel);
     let hdr = page
         .as_struct_mut::<SegmentListPageHeader>(0)
@@ -467,7 +468,7 @@ pub fn segment_list_append(
 
     let mut remaining = segments;
     while !remaining.is_empty() {
-        let mut tail = pgbuffer::BlockBuffer::aquire_mut(rel, root.segment_list_tail)?;
+        let mut tail = ExclusiveBuffer::read_mut(rel, root.segment_list_tail)?;
         let (used, next_block) = {
             let hdr = tail
                 .as_struct_mut::<SegmentListPageHeader>(0)
@@ -560,7 +561,7 @@ pub fn segment_list_read(rel: pg_sys::Relation, root: &RootBlockList) -> Result<
     let mut out = Vec::with_capacity(root.num_segments as usize);
     let mut blk = root.segment_list_head;
     while blk != pg_sys::InvalidBlockNumber && out.len() < root.num_segments as usize {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let buf = PinnedBuffer::read(rel, blk)?;
         let hdr = buf
             .as_struct::<SegmentListPageHeader>(0)
             .context("segment list header")?;
@@ -626,8 +627,7 @@ fn segment_extent_list_write(rel: pg_sys::Relation, extents: &[SegmentExtent]) -
         if head == pg_sys::InvalidBlockNumber {
             head = blk;
         } else {
-            let mut prev =
-                pgbuffer::BlockBuffer::aquire_mut(rel, tail).context("extent list page")?;
+            let mut prev = ExclusiveBuffer::read_mut(rel, tail).context("extent list page")?;
             let prev_hdr = prev
                 .as_struct_mut::<SegmentExtentListPageHeader>(0)
                 .context("segment extent list header")?;
@@ -674,7 +674,7 @@ pub(crate) fn segment_extent_list_read(
     let mut blk = head;
     while blk != pg_sys::InvalidBlockNumber && extents.len() < count as usize {
         pages.push(blk);
-        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let buf = PinnedBuffer::read(rel, blk)?;
         let hdr = buf
             .as_struct::<SegmentExtentListPageHeader>(0)
             .context("segment extent list header")?;
@@ -717,7 +717,7 @@ pub(crate) fn collect_segment_list_pages(rel: pg_sys::Relation, head: u32) -> Re
     let mut blk = head;
     while blk != pg_sys::InvalidBlockNumber {
         pages.push(blk);
-        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let buf = PinnedBuffer::read(rel, blk)?;
         let hdr = buf
             .as_struct::<SegmentListPageHeader>(0)
             .context("segment list header")?;
@@ -865,7 +865,7 @@ fn entry_fields(entry: &IndexEntry) -> (u32, u16, u32) {
 }
 
 fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
-    let root = match pgbuffer::BlockBuffer::acquire(rel, 0) {
+    let root = match PinnedBuffer::read(rel, 0) {
         Ok(root) => root,
         Err(_) => return Ok(None),
     };
@@ -875,7 +875,7 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
         return Ok(None);
     }
 
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
@@ -893,7 +893,7 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
             wal.free_max_block = pg_sys::InvalidBlockNumber;
             break;
         }
-        let free_buf = match pgbuffer::BlockBuffer::acquire(rel, head) {
+        let free_buf = match PinnedBuffer::read(rel, head) {
             Ok(buf) => buf,
             Err(e) => {
                 warning!("free list corruption: cannot read block {}: {e:#}", head);
@@ -932,18 +932,18 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     Ok(None)
 }
 
-pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
+pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::ExclusiveBuffer {
     match pop_free_block(rel) {
         Ok(Some(block)) => {
-            let mut page = match pgbuffer::BlockBuffer::aquire_mut(rel, block) {
+            let mut page = match ExclusiveBuffer::read_mut(rel, block) {
                 Ok(page) => page,
-                Err(_) => return pgbuffer::BlockBuffer::allocate(rel),
+                Err(_) => return ExclusiveBuffer::allocate(rel),
             };
             page.init_page();
             page
         }
         _ => {
-            let page = pgbuffer::BlockBuffer::allocate(rel);
+            let page = ExclusiveBuffer::allocate(rel);
             let block = page.block_number();
             if let Err(err) = update_high_water_block(rel, block) {
                 warning!("failed to update high-water mark: {err:#?}");
@@ -956,7 +956,7 @@ pub fn allocate_block(rel: pg_sys::Relation) -> pgbuffer::BlockBuffer {
 pub(crate) fn allocate_block_tracked(
     rel: pg_sys::Relation,
     tracker: Option<*mut BlockExtentTracker>,
-) -> pgbuffer::BlockBuffer {
+) -> pgbuffer::ExclusiveBuffer {
     let page = allocate_block(rel);
     record_block(tracker, page.block_number());
     page
@@ -967,14 +967,21 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         return Ok(());
     }
 
-    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
+    info!(
+        "free_blocks: start blocks={} live_buffer_owners={} high_water={}",
+        blocks.len(),
+        pgbuffer::test_live_buffer_owners(),
+        pgbuffer::test_buffer_owner_high_water()
+    );
+
+    let root = PinnedBuffer::read(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
         root.close();
         return Ok(());
     }
 
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
@@ -993,7 +1000,13 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         {
             continue;
         }
-        let mut page = pgbuffer::BlockBuffer::aquire_mut(rel, *block)?;
+        info!(
+            "free_blocks: reclaiming block={} live_buffer_owners={} high_water={}",
+            block,
+            pgbuffer::test_live_buffer_owners(),
+            pgbuffer::test_buffer_owner_high_water()
+        );
+        let mut page = ExclusiveBuffer::read_mut(rel, *block)?;
         let header = page
             .as_struct_mut::<FreePageHeader>(0)
             .context("free page header")?;
@@ -1011,6 +1024,11 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     }
     wal_buf.close();
     root.close();
+    info!(
+        "free_blocks: done live_buffer_owners={} high_water={}",
+        pgbuffer::test_live_buffer_owners(),
+        pgbuffer::test_buffer_owner_high_water()
+    );
     Ok(())
 }
 
@@ -1019,7 +1037,7 @@ pub(crate) fn initialize_index_storage(
     expect_root_block_zero: bool,
 ) -> Result<IndexBootstrapBlocks> {
     let root_block = {
-        let mut root_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        let mut root_buffer = ExclusiveBuffer::allocate(rel);
         let root_block = root_buffer.block_number();
         if expect_root_block_zero && root_block != 0 {
             anyhow::bail!("expected root block 0 for empty index, got {root_block}");
@@ -1041,7 +1059,7 @@ pub(crate) fn initialize_index_storage(
     };
 
     let pending_block = {
-        let pending_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        let pending_buffer = ExclusiveBuffer::allocate(rel);
         let block = pending_buffer.block_number();
         pending_buffer.close();
         block
@@ -1049,7 +1067,7 @@ pub(crate) fn initialize_index_storage(
     pending::init_pending(rel, pending_block).context("initialize_index_storage: init pending")?;
 
     let wal_block = {
-        let mut wal_buffer = pgbuffer::BlockBuffer::allocate(rel);
+        let mut wal_buffer = ExclusiveBuffer::allocate(rel);
         let wal_block = wal_buffer.block_number();
         let wal = wal_buffer
             .as_struct_mut::<WALHeader>(0)
@@ -1066,7 +1084,7 @@ pub(crate) fn initialize_index_storage(
     };
 
     {
-        let mut root_buffer = pgbuffer::BlockBuffer::aquire_mut(rel, root_block)
+        let mut root_buffer = ExclusiveBuffer::read_mut(rel, root_block)
             .context("initialize_index_storage: reacquire root")?;
         let rbl = root_buffer
             .as_struct_mut::<RootBlockList>(0)
@@ -1084,13 +1102,13 @@ pub(crate) fn initialize_index_storage(
 }
 
 fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {
-    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
+    let root = PinnedBuffer::read(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.magic != ROOT_MAGIC || rbl.version < 5 || rbl.wal_block == pg_sys::InvalidBlockNumber {
         root.close();
         return Ok(());
     }
-    let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+    let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
     let wal = wal_buf
         .as_struct_mut::<WALHeader>(0)
         .context("wal header")?;
@@ -1110,7 +1128,7 @@ pub(crate) fn collect_segment_tree_blocks(
     if !out.insert(block) {
         return Ok(());
     }
-    let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+    let buf = PinnedBuffer::read(rel, block)?;
     let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
     if header.magic != BLOCK_MAGIC {
         buf.close();
@@ -1147,7 +1165,7 @@ pub(crate) fn collect_posting_blocks(
         if !out.insert(block) {
             break;
         }
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = PinnedBuffer::read(rel, block)?;
         let header = buf
             .as_struct::<PostingPageHeader>(0)
             .context("posting page header")?;
@@ -1190,7 +1208,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
         collect_segment_tree_blocks(rel, seg.block, &mut blocks)?;
         let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
         for leaf in leaf_blocks {
-            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let buf = PinnedBuffer::read(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
                 buf.close();
@@ -1225,7 +1243,7 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
     if wal_block == pg_sys::InvalidBlockNumber {
         return Ok(Vec::new());
     }
-    let wal_buf = pgbuffer::BlockBuffer::acquire(rel, wal_block)?;
+    let wal_buf = PinnedBuffer::read(rel, wal_block)?;
     let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
     let mut out = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -1236,7 +1254,7 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
             break;
         }
         out.push(blk);
-        let buf = pgbuffer::BlockBuffer::acquire(rel, blk)?;
+        let buf = PinnedBuffer::read(rel, blk)?;
         let hdr = buf
             .as_struct::<FreePageHeader>(0)
             .context("free page header")?;
@@ -1300,7 +1318,7 @@ fn collect_reachable_blocks(
         collect_segment_tree_blocks(rel, seg.block, &mut used)?;
         let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
         for leaf in leaf_blocks {
-            let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
+            let buf = PinnedBuffer::read(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
                 buf.close();
@@ -1358,7 +1376,7 @@ pub fn reclaim_orphan_blocks(
 }
 
 fn block_is_free_page(rel: pg_sys::Relation, block: u32) -> Result<bool> {
-    let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+    let buf = PinnedBuffer::read(rel, block)?;
     let hdr = buf
         .as_struct::<FreePageHeader>(0)
         .context("free page header")?;
@@ -1380,7 +1398,7 @@ pub fn maybe_truncate_relation(
         return Ok(());
     }
     if rbl.version >= 5 && rbl.wal_block != pg_sys::InvalidBlockNumber {
-        let wal_buf = pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)?;
+        let wal_buf = PinnedBuffer::read(rel, rbl.wal_block)?;
         let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
         if wal.free_max_block == pg_sys::InvalidBlockNumber {
             wal_buf.close();
@@ -1417,13 +1435,13 @@ pub fn maybe_truncate_relation(
 
     let freelist_rewrite_start = std::time::Instant::now();
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
-        let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
+        let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
         let wal = wal_buf
             .as_struct_mut::<WALHeader>(0)
             .context("wal header")?;
         let mut head = pg_sys::InvalidBlockNumber;
         for block in &keep {
-            let mut page = pgbuffer::BlockBuffer::aquire_mut(rel, *block)?;
+            let mut page = ExclusiveBuffer::read_mut(rel, *block)?;
             let header = page
                 .as_struct_mut::<FreePageHeader>(0)
                 .context("free page header")?;
@@ -1573,27 +1591,19 @@ struct InternalFrame {
 struct SegmentCursor {
     rel: pg_sys::Relation,
     stack: Vec<InternalFrame>,
-    leaf: Option<pgbuffer::BlockBuffer>,
+    leaf_block: Option<u32>,
     leaf_entry_idx: usize,
     leaf_entry_count: usize,
     current: Option<IndexEntry>,
 }
 
 impl SegmentCursor {
-    fn close(mut self) {
-        if let Some(leaf) = self.leaf.take() {
-            leaf.close();
-        }
-    }
+    fn close(self) {}
 
-    fn abandon(mut self) {
-        if let Some(leaf) = self.leaf.take() {
-            leaf.abandon();
-        }
-    }
+    fn abandon(self) {}
 
-    fn read_block_header(buf: &pgbuffer::BlockBuffer) -> Result<BlockHeader> {
-        let bytes = buf.as_ref();
+    fn read_block_header<B: BufferPage>(buf: &B) -> Result<BlockHeader> {
+        let bytes = buf.bytes();
         let size = std::mem::size_of::<BlockHeader>();
         if size > pgbuffer::SPECIAL_SIZE {
             anyhow::bail!("block header size exceeds page");
@@ -1602,11 +1612,7 @@ impl SegmentCursor {
         Ok(header)
     }
 
-    fn read_block_pointer(
-        buf: &pgbuffer::BlockBuffer,
-        idx: usize,
-        count: usize,
-    ) -> Result<BlockPointer> {
+    fn read_block_pointer<B: BufferPage>(buf: &B, idx: usize, count: usize) -> Result<BlockPointer> {
         if idx >= count {
             anyhow::bail!("block pointer index out of range");
         }
@@ -1618,16 +1624,12 @@ impl SegmentCursor {
         if offset + size > pgbuffer::SPECIAL_SIZE {
             anyhow::bail!("block pointer offset out of bounds");
         }
-        let bytes = buf.as_ref();
+        let bytes = buf.bytes();
         let ptr = unsafe { bytes.as_ptr().add(offset) as *const BlockPointer };
         Ok(unsafe { std::ptr::read_unaligned(ptr) })
     }
 
-    fn read_index_entry(
-        buf: &pgbuffer::BlockBuffer,
-        idx: usize,
-        count: usize,
-    ) -> Result<IndexEntry> {
+    fn read_index_entry<B: BufferPage>(buf: &B, idx: usize, count: usize) -> Result<IndexEntry> {
         if idx >= count {
             anyhow::bail!("index entry out of range");
         }
@@ -1639,7 +1641,7 @@ impl SegmentCursor {
         if offset + size > pgbuffer::SPECIAL_SIZE {
             anyhow::bail!("index entry offset out of bounds");
         }
-        let bytes = buf.as_ref();
+        let bytes = buf.bytes();
         let ptr = unsafe { bytes.as_ptr().add(offset) as *const IndexEntry };
         Ok(unsafe { std::ptr::read_unaligned(ptr) })
     }
@@ -1648,7 +1650,7 @@ impl SegmentCursor {
         let mut cursor = Self {
             rel,
             stack: Vec::new(),
-            leaf: None,
+            leaf_block: None,
             leaf_entry_idx: 0,
             leaf_entry_count: 0,
             current: None,
@@ -1663,7 +1665,7 @@ impl SegmentCursor {
     }
 
     fn read_child_block(&self, block: u32, idx: usize) -> Result<u32> {
-        let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+        let buf = PinnedBuffer::read(self.rel, block)?;
         let header = Self::read_block_header(&buf)?;
         if header.magic != BLOCK_MAGIC {
             buf.close();
@@ -1676,7 +1678,7 @@ impl SegmentCursor {
 
     fn descend_leftmost(&mut self, mut block: u32) -> Result<()> {
         loop {
-            let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
+            let buf = PinnedBuffer::read(self.rel, block)?;
             let header = Self::read_block_header(&buf)?;
             if header.magic != BLOCK_MAGIC {
                 buf.close();
@@ -1685,15 +1687,14 @@ impl SegmentCursor {
             if header.level == 0 {
                 self.leaf_entry_idx = 0;
                 self.leaf_entry_count = header.num_entries as usize;
-                self.leaf = Some(buf);
+                self.leaf_block = Some(block);
+                buf.close();
                 return Ok(());
             }
             let count = header.num_entries as usize;
             if count == 0 {
                 buf.close();
-                if let Some(leaf) = self.leaf.take() {
-                    leaf.close();
-                }
+                self.leaf_block = None;
                 self.leaf_entry_count = 0;
                 return Ok(());
             }
@@ -1709,9 +1710,7 @@ impl SegmentCursor {
     }
 
     fn advance_leaf(&mut self) -> Result<bool> {
-        if let Some(leaf) = self.leaf.take() {
-            leaf.close();
-        }
+        self.leaf_block = None;
         self.leaf_entry_idx = 0;
         self.leaf_entry_count = 0;
         while let Some(mut frame) = self.stack.pop() {
@@ -1730,13 +1729,15 @@ impl SegmentCursor {
     }
 
     fn load_current_entry(&mut self) -> Result<bool> {
-        let Some(leaf) = self.leaf.as_ref() else {
+        let Some(leaf_block) = self.leaf_block else {
             return Ok(false);
         };
         if self.leaf_entry_idx >= self.leaf_entry_count {
             return Ok(false);
         }
-        let entry = Self::read_index_entry(leaf, self.leaf_entry_idx, self.leaf_entry_count)?;
+        let leaf = PinnedBuffer::read(self.rel, leaf_block)?;
+        let entry = Self::read_index_entry(&leaf, self.leaf_entry_idx, self.leaf_entry_count)?;
+        leaf.close();
         self.leaf_entry_idx += 1;
         self.current = Some(entry);
         Ok(true)
@@ -1760,7 +1761,7 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
     let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
     let mut all_entries = Vec::new();
     for leaf_block in leaf_blocks {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
+        let buf = PinnedBuffer::read(rel, leaf_block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             buf.close();
@@ -1789,7 +1790,7 @@ pub fn resolve_leaf_for_trigram(
 ) -> Result<Option<u32>> {
     let mut block = root_block;
     loop {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = PinnedBuffer::read(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             buf.close();
@@ -1828,7 +1829,7 @@ pub fn resolve_leaf_for_trigram(
 
 pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec<u32>> {
     fn collect(rel: pg_sys::Relation, block: u32, out: &mut Vec<u32>) -> Result<()> {
-        let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
+        let buf = PinnedBuffer::read(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
             buf.close();
@@ -1988,7 +1989,7 @@ pub fn merge(
         Ok(())
     }
 
-    let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
+    let root = PinnedBuffer::read(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     let track_extents = rbl.magic == ROOT_MAGIC && rbl.version >= 6;
     let mut tracker = BlockExtentTracker::default();
@@ -2038,7 +2039,7 @@ pub fn merge(
     // Stream postings directly into pages while building leaf index entries.
     let mut writer =
         crate::storage::encode::PageWriter::new(rel, pgbuffer::SPECIAL_SIZE, tracker_ptr);
-    let mut leaf: Option<pgbuffer::BlockBuffer> = None;
+    let mut leaf: Option<ExclusiveBuffer> = None;
     let mut leaf_block = pg_sys::InvalidBlockNumber;
     let mut leaf_min_trigram: Option<u32> = None;
     let mut leaf_entries_written: usize = 0;
@@ -2055,7 +2056,7 @@ pub fn merge(
 
     fn start_leaf(
         rel: pg_sys::Relation,
-        leaf: &mut Option<pgbuffer::BlockBuffer>,
+        leaf: &mut Option<ExclusiveBuffer>,
         leaf_block: &mut u32,
         leaf_entries_written: &mut usize,
         leaf_min_trigram: &mut Option<u32>,
@@ -2076,7 +2077,7 @@ pub fn merge(
     }
 
     fn finalize_leaf(
-        leaf: &mut Option<pgbuffer::BlockBuffer>,
+        leaf: &mut Option<ExclusiveBuffer>,
         leaf_entries_written: usize,
         leaf_min_trigram: &Option<u32>,
         leaf_block: u32,

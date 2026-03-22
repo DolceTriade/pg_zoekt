@@ -5,7 +5,7 @@ use zerocopy::TryFromBytes;
 use std::io::Write;
 
 use super::{CompressedBlockHeader, IndexEntry, ItemPointer};
-use crate::storage::pgbuffer::BlockBuffer;
+use crate::storage::pgbuffer::{BufferPage, PinnedBuffer};
 
 #[derive(Debug, Clone)]
 pub struct DocPosting {
@@ -54,7 +54,7 @@ pub struct PostingCursor {
 #[derive(Debug)]
 struct PostingReader {
     rel: pg_sys::Relation,
-    buf: BlockBuffer,
+    buf: PinnedBuffer,
     header: super::PostingPageHeader,
     cursor: usize,
     page_free: usize,
@@ -78,7 +78,7 @@ impl PostingReader {
                 nblocks
             );
         }
-        let buf = BlockBuffer::acquire(rel, block)?;
+        let buf = PinnedBuffer::read(rel, block)?;
         let header_copy = {
             let header = buf
                 .as_struct::<super::PostingPageHeader>(0)
@@ -150,7 +150,7 @@ impl PostingReader {
                 nblocks
             );
         }
-        let next_buf = BlockBuffer::acquire(self.rel, next_block)?;
+        let next_buf = PinnedBuffer::read(self.rel, next_block)?;
         let header_copy = {
             let header = next_buf
                 .as_struct::<super::PostingPageHeader>(0)
