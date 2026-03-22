@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use super::{
-    ItemPointer, PENDING_BUCKET_MAGIC, PENDING_MAGIC, RootBlockList, pgbuffer::BlockBuffer,
+    ItemPointer, PENDING_BUCKET_MAGIC, PENDING_MAGIC, RootBlockList,
+    pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer},
 };
 
 const PAGE_HEADER_SIZE: usize = std::mem::size_of::<PendingBucket>();
@@ -56,7 +57,8 @@ fn write_struct<T: Copy>(bytes: &mut [u8], value: T) {
 
 pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
     let mut header_buf =
-        BlockBuffer::aquire_mut(rel, header_block).context("init_pending: acquire header block")?;
+        ExclusiveBuffer::read_mut(rel, header_block)
+            .context("init_pending: acquire header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -86,7 +88,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
     if *free_head != INVALID_BLOCK {
         let block = *free_head;
         let mut page =
-            BlockBuffer::aquire_mut(rel, block).context("allocate_page: acquire free block")?;
+            ExclusiveBuffer::read_mut(rel, block).context("allocate_page: acquire free block")?;
         let next = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -119,7 +121,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
 fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     {
         let root =
-            BlockBuffer::acquire(rel, root_block).context("ensure_pending_list: read root")?;
+            PinnedBuffer::read(rel, root_block).context("ensure_pending_list: read root")?;
         let (version, pending_block) = {
             let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
             (rbl.version, rbl.pending_block)
@@ -132,7 +134,8 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     }
 
     let mut root =
-        BlockBuffer::aquire_mut(rel, root_block).context("ensure_pending_list: acquire root")?;
+        ExclusiveBuffer::read_mut(rel, root_block)
+            .context("ensure_pending_list: acquire root")?;
     let rbl = root
         .as_struct_mut::<RootBlockList>(0)
         .context("root header")?;
@@ -141,7 +144,12 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
         root.close();
         return Ok(block);
     }
-    let header_block = super::allocate_block(rel).block_number();
+    let header_block = {
+        let page = super::allocate_block(rel);
+        let block = page.block_number();
+        page.close();
+        block
+    };
     init_pending(rel, header_block).context("ensure_pending_list: init header")?;
     rbl.pending_block = header_block;
     if rbl.version < super::VERSION {
@@ -155,7 +163,8 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     let header_block =
         ensure_pending_list(rel, root_block).context("append_tid: ensure pending list")?;
     let mut header_buf =
-        BlockBuffer::aquire_mut(rel, header_block).context("append_tid: acquire header block")?;
+        ExclusiveBuffer::read_mut(rel, header_block)
+            .context("append_tid: acquire header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -185,7 +194,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
 
     let tail_block = header.tail_block;
     let mut page =
-        BlockBuffer::aquire_mut(rel, tail_block).context("append_tid: acquire tail page")?;
+        ExclusiveBuffer::read_mut(rel, tail_block).context("append_tid: acquire tail page")?;
     let free = {
         let header = page
             .as_struct::<PendingBucket>(0)
@@ -206,7 +215,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         page.close();
         let new_block =
             allocate_page(rel, &mut header.free_head).context("append_tid: allocate new page")?;
-        let mut old_tail = BlockBuffer::aquire_mut(rel, header.tail_block)
+        let mut old_tail = ExclusiveBuffer::read_mut(rel, header.tail_block)
             .context("append_tid: acquire old tail")?;
         let old_header = old_tail
             .as_struct_mut::<PendingBucket>(0)
@@ -215,7 +224,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         old_tail.close();
 
         header.tail_block = new_block;
-        page = BlockBuffer::aquire_mut(rel, header.tail_block)
+        page = ExclusiveBuffer::read_mut(rel, header.tail_block)
             .context("append_tid: acquire new tail")?;
     }
 
@@ -275,7 +284,7 @@ pub fn bytes_used(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     let header_block =
         ensure_pending_list(rel, root_block).context("bytes_used: ensure pending list")?;
     let header_buf =
-        BlockBuffer::acquire(rel, header_block).context("bytes_used: acquire header block")?;
+        PinnedBuffer::read(rel, header_block).context("bytes_used: acquire header block")?;
     let header = header_buf
         .as_struct::<PendingHeader>(0)
         .context("bytes_used: pending header")?;
@@ -290,7 +299,7 @@ pub fn bytes_used(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
 
 pub fn detach_pending(rel: pg_sys::Relation, root_block: u32) -> Result<Option<u32>> {
     let header_block = ensure_pending_list(rel, root_block)?;
-    let mut header_buf = BlockBuffer::aquire_mut(rel, header_block)?;
+    let mut header_buf = ExclusiveBuffer::read_mut(rel, header_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
@@ -315,7 +324,7 @@ pub fn collect_blocks(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
     let mut blocks = Vec::new();
     let mut current_block = Some(head);
     while let Some(block) = current_block {
-        let page = BlockBuffer::acquire(rel, block)?;
+        let page = PinnedBuffer::read(rel, block)?;
         let next = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -337,7 +346,7 @@ pub fn collect_blocks(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
 }
 
 pub fn collect_all_blocks(rel: pg_sys::Relation, header_block: u32) -> Result<Vec<u32>> {
-    let page = BlockBuffer::acquire(rel, header_block)?;
+    let page = PinnedBuffer::read(rel, header_block)?;
     let header = page
         .as_struct::<PendingHeader>(0)
         .context("pending header")?;
@@ -358,7 +367,7 @@ pub fn drain_block_entries<F>(rel: pg_sys::Relation, block: u32, mut on_tid: F) 
 where
     F: FnMut(ItemPointer),
 {
-    let page = BlockBuffer::acquire(rel, block)?;
+    let page = PinnedBuffer::read(rel, block)?;
     let used = {
         let header = page
             .as_struct::<PendingBucket>(0)
@@ -395,7 +404,7 @@ where
     let mut count = 0usize;
 
     while let Some(block) = current_block {
-        let page = BlockBuffer::acquire(rel, block)?;
+        let page = PinnedBuffer::read(rel, block)?;
         let (next, used) = {
             let header = page
                 .as_struct::<PendingBucket>(0)
@@ -430,15 +439,15 @@ where
 
     // Return pages to free list.
     if !freed_pages.is_empty() {
-        let root = BlockBuffer::acquire(rel, 0)?;
+        let root = PinnedBuffer::read(rel, 0)?;
         let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
         if rbl.pending_block != INVALID_BLOCK {
-            let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)?;
+            let mut header_buf = ExclusiveBuffer::read_mut(rel, rbl.pending_block)?;
             let header = header_buf
                 .as_struct_mut::<PendingHeader>(0)
                 .context("pending header")?;
             for block in freed_pages {
-                let mut page = BlockBuffer::aquire_mut(rel, block)?;
+                let mut page = ExclusiveBuffer::read_mut(rel, block)?;
                 let page_header = page
                     .as_struct_mut::<PendingBucket>(0)
                     .context("pending page header")?;
@@ -460,18 +469,18 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     if blocks.is_empty() {
         return Ok(());
     }
-    let root = BlockBuffer::acquire(rel, 0)?;
+    let root = PinnedBuffer::read(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.pending_block == INVALID_BLOCK {
         root.close();
         return Ok(());
     }
-    let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)?;
+    let mut header_buf = ExclusiveBuffer::read_mut(rel, rbl.pending_block)?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
     for block in blocks {
-        let mut page = BlockBuffer::aquire_mut(rel, *block)?;
+        let mut page = ExclusiveBuffer::read_mut(rel, *block)?;
         let page_header = page
             .as_struct_mut::<PendingBucket>(0)
             .context("pending page header")?;
@@ -487,7 +496,7 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
 }
 
 pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
-    let root = BlockBuffer::acquire(rel, 0).context("cleanup_free_list: root")?;
+    let root = PinnedBuffer::read(rel, 0).context("cleanup_free_list: root")?;
     let rbl = root
         .as_struct::<RootBlockList>(0)
         .context("cleanup_free_list: root header")?;
@@ -499,7 +508,7 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
 
-    let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)
+    let mut header_buf = ExclusiveBuffer::read_mut(rel, rbl.pending_block)
         .context("cleanup_free_list: pending header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)
@@ -528,7 +537,7 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
             warning!("cleanup_free_list: free list cycle at block {}", block);
             break;
         }
-        let page = BlockBuffer::acquire(rel, block).context("cleanup_free_list: free block")?;
+        let page = PinnedBuffer::read(rel, block).context("cleanup_free_list: free block")?;
         let page_header = page
             .as_struct::<PendingBucket>(0)
             .context("cleanup_free_list: pending page header")?;
@@ -547,8 +556,8 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
 
     let mut head = INVALID_BLOCK;
     for block in valid.into_iter().rev() {
-        let mut page =
-            BlockBuffer::aquire_mut(rel, block).context("cleanup_free_list: rebuild free block")?;
+        let mut page = ExclusiveBuffer::read_mut(rel, block)
+            .context("cleanup_free_list: rebuild free block")?;
         let page_header = page
             .as_struct_mut::<PendingBucket>(0)
             .context("cleanup_free_list: rebuild header")?;
@@ -566,7 +575,7 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
 
 #[cfg(any(test, feature = "pg_test"))]
 pub fn test_get_free_head(rel: pg_sys::Relation) -> Result<u32> {
-    let root = BlockBuffer::acquire(rel, 0).context("test_get_free_head: root")?;
+    let root = PinnedBuffer::read(rel, 0).context("test_get_free_head: root")?;
     let rbl = root
         .as_struct::<RootBlockList>(0)
         .context("test_get_free_head: root header")?;
@@ -574,7 +583,7 @@ pub fn test_get_free_head(rel: pg_sys::Relation) -> Result<u32> {
         root.close();
         return Ok(INVALID_BLOCK);
     }
-    let header_buf = BlockBuffer::acquire(rel, rbl.pending_block)
+    let header_buf = PinnedBuffer::read(rel, rbl.pending_block)
         .context("test_get_free_head: pending header block")?;
     let header = header_buf
         .as_struct::<PendingHeader>(0)
@@ -587,7 +596,7 @@ pub fn test_get_free_head(rel: pg_sys::Relation) -> Result<u32> {
 
 #[cfg(any(test, feature = "pg_test"))]
 pub fn test_set_free_head(rel: pg_sys::Relation, value: u32) -> Result<()> {
-    let root = BlockBuffer::acquire(rel, 0).context("test_set_free_head: root")?;
+    let root = PinnedBuffer::read(rel, 0).context("test_set_free_head: root")?;
     let rbl = root
         .as_struct::<RootBlockList>(0)
         .context("test_set_free_head: root header")?;
@@ -595,7 +604,7 @@ pub fn test_set_free_head(rel: pg_sys::Relation, value: u32) -> Result<()> {
         root.close();
         bail!("pending header not initialized");
     }
-    let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)
+    let mut header_buf = ExclusiveBuffer::read_mut(rel, rbl.pending_block)
         .context("test_set_free_head: pending header block")?;
     let header = header_buf
         .as_struct_mut::<PendingHeader>(0)

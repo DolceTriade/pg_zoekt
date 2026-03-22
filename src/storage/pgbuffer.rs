@@ -3,23 +3,115 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::pg_sys::PgTryBuilder;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
 
 static DEBUG_LEAK_LOCKED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
+static LIVE_BUFFER_OWNERS: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BUFFER_OWNERS_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum BufferState {
-    Released,
-    Pinned,
-    Locked,
+pub trait BufferPage {
+    fn buffer(&self) -> pg_sys::Buffer;
+    fn page(&self) -> pg_sys::Page;
+
+    fn bytes(&self) -> &[u8] {
+        unsafe {
+            let p = self.as_ptr();
+            std::slice::from_raw_parts(p as *const u8, SPECIAL_SIZE)
+        }
+    }
+
+    fn block_number(&self) -> u32 {
+        unsafe { pg_sys::BufferGetBlockNumber(self.buffer()) }
+    }
+
+    fn as_struct<'a, T>(&'a self, offset: usize) -> anyhow::Result<&'a T>
+    where
+        T: TryFromBytes + KnownLayout + Immutable,
+    {
+        let struct_size = std::mem::size_of::<T>();
+        validate_bounds(offset, struct_size)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page()) as *const u8 };
+        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), struct_size) };
+        T::try_ref_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    fn as_struct_with_elems<'a, T>(&'a self, offset: usize, elems: usize) -> anyhow::Result<&'a T>
+    where
+        T: TryFromBytes + KnownLayout<PointerMetadata = usize> + Immutable + ?Sized,
+    {
+        let required = required_size::<T>(elems)?;
+        validate_bounds(offset, required)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page()) as *const u8 };
+        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), required) };
+        T::try_ref_from_bytes_with_elems(bytes, elems)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    unsafe fn as_ptr(&self) -> *const i8 {
+        unsafe { pg_sys::PageGetSpecialPointer(self.page()) }
+    }
+}
+
+pub trait MutableBufferPage: BufferPage {
+    fn as_struct_mut<'a, T>(&'a mut self, offset: usize) -> anyhow::Result<&'a mut T>
+    where
+        T: TryFromBytes + IntoBytes + KnownLayout,
+    {
+        let struct_size = std::mem::size_of::<T>();
+        validate_bounds(offset, struct_size)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page()) as *mut u8 };
+        let bytes: &'a mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(start.add(offset), struct_size) };
+        T::try_mut_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    fn as_struct_with_elems_mut<'a, T>(
+        &'a mut self,
+        offset: usize,
+        elems: usize,
+    ) -> anyhow::Result<&'a mut T>
+    where
+        T: TryFromBytes + IntoBytes + KnownLayout<PointerMetadata = usize> + ?Sized,
+    {
+        let required = required_size::<T>(elems)?;
+        validate_bounds(offset, required)?;
+        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page()) as *mut u8 };
+        let bytes: &'a mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(start.add(offset), required) };
+        T::try_mut_from_bytes_with_elems(bytes, elems)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))
+    }
+
+    unsafe fn as_ptr_mut(&mut self) -> *mut i8 {
+        unsafe { pg_sys::PageGetSpecialPointer(self.page()) }
+    }
+
+    fn init_page(&mut self) {
+        unsafe {
+            pg_sys::PageInit(self.page(), pg_sys::BLCKSZ as usize, SPECIAL_SIZE);
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct BlockBuffer {
+pub struct PinnedBuffer {
+    buffer: pg_sys::Buffer,
+    page: pg_sys::Page,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct SharedBuffer {
+    buffer: pg_sys::Buffer,
+    page: pg_sys::Page,
+}
+
+#[derive(Debug)]
+pub struct ExclusiveBuffer {
     buffer: pg_sys::Buffer,
     page: pg_sys::Page,
     wal: Option<GenericWAL>,
-    state: BufferState,
 }
 
 pub const SPECIAL_SIZE: usize = align_down(
@@ -54,8 +146,8 @@ const fn align_down(val: usize, align: usize) -> usize {
 pub(crate) fn init() {
     GucRegistry::define_bool_guc(
         c"pg_zoekt.debug_leak_locked_buffers",
-        c"Skip releasing locked BlockBuffer handles in Drop.",
-        c"Testing escape hatch. When enabled, pg_zoekt intentionally leaks locked buffers instead of calling UnlockReleaseBuffer() from BlockBuffer::drop(). This avoids backend aborts from double unlocks but can leave pins/locks held until backend exit.",
+        c"Skip releasing locked ExclusiveBuffer handles during close.",
+        c"Testing escape hatch. When enabled, pg_zoekt intentionally leaks locked buffers instead of calling UnlockReleaseBuffer() from ExclusiveBuffer::close(). This avoids backend aborts from double unlocks but can leave pins/locks held until backend exit.",
         &DEBUG_LEAK_LOCKED_BUFFERS,
         GucContext::Userset,
         GucFlags::default(),
@@ -96,13 +188,17 @@ fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
                     pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
                 }
             };
+            let live_owners = LIVE_BUFFER_OWNERS.load(Ordering::Relaxed);
+            let high_water = LIVE_BUFFER_OWNERS_HIGH_WATER.load(Ordering::Relaxed);
             match error {
                 CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => Err(
                     anyhow!(
-                        "ReadBuffer failed for rel {} block {} (nblocks={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
+                        "ReadBuffer failed for rel {} block {} (nblocks={}, live_buffer_owners={}, high_water={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
                         relid,
                         num,
                         nblocks,
+                        live_owners,
+                        high_water,
                         report.message(),
                         report.detail(),
                         report.hint(),
@@ -112,10 +208,12 @@ fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
                     ),
                 ),
                 CaughtError::RustPanic { ereport, .. } => Err(anyhow!(
-                    "ReadBuffer failed for rel {} block {} (nblocks={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
+                    "ReadBuffer failed for rel {} block {} (nblocks={}, live_buffer_owners={}, high_water={}): {} detail={:?} hint={:?} sqlstate={} source={}:{}",
                     relid,
                     num,
                     nblocks,
+                    live_owners,
+                    high_water,
                     ereport.message(),
                     ereport.detail(),
                     ereport.hint(),
@@ -149,20 +247,142 @@ fn read_buffer(rel: pg_sys::Relation, num: u32) -> Result<pg_sys::Buffer> {
         .execute()
 }
 
-impl BlockBuffer {
-    pub fn acquire(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+fn track_owner_acquired() {
+    let live = LIVE_BUFFER_OWNERS.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = LIVE_BUFFER_OWNERS_HIGH_WATER.fetch_max(live, Ordering::Relaxed);
+}
+
+fn track_owner_released() {
+    let prev = LIVE_BUFFER_OWNERS.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "buffer owner tracking underflow");
+}
+
+#[allow(dead_code)]
+pub fn test_reset_buffer_owner_tracking() {
+    LIVE_BUFFER_OWNERS.store(0, Ordering::Relaxed);
+    LIVE_BUFFER_OWNERS_HIGH_WATER.store(0, Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub fn test_live_buffer_owners() -> usize {
+    LIVE_BUFFER_OWNERS.load(Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+pub fn test_buffer_owner_high_water() -> usize {
+    LIVE_BUFFER_OWNERS_HIGH_WATER.load(Ordering::Relaxed)
+}
+
+fn validate_bounds(offset: usize, size: usize) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| anyhow::anyhow!("Offset overflow"))?;
+
+    if end > SPECIAL_SIZE {
+        anyhow::bail!("Invalid offset. Out of bounds access");
+    }
+
+    Ok(())
+}
+
+fn required_size<T>(elems: usize) -> anyhow::Result<usize>
+where
+    T: KnownLayout<PointerMetadata = usize> + ?Sized,
+{
+    let meta = T::PointerMetadata::from_elem_count(elems);
+    T::size_for_metadata(meta).ok_or_else(|| anyhow::anyhow!("Requested size would overflow"))
+}
+
+impl PinnedBuffer {
+    pub fn read(rel: pg_sys::Relation, num: u32) -> Result<Self> {
         ensure_block_in_range(rel, num)?;
         let buffer = read_buffer(rel, num)?;
         let page = unsafe { pg_sys::BufferGetPage(buffer) };
-        Ok(Self {
-            buffer,
-            page,
-            wal: None,
-            state: BufferState::Pinned,
-        })
+        track_owner_acquired();
+        Ok(Self { buffer, page })
     }
 
-    pub fn aquire_mut(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+    pub fn close(self) {
+        unsafe {
+            if pg_sys::BufferIsValid(self.buffer) {
+                pg_sys::ReleaseBuffer(self.buffer);
+                track_owner_released();
+            }
+        }
+    }
+
+    pub fn abandon(mut self) {
+        if unsafe { pg_sys::BufferIsValid(self.buffer) } {
+            track_owner_released();
+        }
+        self.buffer = pg_sys::InvalidBuffer as _;
+        self.page = std::ptr::null_mut();
+    }
+}
+
+impl BufferPage for PinnedBuffer {
+    fn buffer(&self) -> pg_sys::Buffer {
+        self.buffer
+    }
+
+    fn page(&self) -> pg_sys::Page {
+        self.page
+    }
+}
+
+impl AsRef<[u8]> for PinnedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        unsafe {
+            let p = self.as_ptr();
+            std::slice::from_raw_parts(p as *const u8, SPECIAL_SIZE)
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SharedBuffer {
+    pub fn read(rel: pg_sys::Relation, num: u32) -> Result<Self> {
+        ensure_block_in_range(rel, num)?;
+        let buffer = read_buffer(rel, num)?;
+        unsafe {
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        }
+        let page = unsafe { pg_sys::BufferGetPage(buffer) };
+        track_owner_acquired();
+        Ok(Self { buffer, page })
+    }
+
+    pub fn close(self) {
+        unsafe {
+            if pg_sys::BufferIsValid(self.buffer) {
+                pg_sys::UnlockReleaseBuffer(self.buffer);
+                track_owner_released();
+            }
+        }
+    }
+}
+
+impl BufferPage for SharedBuffer {
+    fn buffer(&self) -> pg_sys::Buffer {
+        self.buffer
+    }
+
+    fn page(&self) -> pg_sys::Page {
+        self.page
+    }
+}
+
+impl AsRef<[u8]> for SharedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        unsafe {
+            let p = self.as_ptr();
+            std::slice::from_raw_parts(p as *const u8, SPECIAL_SIZE)
+        }
+    }
+}
+
+impl ExclusiveBuffer {
+    pub fn read_mut(rel: pg_sys::Relation, num: u32) -> Result<Self> {
         ensure_block_in_range(rel, num)?;
         let buffer = read_buffer(rel, num)?;
         unsafe {
@@ -170,17 +390,15 @@ impl BlockBuffer {
         }
         let wal = GenericWAL::new(rel);
         let page = wal.track(buffer, false);
+        track_owner_acquired();
         Ok(Self {
             buffer,
             page,
             wal: Some(wal),
-            state: BufferState::Locked,
         })
     }
 
     pub fn allocate(rel: pg_sys::Relation) -> Self {
-        // TODO(pg18): evaluate whether ExtendBufferedRel can replace this path
-        // without changing extension-locking or Generic WAL semantics.
         let lock = unsafe {
             RelationExtensionLockGuard::new(rel, pg_sys::ExclusiveLock as pg_sys::LOCKMODE)
         };
@@ -195,26 +413,12 @@ impl BlockBuffer {
             pg_sys::PageInit(page, pg_sys::BLCKSZ as usize, SPECIAL_SIZE);
             page
         };
+        track_owner_acquired();
         Self {
             buffer,
             page,
             wal: Some(wal),
-            state: BufferState::Locked,
         }
-    }
-
-    pub fn block_number(&self) -> u32 {
-        unsafe { pg_sys::BufferGetBlockNumber(self.buffer) }
-    }
-
-    #[allow(dead_code)]
-    pub fn release(mut self) {
-        self.release_internal();
-    }
-
-    #[allow(dead_code)]
-    pub fn unlock_release(mut self) {
-        self.release_internal();
     }
 
     pub fn close(mut self) {
@@ -226,13 +430,10 @@ impl BlockBuffer {
     }
 
     fn release_internal(&mut self) {
-        if matches!(self.state, BufferState::Released) {
-            return;
-        }
         if self.finish_wal_if_needed().is_err() {
             return;
         }
-        if matches!(self.state, BufferState::Locked) && DEBUG_LEAK_LOCKED_BUFFERS.get() {
+        if DEBUG_LEAK_LOCKED_BUFFERS.get() {
             warning!(
                 "pg_zoekt.debug_leak_locked_buffers is enabled; leaking locked buffer {} to avoid UnlockReleaseBuffer()",
                 self.buffer
@@ -242,11 +443,7 @@ impl BlockBuffer {
         }
         unsafe {
             if pg_sys::BufferIsValid(self.buffer) {
-                match self.state {
-                    BufferState::Pinned => pg_sys::ReleaseBuffer(self.buffer),
-                    BufferState::Locked => pg_sys::UnlockReleaseBuffer(self.buffer),
-                    BufferState::Released => {}
-                }
+                pg_sys::UnlockReleaseBuffer(self.buffer);
             }
         }
         self.disarm();
@@ -263,112 +460,28 @@ impl BlockBuffer {
     }
 
     fn disarm(&mut self) {
-        self.state = BufferState::Released;
+        if unsafe { pg_sys::BufferIsValid(self.buffer) } {
+            track_owner_released();
+        }
         self.buffer = pg_sys::InvalidBuffer as _;
         self.page = std::ptr::null_mut();
         self.wal = None;
     }
+}
 
-    pub fn init_page(&mut self) {
-        unsafe {
-            pg_sys::PageInit(self.page, pg_sys::BLCKSZ as usize, SPECIAL_SIZE);
-        }
+impl BufferPage for ExclusiveBuffer {
+    fn buffer(&self) -> pg_sys::Buffer {
+        self.buffer
     }
 
-    pub fn as_struct<'a, T>(&'a self, offset: usize) -> anyhow::Result<&'a T>
-    where
-        T: TryFromBytes + KnownLayout + Immutable,
-    {
-        let struct_size = std::mem::size_of::<T>();
-        self.validate_bounds(offset, struct_size)?;
-
-        // SAFETY: We validated that the requested range fits within the page's
-        // special area. `try_ref_from_bytes` will check alignment and validity.
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
-        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), struct_size) };
-
-        T::try_ref_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
-    }
-
-    pub fn as_struct_mut<'a, T>(&'a mut self, offset: usize) -> anyhow::Result<&'a mut T>
-    where
-        T: TryFromBytes + IntoBytes + KnownLayout,
-    {
-        let struct_size = std::mem::size_of::<T>();
-        self.validate_bounds(offset, struct_size)?;
-
-        // SAFETY: We validated that the requested range fits within the page's
-        // special area. `try_mut_from_bytes` will check alignment and validity.
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *mut u8 };
-        let bytes: &'a mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(start.add(offset), struct_size) };
-
-        T::try_mut_from_bytes(bytes).map_err(|e| anyhow::Error::msg(e.to_string()))
-    }
-
-    pub fn as_struct_with_elems<'a, T>(
-        &'a self,
-        offset: usize,
-        elems: usize,
-    ) -> anyhow::Result<&'a T>
-    where
-        T: TryFromBytes + KnownLayout<PointerMetadata = usize> + Immutable + ?Sized,
-    {
-        let required = self.required_size::<T>(elems)?;
-        self.validate_bounds(offset, required)?;
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *const u8 };
-        let bytes: &'a [u8] = unsafe { std::slice::from_raw_parts(start.add(offset), required) };
-        T::try_ref_from_bytes_with_elems(bytes, elems)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))
-    }
-
-    pub fn as_struct_with_elems_mut<'a, T>(
-        &'a mut self,
-        offset: usize,
-        elems: usize,
-    ) -> anyhow::Result<&'a mut T>
-    where
-        T: TryFromBytes + IntoBytes + KnownLayout<PointerMetadata = usize> + ?Sized,
-    {
-        let required = self.required_size::<T>(elems)?;
-        self.validate_bounds(offset, required)?;
-        let start = unsafe { pg_sys::PageGetSpecialPointer(self.page) as *mut u8 };
-        let bytes: &'a mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(start.add(offset), required) };
-        T::try_mut_from_bytes_with_elems(bytes, elems)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))
-    }
-
-    fn validate_bounds(&self, offset: usize, size: usize) -> anyhow::Result<()> {
-        let end = offset
-            .checked_add(size)
-            .ok_or_else(|| anyhow::anyhow!("Offset overflow"))?;
-
-        if end > SPECIAL_SIZE {
-            anyhow::bail!("Invalid offset. Out of bounds access");
-        }
-
-        Ok(())
-    }
-
-    fn required_size<T>(&self, elems: usize) -> anyhow::Result<usize>
-    where
-        T: KnownLayout<PointerMetadata = usize> + ?Sized,
-    {
-        let meta = T::PointerMetadata::from_elem_count(elems);
-        T::size_for_metadata(meta).ok_or_else(|| anyhow::anyhow!("Requested size would overflow"))
-    }
-
-    pub unsafe fn as_ptr_mut(&mut self) -> *mut i8 {
-        unsafe { pg_sys::PageGetSpecialPointer(self.page) }
-    }
-
-    pub unsafe fn as_ptr(&self) -> *const i8 {
-        unsafe { pg_sys::PageGetSpecialPointer(self.page) }
+    fn page(&self) -> pg_sys::Page {
+        self.page
     }
 }
 
-impl AsRef<[u8]> for BlockBuffer {
+impl MutableBufferPage for ExclusiveBuffer {}
+
+impl AsRef<[u8]> for ExclusiveBuffer {
     fn as_ref(&self) -> &[u8] {
         unsafe {
             let p = self.as_ptr();
@@ -377,7 +490,7 @@ impl AsRef<[u8]> for BlockBuffer {
     }
 }
 
-impl AsMut<[u8]> for BlockBuffer {
+impl AsMut<[u8]> for ExclusiveBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
         unsafe {
             let p = self.as_ptr_mut();
@@ -443,7 +556,7 @@ mod tests {
         let table = "public.documents";
         let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
         let blkno = {
-            let mut buff = BlockBuffer::allocate(relation.as_ptr());
+            let mut buff = ExclusiveBuffer::allocate(relation.as_ptr());
             let block = buff.block_number();
             let s = CString::new("hello").expect("string made");
             unsafe {
@@ -455,7 +568,7 @@ mod tests {
         };
 
         {
-            let buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
+            let buff = PinnedBuffer::read(relation.as_ptr(), blkno).expect("acquire buffer");
             let cstr = unsafe { CStr::from_ptr(buff.as_ptr()) };
             assert_eq!(
                 cstr.to_str().expect("valid utf8"),
@@ -478,7 +591,7 @@ mod tests {
         let table = "public.lock_probe";
         let relation = unsafe { pgrx::PgRelation::open_with_name(&table).expect("table exists") };
         let blkno = {
-            let mut buff = BlockBuffer::allocate(relation.as_ptr());
+            let mut buff = ExclusiveBuffer::allocate(relation.as_ptr());
             let block = buff.block_number();
             let s = CString::new("probe").expect("string made");
             unsafe {
@@ -488,7 +601,7 @@ mod tests {
             block
         };
 
-        let buff = BlockBuffer::acquire(relation.as_ptr(), blkno).expect("acquire buffer");
+        let buff = PinnedBuffer::read(relation.as_ptr(), blkno).expect("acquire buffer");
         let buffer_id = buff.buffer;
         unsafe {
             // If acquire left a share lock, conditional exclusive lock would fail.

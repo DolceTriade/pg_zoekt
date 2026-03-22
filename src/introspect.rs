@@ -2,6 +2,7 @@ use pgrx::iter::TableIterator;
 use pgrx::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 
+use crate::storage::pgbuffer::{BufferPage, PinnedBuffer};
 use crate::storage::{IndexEntry, Segment, SegmentExtent, WALHeader};
 use crate::trgm::CompactTrgm;
 
@@ -385,7 +386,7 @@ pub fn pg_zoekt_wal_stats(
     let mut rows = Vec::new();
     unsafe {
         let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
-        let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).unwrap_or_else(|e| {
+        let root = PinnedBuffer::read(rel, 0).unwrap_or_else(|e| {
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             error!("failed to read root: {e:#?}");
         });
@@ -400,7 +401,7 @@ pub fn pg_zoekt_wal_stats(
             error!("invalid root magic");
         }
         if rbl.wal_block != pg_sys::InvalidBlockNumber {
-            let wal_buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)
+            let wal_buf = PinnedBuffer::read(rel, rbl.wal_block)
                 .unwrap_or_else(|e| {
                     pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
                     error!("failed to read wal block: {e:#?}");
@@ -448,7 +449,7 @@ pub fn pg_zoekt_index_overhead(
         let pg_header_bytes = (pg_sys::BLCKSZ as usize).saturating_sub(special_size);
         let mut root_version: u16 = 0;
         for block in 0..nblocks {
-            let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, block as u32)
+            let buf = PinnedBuffer::read(rel, block as u32)
                 .unwrap_or_else(|e| error!("failed to read block {block}: {e:#?}"));
             let bytes = buf.as_ref();
             let magic = read_u32(bytes, 0);
@@ -625,7 +626,7 @@ pub fn pg_zoekt_index_waste(
         let mut used = HashSet::<u32>::new();
         let mut categories: BTreeMap<String, HashSet<u32>> = BTreeMap::new();
 
-        let root = crate::storage::pgbuffer::BlockBuffer::acquire(rel, 0).unwrap_or_else(|e| {
+        let root = PinnedBuffer::read(rel, 0).unwrap_or_else(|e| {
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             error!("failed to read root: {e:#?}");
         });
@@ -734,7 +735,7 @@ pub fn pg_zoekt_index_waste(
                     Vec::new()
                 });
             for leaf in leaf_blocks {
-                let buf = match crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf) {
+                let buf = match PinnedBuffer::read(rel, leaf) {
                     Ok(buf) => buf,
                     Err(e) => {
                         warning!("failed to read leaf block {leaf}: {e:#}");

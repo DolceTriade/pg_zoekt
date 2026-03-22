@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use super::pgbuffer::BlockBuffer;
+use super::pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer};
 use anyhow::Context;
 use delta_encoding::DeltaEncoderExt;
 use pgrx::prelude::*;
@@ -31,7 +31,7 @@ impl Encoder {
         };
         let mut leaf_pointers: Vec<super::BlockPointer> = Vec::new();
 
-        let root = super::pgbuffer::BlockBuffer::acquire(rel, 0)?;
+        let root = PinnedBuffer::read(rel, 0)?;
         let rbl = root
             .as_struct::<super::RootBlockList>(0)
             .context("root header")?;
@@ -502,7 +502,7 @@ const POSTING_PAGE_HEADER_SIZE: usize = std::mem::size_of::<super::PostingPageHe
 
 pub(super) struct PageWriter {
     rel: pg_sys::Relation,
-    buff: Option<BlockBuffer>,
+    buff: Option<ExclusiveBuffer>,
     size: usize,
     pos: usize,
     tracker: Option<*mut super::BlockExtentTracker>,
