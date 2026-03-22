@@ -84,6 +84,7 @@ fn flush_segments(
             if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
                 error!("failed to append segments: {e:#?}");
             }
+            root.close();
         }
         Err(e) => {
             error!("failed to flush segment: {e:#?}");
@@ -295,8 +296,10 @@ fn finalize_segment_list(
         let rbl = root_buffer
             .as_struct_mut::<crate::storage::RootBlockList>(0)
             .expect("root header");
-        crate::storage::segment_list_read(index_relation, rbl)
-            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"))
+        let existing = crate::storage::segment_list_read(index_relation, rbl)
+            .unwrap_or_else(|e| error!("failed to read segment list: {e:#?}"));
+        root_buffer.close();
+        existing
     };
     let total_size: u64 = existing.iter().map(|s| s.size).sum();
     info!(
@@ -361,6 +364,7 @@ fn finalize_segment_list(
             cleanup_start.elapsed().as_millis()
         );
     }
+    root_buffer.close();
 }
 
 fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> Option<i32> {
@@ -472,4 +476,14 @@ pub extern "C-unwind" fn ambuild(
 #[pg_extern]
 fn pg_zoekt_parallel_builds() -> i64 {
     PARALLEL_BUILD_COUNT.load(Ordering::Relaxed) as i64
+}
+
+#[cfg(feature = "pg_test")]
+pub(crate) fn test_parallel_build_reset() {
+    PARALLEL_BUILD_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "pg_test")]
+pub(crate) fn test_parallel_build_count() -> usize {
+    PARALLEL_BUILD_COUNT.load(Ordering::Relaxed) as usize
 }

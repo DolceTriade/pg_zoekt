@@ -18,6 +18,7 @@ mod trgm;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    storage::pgbuffer::init();
     bgworker::init();
 }
 

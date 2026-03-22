@@ -61,7 +61,9 @@ fn encode_tid(tid: ItemPointer) -> u64 {
 pub fn load_snapshot(rel: pg_sys::Relation) -> Result<Snapshot> {
     let root = BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
-    load_internal(rel, rbl)
+    let result = load_internal(rel, rbl);
+    root.close();
+    result
 }
 
 pub fn load_snapshot_for_root(rel: pg_sys::Relation, root: &RootBlockList) -> Result<Snapshot> {
@@ -95,6 +97,7 @@ fn load_internal(rel: pg_sys::Relation, root: &RootBlockList) -> Result<Snapshot
         bytes.extend_from_slice(&buf[start..end]);
         block = header.next_block;
         remaining = remaining.saturating_sub(used);
+        page.close();
     }
 
     bytes.truncate(root.tombstone_bytes as usize);
@@ -121,6 +124,7 @@ where
     if added > 0 {
         persist(rel, rbl, &snapshot)?;
     }
+    root.close();
     Ok(added)
 }
 
@@ -164,6 +168,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
             if end < buf.len() {
                 buf[end..].fill(0);
             }
+            page.close();
         }
         used_blocks.push(block);
         cursor = &cursor[chunk_len..];
@@ -175,6 +180,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
             .as_struct_mut::<TombstonePageHeader>(0)
             .context("tombstone header")?;
         header.next_block = window[1];
+        page.close();
     }
 
     root.tombstone_block = *used_blocks.first().unwrap();
@@ -194,10 +200,12 @@ fn collect_chain(rel: pg_sys::Relation, start: u32) -> Result<Vec<u32>> {
             .as_struct::<TombstonePageHeader>(0)
             .context("tombstone header")?;
         if header.magic != TOMBSTONE_PAGE_MAGIC {
+            page.close();
             anyhow::bail!("invalid tombstone page magic");
         }
         out.push(block);
         block = header.next_block;
+        page.close();
     }
     out.reverse();
     Ok(out)

@@ -1,15 +1,25 @@
 use anyhow::{Result, anyhow};
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::pg_sys::PgTryBuilder;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, PointerMetadata, TryFromBytes};
+
+static DEBUG_LEAK_LOCKED_BUFFERS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BufferState {
+    Released,
+    Pinned,
+    Locked,
+}
 
 #[derive(Debug)]
 pub struct BlockBuffer {
     buffer: pg_sys::Buffer,
     page: pg_sys::Page,
     wal: Option<GenericWAL>,
-    locked: bool,
+    state: BufferState,
 }
 
 pub const SPECIAL_SIZE: usize = align_down(
@@ -39,6 +49,17 @@ impl Drop for RelationExtensionLockGuard {
 
 const fn align_down(val: usize, align: usize) -> usize {
     val & !(align - 1)
+}
+
+pub(crate) fn init() {
+    GucRegistry::define_bool_guc(
+        c"pg_zoekt.debug_leak_locked_buffers",
+        c"Skip releasing locked BlockBuffer handles in Drop.",
+        c"Testing escape hatch. When enabled, pg_zoekt intentionally leaks locked buffers instead of calling UnlockReleaseBuffer() from BlockBuffer::drop(). This avoids backend aborts from double unlocks but can leave pins/locks held until backend exit.",
+        &DEBUG_LEAK_LOCKED_BUFFERS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 }
 
 fn ensure_block_in_range(rel: pg_sys::Relation, num: u32) -> Result<()> {
@@ -137,7 +158,7 @@ impl BlockBuffer {
             buffer,
             page,
             wal: None,
-            locked: false,
+            state: BufferState::Pinned,
         })
     }
 
@@ -153,7 +174,7 @@ impl BlockBuffer {
             buffer,
             page,
             wal: Some(wal),
-            locked: true,
+            state: BufferState::Locked,
         })
     }
 
@@ -178,12 +199,74 @@ impl BlockBuffer {
             buffer,
             page,
             wal: Some(wal),
-            locked: true,
+            state: BufferState::Locked,
         }
     }
 
     pub fn block_number(&self) -> u32 {
         unsafe { pg_sys::BufferGetBlockNumber(self.buffer) }
+    }
+
+    #[allow(dead_code)]
+    pub fn release(mut self) {
+        self.release_internal();
+    }
+
+    #[allow(dead_code)]
+    pub fn unlock_release(mut self) {
+        self.release_internal();
+    }
+
+    pub fn close(mut self) {
+        self.release_internal();
+    }
+
+    pub fn abandon(mut self) {
+        self.disarm();
+    }
+
+    fn release_internal(&mut self) {
+        if matches!(self.state, BufferState::Released) {
+            return;
+        }
+        if self.finish_wal_if_needed().is_err() {
+            return;
+        }
+        if matches!(self.state, BufferState::Locked) && DEBUG_LEAK_LOCKED_BUFFERS.get() {
+            warning!(
+                "pg_zoekt.debug_leak_locked_buffers is enabled; leaking locked buffer {} to avoid UnlockReleaseBuffer()",
+                self.buffer
+            );
+            self.disarm();
+            return;
+        }
+        unsafe {
+            if pg_sys::BufferIsValid(self.buffer) {
+                match self.state {
+                    BufferState::Pinned => pg_sys::ReleaseBuffer(self.buffer),
+                    BufferState::Locked => pg_sys::UnlockReleaseBuffer(self.buffer),
+                    BufferState::Released => {}
+                }
+            }
+        }
+        self.disarm();
+    }
+
+    fn finish_wal_if_needed(&mut self) -> Result<()> {
+        if self.wal.is_some() {
+            _ = self.wal.take();
+            unsafe {
+                pg_sys::MarkBufferDirty(self.buffer);
+            }
+        }
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.state = BufferState::Released;
+        self.buffer = pg_sys::InvalidBuffer as _;
+        self.page = std::ptr::null_mut();
+        self.wal = None;
     }
 
     pub fn init_page(&mut self) {
@@ -285,31 +368,6 @@ impl BlockBuffer {
     }
 }
 
-impl Drop for BlockBuffer {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            // Postgres cleans up buffer pins/locks during ERROR handling; avoid double release.
-            return;
-        }
-        // Ensure generic WAL finishes before we release the buffer.
-        if self.wal.is_some() {
-            _ = self.wal.take();
-            unsafe {
-                pg_sys::MarkBufferDirty(self.buffer);
-            }
-        }
-        unsafe {
-            if pg_sys::BufferIsValid(self.buffer) {
-                if self.locked {
-                    pg_sys::UnlockReleaseBuffer(self.buffer);
-                } else {
-                    pg_sys::ReleaseBuffer(self.buffer);
-                }
-            }
-        }
-    }
-}
-
 impl AsRef<[u8]> for BlockBuffer {
     fn as_ref(&self) -> &[u8] {
         unsafe {
@@ -392,6 +450,7 @@ mod tests {
                 let bytes = s.as_bytes_with_nul();
                 std::ptr::copy(bytes.as_ptr().cast(), buff.as_ptr_mut(), bytes.len());
             }
+            buff.close();
             block
         };
 
@@ -403,6 +462,7 @@ mod tests {
                 "hello",
                 "expected string contents"
             );
+            buff.close();
         }
 
         Ok(())
@@ -424,6 +484,7 @@ mod tests {
             unsafe {
                 std::ptr::copy(s.as_ptr(), buff.as_ptr_mut(), s.count_bytes());
             }
+            buff.close();
             block
         };
 
@@ -434,7 +495,7 @@ mod tests {
             assert!(pg_sys::ConditionalLockBuffer(buffer_id));
             pg_sys::LockBuffer(buffer_id, pg_sys::BUFFER_LOCK_UNLOCK as i32);
         }
-        drop(buff);
+        buff.close();
 
         Ok(())
     }

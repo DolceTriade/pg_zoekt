@@ -65,6 +65,7 @@ pub fn init_pending(rel: pg_sys::Relation, header_block: u32) -> Result<()> {
     header.head_block = INVALID_BLOCK;
     header.tail_block = INVALID_BLOCK;
     header.free_head = INVALID_BLOCK;
+    header_buf.close();
     Ok(())
 }
 
@@ -99,6 +100,7 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
         header.free = page_capacity() as u16;
         header.next_block = INVALID_BLOCK;
         *free_head = next;
+        page.close();
         return Ok(block);
     }
 
@@ -109,17 +111,24 @@ fn allocate_page(rel: pg_sys::Relation, free_head: &mut u32) -> Result<u32> {
     header.magic = PENDING_BUCKET_MAGIC;
     header.free = page_capacity() as u16;
     header.next_block = INVALID_BLOCK;
-    Ok(page.block_number())
+    let block = page.block_number();
+    page.close();
+    Ok(block)
 }
 
 fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     {
         let root =
             BlockBuffer::acquire(rel, root_block).context("ensure_pending_list: read root")?;
-        let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
-        if rbl.version >= super::VERSION && rbl.pending_block != INVALID_BLOCK {
-            return Ok(rbl.pending_block);
+        let (version, pending_block) = {
+            let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
+            (rbl.version, rbl.pending_block)
+        };
+        if version >= super::VERSION && pending_block != INVALID_BLOCK {
+            root.close();
+            return Ok(pending_block);
         }
+        root.close();
     }
 
     let mut root =
@@ -128,7 +137,9 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
         .as_struct_mut::<RootBlockList>(0)
         .context("root header")?;
     if rbl.version >= super::VERSION && rbl.pending_block != INVALID_BLOCK {
-        return Ok(rbl.pending_block);
+        let block = rbl.pending_block;
+        root.close();
+        return Ok(block);
     }
     let header_block = super::allocate_block(rel).block_number();
     init_pending(rel, header_block).context("ensure_pending_list: init header")?;
@@ -136,6 +147,7 @@ fn ensure_pending_list(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
     if rbl.version < super::VERSION {
         rbl.version = super::VERSION;
     }
+    root.close();
     Ok(header_block)
 }
 
@@ -191,7 +203,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
     };
 
     if free < ENTRY_SIZE {
-        drop(page);
+        page.close();
         let new_block =
             allocate_page(rel, &mut header.free_head).context("append_tid: allocate new page")?;
         let mut old_tail = BlockBuffer::aquire_mut(rel, header.tail_block)
@@ -200,7 +212,7 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
             .as_struct_mut::<PendingBucket>(0)
             .context("pending page header")?;
         old_header.next_block = new_block;
-        drop(old_tail);
+        old_tail.close();
 
         header.tail_block = new_block;
         page = BlockBuffer::aquire_mut(rel, header.tail_block)
@@ -254,7 +266,8 @@ pub fn append_tid(rel: pg_sys::Relation, root_block: u32, tid: ItemPointer) -> R
         }
     };
     header.bytes_used = header.bytes_used.saturating_add(ENTRY_SIZE as u32);
-
+    page.close();
+    header_buf.close();
     Ok(())
 }
 
@@ -267,9 +280,12 @@ pub fn bytes_used(rel: pg_sys::Relation, root_block: u32) -> Result<u32> {
         .as_struct::<PendingHeader>(0)
         .context("bytes_used: pending header")?;
     if header.magic != PENDING_MAGIC {
+        header_buf.close();
         bail!("invalid pending header magic");
     }
-    Ok(header.bytes_used)
+    let bytes = header.bytes_used;
+    header_buf.close();
+    Ok(bytes)
 }
 
 pub fn detach_pending(rel: pg_sys::Relation, root_block: u32) -> Result<Option<u32>> {
@@ -279,16 +295,19 @@ pub fn detach_pending(rel: pg_sys::Relation, root_block: u32) -> Result<Option<u
         .as_struct_mut::<PendingHeader>(0)
         .context("pending header")?;
     if header.magic != PENDING_MAGIC {
+        header_buf.close();
         bail!("invalid pending header magic");
     }
     let head = header.head_block;
     if head == INVALID_BLOCK {
+        header_buf.close();
         return Ok(None);
     }
 
     header.head_block = INVALID_BLOCK;
     header.tail_block = INVALID_BLOCK;
     header.bytes_used = 0;
+    header_buf.close();
     Ok(Some(head))
 }
 
@@ -306,7 +325,7 @@ pub fn collect_blocks(rel: pg_sys::Relation, head: u32) -> Result<Vec<u32>> {
             }
             header.next_block
         };
-        drop(page);
+        page.close();
         blocks.push(block);
         current_block = if next == INVALID_BLOCK {
             None
@@ -323,6 +342,7 @@ pub fn collect_all_blocks(rel: pg_sys::Relation, header_block: u32) -> Result<Ve
         .as_struct::<PendingHeader>(0)
         .context("pending header")?;
     if header.magic != PENDING_MAGIC {
+        page.close();
         bail!("invalid pending header magic");
     }
     let mut blocks = Vec::new();
@@ -330,6 +350,7 @@ pub fn collect_all_blocks(rel: pg_sys::Relation, header_block: u32) -> Result<Ve
     if header.head_block != INVALID_BLOCK {
         blocks.extend(collect_blocks(rel, header.head_block)?);
     }
+    page.close();
     Ok(blocks)
 }
 
@@ -361,6 +382,7 @@ where
         });
         count += 1;
     }
+    page.close();
     Ok(count)
 }
 
@@ -397,7 +419,7 @@ where
             });
             count += 1;
         }
-        drop(page);
+        page.close();
         freed_pages.push(block);
         current_block = if next == INVALID_BLOCK {
             None
@@ -424,8 +446,11 @@ where
                 page_header.free = page_capacity() as u16;
                 page_header.next_block = header.free_head;
                 header.free_head = block;
+                page.close();
             }
+            header_buf.close();
         }
+        root.close();
     }
 
     Ok(count)
@@ -438,6 +463,7 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     let root = BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.pending_block == INVALID_BLOCK {
+        root.close();
         return Ok(());
     }
     let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)?;
@@ -453,7 +479,10 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         page_header.free = page_capacity() as u16;
         page_header.next_block = header.free_head;
         header.free_head = *block;
+        page.close();
     }
+    header_buf.close();
+    root.close();
     Ok(())
 }
 
@@ -463,6 +492,7 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
         .as_struct::<RootBlockList>(0)
         .context("cleanup_free_list: root header")?;
     if rbl.pending_block == INVALID_BLOCK {
+        root.close();
         return Ok(());
     }
 
@@ -477,6 +507,8 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
     if header.magic != PENDING_MAGIC {
         warning!("cleanup_free_list: invalid pending header magic");
         header.free_head = INVALID_BLOCK;
+        header_buf.close();
+        root.close();
         return Ok(());
     }
 
@@ -505,10 +537,12 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
                 "cleanup_free_list: bad pending page magic at block {}",
                 block
             );
+            page.close();
             break;
         }
         valid.push(block);
         block = page_header.next_block;
+        page.close();
     }
 
     let mut head = INVALID_BLOCK;
@@ -522,8 +556,11 @@ pub fn cleanup_free_list(rel: pg_sys::Relation) -> Result<()> {
         page_header.free = page_capacity() as u16;
         page_header.next_block = head;
         head = block;
+        page.close();
     }
     header.free_head = head;
+    header_buf.close();
+    root.close();
     Ok(())
 }
 
@@ -534,6 +571,7 @@ pub fn test_get_free_head(rel: pg_sys::Relation) -> Result<u32> {
         .as_struct::<RootBlockList>(0)
         .context("test_get_free_head: root header")?;
     if rbl.pending_block == INVALID_BLOCK {
+        root.close();
         return Ok(INVALID_BLOCK);
     }
     let header_buf = BlockBuffer::acquire(rel, rbl.pending_block)
@@ -541,7 +579,10 @@ pub fn test_get_free_head(rel: pg_sys::Relation) -> Result<u32> {
     let header = header_buf
         .as_struct::<PendingHeader>(0)
         .context("test_get_free_head: pending header")?;
-    Ok(header.free_head)
+    let free_head = header.free_head;
+    header_buf.close();
+    root.close();
+    Ok(free_head)
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -551,6 +592,7 @@ pub fn test_set_free_head(rel: pg_sys::Relation, value: u32) -> Result<()> {
         .as_struct::<RootBlockList>(0)
         .context("test_set_free_head: root header")?;
     if rbl.pending_block == INVALID_BLOCK {
+        root.close();
         bail!("pending header not initialized");
     }
     let mut header_buf = BlockBuffer::aquire_mut(rel, rbl.pending_block)
@@ -559,5 +601,7 @@ pub fn test_set_free_head(rel: pg_sys::Relation, value: u32) -> Result<()> {
         .as_struct_mut::<PendingHeader>(0)
         .context("test_set_free_head: pending header")?;
     header.free_head = value;
+    header_buf.close();
+    root.close();
     Ok(())
 }

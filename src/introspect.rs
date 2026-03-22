@@ -308,6 +308,7 @@ pub fn pg_zoekt_postings_preview(
                 ));
                 seen += 1;
             }
+            cursor.close();
         }
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
     }
@@ -361,6 +362,7 @@ pub fn pg_zoekt_posting_positions(
                 }
                 break;
             }
+            cursor.close();
             break;
         }
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
@@ -413,7 +415,9 @@ pub fn pg_zoekt_wal_stats(
                 wal.free_max_block as i64,
                 wal.high_water_block as i64,
             ));
+            wal_buf.close();
         }
+        root.close();
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
     }
     TableIterator::new(rows.into_iter())
@@ -578,6 +582,7 @@ pub fn pg_zoekt_index_overhead(
                 special_size,
                 pg_header_bytes,
             );
+            buf.close();
         }
         pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
     }
@@ -630,6 +635,7 @@ pub fn pg_zoekt_index_waste(
                 pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
                 error!("failed to read root header: {e:#?}");
             });
+        let wal_block = rbl.wal_block;
 
         used.insert(0);
         categories.entry("root".to_string()).or_default().insert(0);
@@ -739,11 +745,13 @@ pub fn pg_zoekt_index_waste(
                     Ok(header) => header,
                     Err(e) => {
                         warning!("failed to read leaf header {leaf}: {e:#}");
+                        buf.close();
                         continue;
                     }
                 };
                 if header.magic != crate::storage::BLOCK_MAGIC {
                     warning!("invalid block magic at leaf {leaf}");
+                    buf.close();
                     continue;
                 }
                 let entries = match buf.as_struct_with_elems::<crate::storage::IndexList>(
@@ -753,6 +761,7 @@ pub fn pg_zoekt_index_waste(
                     Ok(entries) => entries,
                     Err(e) => {
                         warning!("failed to read leaf entries {leaf}: {e:#}");
+                        buf.close();
                         continue;
                     }
                 };
@@ -768,10 +777,12 @@ pub fn pg_zoekt_index_waste(
                     let post_vec: Vec<u32> = posting_blocks.iter().copied().collect();
                     add_blocks_to_category(&mut categories, &mut used, "posting", &post_vec, true);
                 }
+                buf.close();
             }
         }
+        root.close();
 
-        let free_blocks = crate::storage::collect_free_list_blocks(rel, rbl.wal_block)
+        let free_blocks = crate::storage::collect_free_list_blocks(rel, wal_block)
             .unwrap_or_else(|e| {
                 warning!("failed to collect free list blocks: {e:#}");
                 Vec::new()
