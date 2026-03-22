@@ -122,6 +122,7 @@ pub fn estimate_segment_deadness(
                 }
             }
         }
+        cursor.close();
     }
 
     if sampled_docs == 0 {
@@ -461,7 +462,7 @@ pub fn segment_list_append(
         let blk = page.block_number();
         root.segment_list_head = blk;
         root.segment_list_tail = blk;
-        drop(page);
+        page.close();
     }
 
     let mut remaining = segments;
@@ -488,7 +489,8 @@ pub fn segment_list_append(
                 hdr.next_block = next_blk;
             }
             root.segment_list_tail = next_blk;
-            drop(next_page);
+            tail.close();
+            next_page.close();
             continue;
         }
 
@@ -543,6 +545,7 @@ pub fn segment_list_append(
             .num_segments
             .checked_add(take as u32)
             .expect("segment count overflow");
+        tail.close();
 
         remaining = &remaining[take..];
     }
@@ -588,6 +591,7 @@ pub fn segment_list_read(rel: pg_sys::Relation, root: &RootBlockList) -> Result<
             }));
         }
         blk = hdr.next_block;
+        buf.close();
     }
     out.truncate(root.num_segments as usize);
     Ok(out)
@@ -628,6 +632,7 @@ fn segment_extent_list_write(rel: pg_sys::Relation, extents: &[SegmentExtent]) -
                 .as_struct_mut::<SegmentExtentListPageHeader>(0)
                 .context("segment extent list header")?;
             prev_hdr.next_block = blk;
+            prev.close();
         }
         let take = remaining.len().min(cap);
         let header_size = std::mem::size_of::<SegmentExtentListPageHeader>();
@@ -649,6 +654,7 @@ fn segment_extent_list_write(rel: pg_sys::Relation, extents: &[SegmentExtent]) -
             .context("segment extent list header")?;
         hdr.count = take as u16;
         tail = blk;
+        page.close();
         remaining = &remaining[take..];
     }
     Ok(head)
@@ -684,6 +690,7 @@ pub(crate) fn segment_extent_list_read(
             .context("segment extent list entries")?;
         extents.extend_from_slice(&list.entries[..take]);
         blk = hdr.next_block;
+        buf.close();
     }
     extents.truncate(count as usize);
     Ok((extents, pages))
@@ -718,6 +725,7 @@ pub(crate) fn collect_segment_list_pages(rel: pg_sys::Relation, head: u32) -> Re
             anyhow::bail!("bad segment list magic");
         }
         blk = hdr.next_block;
+        buf.close();
     }
     Ok(pages)
 }
@@ -863,6 +871,7 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
     };
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+        root.close();
         return Ok(None);
     }
 
@@ -906,14 +915,20 @@ fn pop_free_block(rel: pg_sys::Relation) -> Result<Option<u32>> {
             );
             wal.free_head = pg_sys::InvalidBlockNumber;
             wal.free_max_block = pg_sys::InvalidBlockNumber;
+            free_buf.close();
             break;
         }
         if rbl.version >= 5 && wal.free_max_block == head {
             wal.free_max_block = pg_sys::InvalidBlockNumber;
         }
         wal.free_head = free_hdr.next_block;
+        free_buf.close();
+        wal_buf.close();
+        root.close();
         return Ok(Some(head));
     }
+    wal_buf.close();
+    root.close();
     Ok(None)
 }
 
@@ -955,6 +970,7 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
     let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.magic != ROOT_MAGIC || rbl.wal_block == pg_sys::InvalidBlockNumber {
+        root.close();
         return Ok(());
     }
 
@@ -987,11 +1003,14 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         if rbl.version >= 5 && (free_max == pg_sys::InvalidBlockNumber || *block > free_max) {
             free_max = *block;
         }
+        page.close();
     }
     wal.free_head = head;
     if rbl.version >= 5 {
         wal.free_max_block = free_max;
     }
+    wal_buf.close();
+    root.close();
     Ok(())
 }
 
@@ -1017,12 +1036,15 @@ pub(crate) fn initialize_index_storage(
         rbl.tombstone_block = pg_sys::InvalidBlockNumber;
         rbl.tombstone_bytes = 0;
         rbl.pending_block = pg_sys::InvalidBlockNumber;
+        root_buffer.close();
         root_block
     };
 
     let pending_block = {
         let pending_buffer = pgbuffer::BlockBuffer::allocate(rel);
-        pending_buffer.block_number()
+        let block = pending_buffer.block_number();
+        pending_buffer.close();
+        block
     };
     pending::init_pending(rel, pending_block).context("initialize_index_storage: init pending")?;
 
@@ -1039,6 +1061,7 @@ pub(crate) fn initialize_index_storage(
         wal.free_head = pg_sys::InvalidBlockNumber;
         wal.free_max_block = pg_sys::InvalidBlockNumber;
         wal.high_water_block = root_block.max(wal_block).max(pending_block);
+        wal_buffer.close();
         wal_block
     };
 
@@ -1050,6 +1073,7 @@ pub(crate) fn initialize_index_storage(
             .context("initialize_index_storage: update root header")?;
         rbl.wal_block = wal_block;
         rbl.pending_block = pending_block;
+        root_buffer.close();
     }
 
     Ok(IndexBootstrapBlocks {
@@ -1063,6 +1087,7 @@ fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {
     let root = pgbuffer::BlockBuffer::acquire(rel, 0)?;
     let rbl = root.as_struct::<RootBlockList>(0).context("root header")?;
     if rbl.magic != ROOT_MAGIC || rbl.version < 5 || rbl.wal_block == pg_sys::InvalidBlockNumber {
+        root.close();
         return Ok(());
     }
     let mut wal_buf = pgbuffer::BlockBuffer::aquire_mut(rel, rbl.wal_block)?;
@@ -1072,6 +1097,8 @@ fn update_high_water_block(rel: pg_sys::Relation, block: u32) -> Result<()> {
     if wal.high_water_block == pg_sys::InvalidBlockNumber || block > wal.high_water_block {
         wal.high_water_block = block;
     }
+    wal_buf.close();
+    root.close();
     Ok(())
 }
 
@@ -1086,9 +1113,11 @@ pub(crate) fn collect_segment_tree_blocks(
     let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
     let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
     if header.magic != BLOCK_MAGIC {
+        buf.close();
         anyhow::bail!("invalid block magic while freeing segment");
     }
     if header.level == 0 {
+        buf.close();
         return Ok(());
     }
     let pointers = buf
@@ -1101,6 +1130,7 @@ pub(crate) fn collect_segment_tree_blocks(
     for p in slice {
         collect_segment_tree_blocks(rel, p.block, out)?;
     }
+    buf.close();
     Ok(())
 }
 
@@ -1122,12 +1152,15 @@ pub(crate) fn collect_posting_blocks(
             .as_struct::<PostingPageHeader>(0)
             .context("posting page header")?;
         if header.magic != POSTING_PAGE_MAGIC {
+            buf.close();
             anyhow::bail!("invalid posting page magic while freeing segment");
         }
         if header.next_block == pg_sys::InvalidBlockNumber {
+            buf.close();
             break;
         }
         block = header.next_block;
+        buf.close();
     }
     Ok(())
 }
@@ -1160,6 +1193,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
             let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
+                buf.close();
                 anyhow::bail!("invalid block magic while freeing segment");
             }
             let entries = buf
@@ -1172,6 +1206,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
             for entry in slice {
                 collect_posting_blocks(rel, entry, &mut blocks)?;
             }
+            buf.close();
         }
     }
     let mut list: Vec<u32> = blocks.into_iter().collect();
@@ -1213,10 +1248,13 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
                 magic,
                 FREE_PAGE_MAGIC
             );
+            buf.close();
             break;
         }
         blk = hdr.next_block;
+        buf.close();
     }
+    wal_buf.close();
     Ok(out)
 }
 
@@ -1265,6 +1303,7 @@ fn collect_reachable_blocks(
             let buf = pgbuffer::BlockBuffer::acquire(rel, leaf)?;
             let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
             if header.magic != BLOCK_MAGIC {
+                buf.close();
                 anyhow::bail!("invalid block magic while collecting reachable blocks");
             }
             let entries = buf
@@ -1277,6 +1316,7 @@ fn collect_reachable_blocks(
             for entry in slice {
                 collect_posting_blocks(rel, entry, &mut used)?;
             }
+            buf.close();
         }
     }
     Ok(used)
@@ -1323,6 +1363,7 @@ fn block_is_free_page(rel: pg_sys::Relation, block: u32) -> Result<bool> {
         .as_struct::<FreePageHeader>(0)
         .context("free page header")?;
     let magic = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(hdr.magic)) };
+    buf.close();
     Ok(magic == FREE_PAGE_MAGIC)
 }
 
@@ -1342,12 +1383,14 @@ pub fn maybe_truncate_relation(
         let wal_buf = pgbuffer::BlockBuffer::acquire(rel, rbl.wal_block)?;
         let wal = wal_buf.as_struct::<WALHeader>(0).context("wal header")?;
         if wal.free_max_block == pg_sys::InvalidBlockNumber {
+            wal_buf.close();
             info!(
                 "maybe_truncate_relation done: truncated=false elapsed_ms={}",
                 start.elapsed().as_millis()
             );
             return Ok(());
         }
+        wal_buf.close();
     }
     let mut new_nblocks = nblocks;
     while new_nblocks > 1 {
@@ -1387,6 +1430,7 @@ pub fn maybe_truncate_relation(
             header.magic = FREE_PAGE_MAGIC;
             header.next_block = head;
             head = *block;
+            page.close();
         }
         wal.free_head = head;
         if rbl.version >= 5 {
@@ -1397,6 +1441,7 @@ pub fn maybe_truncate_relation(
                 .unwrap_or(pg_sys::InvalidBlockNumber);
             wal.high_water_block = new_nblocks.saturating_sub(1);
         }
+        wal_buf.close();
     }
     let freelist_rewrite_elapsed_ms = freelist_rewrite_start.elapsed().as_millis();
     info!(
@@ -1535,6 +1580,18 @@ struct SegmentCursor {
 }
 
 impl SegmentCursor {
+    fn close(mut self) {
+        if let Some(leaf) = self.leaf.take() {
+            leaf.close();
+        }
+    }
+
+    fn abandon(mut self) {
+        if let Some(leaf) = self.leaf.take() {
+            leaf.abandon();
+        }
+    }
+
     fn read_block_header(buf: &pgbuffer::BlockBuffer) -> Result<BlockHeader> {
         let bytes = buf.as_ref();
         let size = std::mem::size_of::<BlockHeader>();
@@ -1609,9 +1666,11 @@ impl SegmentCursor {
         let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
         let header = Self::read_block_header(&buf)?;
         if header.magic != BLOCK_MAGIC {
+            buf.close();
             anyhow::bail!("invalid block magic while merging");
         }
         let entry = Self::read_block_pointer(&buf, idx, header.num_entries as usize)?;
+        buf.close();
         Ok(entry.block)
     }
 
@@ -1620,6 +1679,7 @@ impl SegmentCursor {
             let buf = pgbuffer::BlockBuffer::acquire(self.rel, block)?;
             let header = Self::read_block_header(&buf)?;
             if header.magic != BLOCK_MAGIC {
+                buf.close();
                 anyhow::bail!("invalid block magic while merging");
             }
             if header.level == 0 {
@@ -1630,7 +1690,10 @@ impl SegmentCursor {
             }
             let count = header.num_entries as usize;
             if count == 0 {
-                self.leaf = None;
+                buf.close();
+                if let Some(leaf) = self.leaf.take() {
+                    leaf.close();
+                }
                 self.leaf_entry_count = 0;
                 return Ok(());
             }
@@ -1640,12 +1703,15 @@ impl SegmentCursor {
                 next_idx: 1,
                 count,
             });
+            buf.close();
             block = child;
         }
     }
 
     fn advance_leaf(&mut self) -> Result<bool> {
-        self.leaf = None;
+        if let Some(leaf) = self.leaf.take() {
+            leaf.close();
+        }
         self.leaf_entry_idx = 0;
         self.leaf_entry_count = 0;
         while let Some(mut frame) = self.stack.pop() {
@@ -1697,9 +1763,11 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
         let buf = pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
+            buf.close();
             anyhow::bail!("invalid block magic while merging");
         }
         if header.level != 0 {
+            buf.close();
             anyhow::bail!("expected leaf page while merging");
         }
         let entries = buf
@@ -1709,6 +1777,7 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
             )
             .context("index entries")?;
         all_entries.extend_from_slice(&entries.entries[..header.num_entries as usize]);
+        buf.close();
     }
     Ok(all_entries)
 }
@@ -1723,9 +1792,11 @@ pub fn resolve_leaf_for_trigram(
         let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
+            buf.close();
             anyhow::bail!("invalid block magic");
         }
         if header.level == 0 {
+            buf.close();
             return Ok(Some(block));
         }
         let pointers = buf
@@ -1736,6 +1807,7 @@ pub fn resolve_leaf_for_trigram(
             .context("block pointers")?;
         let slice = &pointers.entries[..header.num_entries as usize];
         if slice.is_empty() {
+            buf.close();
             return Ok(None);
         }
         let idx = match slice.binary_search_by(|p| {
@@ -1743,10 +1815,14 @@ pub fn resolve_leaf_for_trigram(
             mt.cmp(&trigram)
         }) {
             Ok(i) => i,
-            Err(0) => return Ok(None),
+            Err(0) => {
+                buf.close();
+                return Ok(None);
+            }
             Err(i) => i - 1,
         };
         block = slice[idx].block;
+        buf.close();
     }
 }
 
@@ -1755,10 +1831,12 @@ pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec
         let buf = pgbuffer::BlockBuffer::acquire(rel, block)?;
         let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
         if header.magic != BLOCK_MAGIC {
+            buf.close();
             anyhow::bail!("invalid block magic");
         }
         if header.level == 0 {
             out.push(block);
+            buf.close();
             return Ok(());
         }
         let pointers = buf
@@ -1771,6 +1849,7 @@ pub fn collect_leaf_blocks(rel: pg_sys::Relation, root_block: u32) -> Result<Vec
         for p in slice {
             collect(rel, p.block, out)?;
         }
+        buf.close();
         Ok(())
     }
 
@@ -1810,67 +1889,75 @@ fn merge_entry_postings_stream(
     }
 
     let mut cursors = Vec::new();
-    for entry in entries {
-        let mut cursor = unsafe { crate::storage::decode::PostingCursor::new(rel, entry)? };
-        if cursor.advance()? {
-            cursors.push(cursor);
-        }
-    }
-
-    let mut heap: BinaryHeap<Reverse<(ItemPointer, usize)>> = BinaryHeap::new();
-    for (idx, cursor) in cursors.iter().enumerate() {
-        if let Some(tid) = cursor.current_tid() {
-            heap.push(Reverse((tid, idx)));
-        }
-    }
-
-    let mut occs: Vec<(u32, u8)> = Vec::new();
-    while let Some(Reverse((target, idx))) = heap.pop() {
-        let mut source_count = 0usize;
-        occs.clear();
-        let deleted = tombstones.contains(target);
-
-        advance_posting_cursor(
-            &mut cursors,
-            &mut heap,
-            idx,
-            deleted,
-            &mut source_count,
-            &mut occs,
-        )?;
-        loop {
-            let Some(&Reverse((next_tid, _))) = heap.peek() else {
-                break;
-            };
-            if next_tid != target {
-                break;
+    let result = (|| -> Result<()> {
+        for entry in entries {
+            let mut cursor = unsafe { crate::storage::decode::PostingCursor::new(rel, entry)? };
+            if cursor.advance()? {
+                cursors.push(cursor);
+            } else {
+                cursor.close();
             }
-            let Some(Reverse((_, next_idx))) = heap.pop() else {
-                break;
-            };
+        }
+
+        let mut heap: BinaryHeap<Reverse<(ItemPointer, usize)>> = BinaryHeap::new();
+        for (idx, cursor) in cursors.iter().enumerate() {
+            if let Some(tid) = cursor.current_tid() {
+                heap.push(Reverse((tid, idx)));
+            }
+        }
+
+        let mut occs: Vec<(u32, u8)> = Vec::new();
+        while let Some(Reverse((target, idx))) = heap.pop() {
+            let mut source_count = 0usize;
+            occs.clear();
+            let deleted = tombstones.contains(target);
+
             advance_posting_cursor(
                 &mut cursors,
                 &mut heap,
-                next_idx,
+                idx,
                 deleted,
                 &mut source_count,
                 &mut occs,
             )?;
-        }
-
-        if deleted {
-            continue;
-        }
-
-        if !occs.is_empty() {
-            if source_count > 1 {
-                occs.sort_unstable_by_key(|(position, _)| *position);
+            loop {
+                let Some(&Reverse((next_tid, _))) = heap.peek() else {
+                    break;
+                };
+                if next_tid != target {
+                    break;
+                }
+                let Some(Reverse((_, next_idx))) = heap.pop() else {
+                    break;
+                };
+                advance_posting_cursor(
+                    &mut cursors,
+                    &mut heap,
+                    next_idx,
+                    deleted,
+                    &mut source_count,
+                    &mut occs,
+                )?;
             }
-            on_doc(target, &occs)?;
-        }
-    }
 
-    Ok(())
+            if deleted {
+                continue;
+            }
+
+            if !occs.is_empty() {
+                if source_count > 1 {
+                    occs.sort_unstable_by_key(|(position, _)| *position);
+                }
+                on_doc(target, &occs)?;
+            }
+        }
+
+        Ok(())
+    })();
+    for cursor in cursors {
+        cursor.close();
+    }
+    result
 }
 
 pub fn merge(
@@ -1925,10 +2012,13 @@ pub fn merge(
         let cursor = SegmentCursor::new(rel, segment)?;
         if cursor.current_entry().is_some() {
             cursors.push(cursor);
+        } else {
+            cursor.close();
         }
     }
 
     if cursors.is_empty() {
+        root.close();
         return Ok(Segment {
             block: pg_sys::InvalidBlockNumber,
             size: 0,
@@ -1993,7 +2083,9 @@ pub fn merge(
         leaf_pointers: &mut Vec<BlockPointer>,
     ) -> Result<()> {
         if leaf_entries_written == 0 {
-            *leaf = None;
+            if let Some(page) = leaf.take() {
+                page.close();
+            }
             return Ok(());
         }
         let min_trigram = leaf_min_trigram.context("leaf missing min trigram")?;
@@ -2001,209 +2093,238 @@ pub fn merge(
             min_trigram,
             block: leaf_block,
         });
-        *leaf = None;
+        if let Some(page) = leaf.take() {
+            page.close();
+        }
         Ok(())
     }
 
-    let mut group_entries: Vec<IndexEntry> = Vec::new();
-    while let Some(Reverse((trigram, idx))) = heap.pop() {
-        // Collect all segment entries for this trigram and advance those cursors.
-        group_entries.clear();
-        advance_segment_cursor(&mut cursors, &mut heap, &mut group_entries, idx, trigram)?;
-        loop {
-            let Some(&Reverse((next_trigram, _))) = heap.peek() else {
-                break;
-            };
-            if next_trigram != trigram {
-                break;
-            }
-            let Some(Reverse((_, next_idx))) = heap.pop() else {
-                break;
-            };
-            advance_segment_cursor(
-                &mut cursors,
-                &mut heap,
-                &mut group_entries,
-                next_idx,
-                trigram,
-            )?;
-        }
-
-        if leaf.is_none() {
-            start_leaf(
-                rel,
-                &mut leaf,
-                &mut leaf_block,
-                &mut leaf_entries_written,
-                &mut leaf_min_trigram,
-                tracker_ptr,
-            )?;
-        }
-        if leaf_entries_written >= leaf_entry_cap {
-            finalize_leaf(
-                &mut leaf,
-                leaf_entries_written,
-                &leaf_min_trigram,
-                leaf_block,
-                &mut leaf_pointers,
-            )?;
-            start_leaf(
-                rel,
-                &mut leaf,
-                &mut leaf_block,
-                &mut leaf_entries_written,
-                &mut leaf_min_trigram,
-                tracker_ptr,
-            )?;
-        }
-
-        // Encode postings for this trigram into posting pages.
-        let mut idx_entry = IndexEntry {
-            trigram,
-            block: 0,
-            offset: 0,
-            data_length: 0,
-            frequency: 0,
-        };
-        let mut trgm_docs: u32 = 0;
-        let mut builder = encode::CompressedBatchBuilder::new();
-        let mut compressed = Vec::new();
-        let mut first_chunk = false;
-
-        let mut flush_chunk = |builder: &mut encode::CompressedBatchBuilder,
-                               idx: &mut IndexEntry,
-                               first_chunk: &mut bool|
-         -> Result<()> {
-            if builder.num_docs() == 0 {
-                return Ok(());
-            }
-            builder.compress_into(&mut compressed);
-            if compressed.len() > max_chunk_size {
-                anyhow::bail!(
-                    "chunk size {} exceeds page capacity {}",
-                    compressed.len(),
-                    max_chunk_size
-                );
-            }
-            let loc = writer.start_chunk(compressed.len());
-            writer
-                .write_all(&compressed)
-                .expect("posting write succeeds");
-            if !*first_chunk {
-                idx.block = loc.block_number;
-                idx.offset = loc.offset as u16;
-                *first_chunk = true;
-            }
-            idx.data_length = idx
-                .data_length
-                .checked_add(compressed.len() as u32)
-                .expect("overflow on data length");
-            byte_count = byte_count.saturating_add(compressed.len() as u64);
-            builder.reset();
-            Ok(())
-        };
-
-        if group_entries.len() == 1 && tombstones.is_empty() {
-            let entry = &group_entries[0];
-            let (_, _, data_length) = entry_fields(entry);
-            let frequency =
-                unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.frequency)) };
-            idx_entry.data_length = data_length;
-            idx_entry.frequency = frequency;
-            if data_length > 0 {
-                unsafe {
-                    let result =
-                        crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer);
-                    if let Err(e) = result {
-                        let (block, offset, _len) = entry_fields(entry);
-                        warning!(
-                            "posting copy failed: trigram={} block={} offset={} length={} err={e:#}",
-                            trigram,
-                            block,
-                            offset,
-                            data_length
-                        );
-                        return Err(e);
-                    }
-                    if let Ok(Some(loc)) = result {
-                        idx_entry.block = loc.block_number;
-                        idx_entry.offset = loc.offset as u16;
-                    }
+    let result = (|| -> Result<Segment> {
+        let mut group_entries: Vec<IndexEntry> = Vec::new();
+        while let Some(Reverse((trigram, idx))) = heap.pop() {
+            // Collect all segment entries for this trigram and advance those cursors.
+            group_entries.clear();
+            advance_segment_cursor(&mut cursors, &mut heap, &mut group_entries, idx, trigram)?;
+            loop {
+                let Some(&Reverse((next_trigram, _))) = heap.peek() else {
+                    break;
+                };
+                if next_trigram != trigram {
+                    break;
                 }
-                byte_count = byte_count.saturating_add(data_length as u64);
+                let Some(Reverse((_, next_idx))) = heap.pop() else {
+                    break;
+                };
+                advance_segment_cursor(
+                    &mut cursors,
+                    &mut heap,
+                    &mut group_entries,
+                    next_idx,
+                    trigram,
+                )?;
             }
-            doc_count = doc_count.saturating_add(frequency as u64);
-            occ_count_known = false;
-        } else {
-            merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
-                trgm_docs = trgm_docs.saturating_add(1);
-                doc_count = doc_count.saturating_add(1);
-                occ_count = occ_count.saturating_add(occs.len() as u64);
-                if occs.is_empty() {
+
+            if leaf.is_none() {
+                start_leaf(
+                    rel,
+                    &mut leaf,
+                    &mut leaf_block,
+                    &mut leaf_entries_written,
+                    &mut leaf_min_trigram,
+                    tracker_ptr,
+                )?;
+            }
+            if leaf_entries_written >= leaf_entry_cap {
+                finalize_leaf(
+                    &mut leaf,
+                    leaf_entries_written,
+                    &leaf_min_trigram,
+                    leaf_block,
+                    &mut leaf_pointers,
+                )?;
+                start_leaf(
+                    rel,
+                    &mut leaf,
+                    &mut leaf_block,
+                    &mut leaf_entries_written,
+                    &mut leaf_min_trigram,
+                    tracker_ptr,
+                )?;
+            }
+
+            // Encode postings for this trigram into posting pages.
+            let mut idx_entry = IndexEntry {
+                trigram,
+                block: 0,
+                offset: 0,
+                data_length: 0,
+                frequency: 0,
+            };
+            let mut trgm_docs: u32 = 0;
+            let mut builder = encode::CompressedBatchBuilder::new();
+            let mut compressed = Vec::new();
+            let mut first_chunk = false;
+
+            let mut flush_chunk = |builder: &mut encode::CompressedBatchBuilder,
+                                   idx: &mut IndexEntry,
+                                   first_chunk: &mut bool|
+             -> Result<()> {
+                if builder.num_docs() == 0 {
                     return Ok(());
                 }
-                let mut start = 0usize;
-                while start < occs.len() {
-                    if builder.num_docs() >= u8::MAX as usize {
-                        flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
-                        continue;
-                    }
-
-                    let remaining = occs.len() - start;
-                    let can_take = builder.max_positions_fit(max_chunk_size).min(remaining);
-                    if can_take == 0 {
-                        if builder.num_docs() == 0 {
-                            anyhow::bail!(
-                                "single doc chunk size {} exceeds page capacity {}",
-                                occs.len(),
-                                max_chunk_size
-                            );
-                        }
-                        flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
-                        continue;
-                    }
-                    builder.add_raw(doc, &occs[start..start + can_take]);
-                    start += can_take;
+                builder.compress_into(&mut compressed);
+                if compressed.len() > max_chunk_size {
+                    anyhow::bail!(
+                        "chunk size {} exceeds page capacity {}",
+                        compressed.len(),
+                        max_chunk_size
+                    );
                 }
+                let loc = writer.start_chunk(compressed.len());
+                writer
+                    .write_all(&compressed)
+                    .expect("posting write succeeds");
+                if !*first_chunk {
+                    idx.block = loc.block_number;
+                    idx.offset = loc.offset as u16;
+                    *first_chunk = true;
+                }
+                idx.data_length = idx
+                    .data_length
+                    .checked_add(compressed.len() as u32)
+                    .expect("overflow on data length");
+                byte_count = byte_count.saturating_add(compressed.len() as u64);
+                builder.reset();
                 Ok(())
-            })?;
-            flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
-            idx_entry.frequency = trgm_docs;
+            };
+
+            if group_entries.len() == 1 && tombstones.is_empty() {
+                let entry = &group_entries[0];
+                let (_, _, data_length) = entry_fields(entry);
+                let frequency =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.frequency)) };
+                idx_entry.data_length = data_length;
+                idx_entry.frequency = frequency;
+                if data_length > 0 {
+                    unsafe {
+                        let result =
+                            crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer);
+                        if let Err(e) = result {
+                            let (block, offset, _len) = entry_fields(entry);
+                            warning!(
+                                "posting copy failed: trigram={} block={} offset={} length={} err={e:#}",
+                                trigram,
+                                block,
+                                offset,
+                                data_length
+                            );
+                            return Err(e);
+                        }
+                        if let Ok(Some(loc)) = result {
+                            idx_entry.block = loc.block_number;
+                            idx_entry.offset = loc.offset as u16;
+                        }
+                    }
+                    byte_count = byte_count.saturating_add(data_length as u64);
+                }
+                doc_count = doc_count.saturating_add(frequency as u64);
+                occ_count_known = false;
+            } else {
+                merge_entry_postings_stream(rel, &group_entries, tombstones, |doc, occs| {
+                    trgm_docs = trgm_docs.saturating_add(1);
+                    doc_count = doc_count.saturating_add(1);
+                    occ_count = occ_count.saturating_add(occs.len() as u64);
+                    if occs.is_empty() {
+                        return Ok(());
+                    }
+                    let mut start = 0usize;
+                    while start < occs.len() {
+                        if builder.num_docs() >= u8::MAX as usize {
+                            flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+                            continue;
+                        }
+
+                        let remaining = occs.len() - start;
+                        let can_take = builder.max_positions_fit(max_chunk_size).min(remaining);
+                        if can_take == 0 {
+                            if builder.num_docs() == 0 {
+                                anyhow::bail!(
+                                    "single doc chunk size {} exceeds page capacity {}",
+                                    occs.len(),
+                                    max_chunk_size
+                                );
+                            }
+                            flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+                            continue;
+                        }
+                        builder.add_raw(doc, &occs[start..start + can_take]);
+                        start += can_take;
+                    }
+                    Ok(())
+                })?;
+                flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
+                idx_entry.frequency = trgm_docs;
+            }
+
+            let leaf_ref = leaf.as_mut().context("leaf buffer")?;
+            let header = leaf_ref
+                .as_struct_mut::<BlockHeader>(0)
+                .context("block header")?;
+            header.num_entries = (leaf_entries_written + 1) as u32;
+            let entries = leaf_ref
+                .as_struct_with_elems_mut::<IndexList>(BH_SIZE, leaf_entry_cap)
+                .context("index entries")?;
+            entries.entries[leaf_entries_written] = idx_entry;
+            if leaf_min_trigram.is_none() {
+                leaf_min_trigram = Some(trigram);
+            }
+            leaf_entries_written += 1;
         }
 
-        let leaf_ref = leaf.as_mut().context("leaf buffer")?;
-        let header = leaf_ref
-            .as_struct_mut::<BlockHeader>(0)
-            .context("block header")?;
-        header.num_entries = (leaf_entries_written + 1) as u32;
-        let entries = leaf_ref
-            .as_struct_with_elems_mut::<IndexList>(BH_SIZE, leaf_entry_cap)
-            .context("index entries")?;
-        entries.entries[leaf_entries_written] = idx_entry;
-        if leaf_min_trigram.is_none() {
-            leaf_min_trigram = Some(trigram);
+        finalize_leaf(
+            &mut leaf,
+            leaf_entries_written,
+            &leaf_min_trigram,
+            leaf_block,
+            &mut leaf_pointers,
+        )?;
+        writer.flush().context("flush posting writer")?;
+        if occ_count_known {
+            info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
+        } else {
+            info!("Encoded {doc_count} docs and {byte_count} bytes (occs elided)");
         }
-        leaf_entries_written += 1;
-    }
-
-    finalize_leaf(
-        &mut leaf,
-        leaf_entries_written,
-        &leaf_min_trigram,
-        leaf_block,
-        &mut leaf_pointers,
-    )?;
-    if occ_count_known {
-        info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
+        let segment = Segment {
+            block: crate::storage::encode::build_segment_root(rel, &leaf_pointers, tracker_ptr)?,
+            size: byte_count,
+            extent_head: pg_sys::InvalidBlockNumber,
+            extent_count: 0,
+        };
+        Ok(segment)
+    })();
+    if result.is_ok() {
+        if let Some(page) = leaf.take() {
+            page.close();
+        }
+        let _ = writer.flush();
+        for cursor in cursors {
+            cursor.close();
+        }
+        root.close();
     } else {
-        info!("Encoded {doc_count} docs and {byte_count} bytes (occs elided)");
+        // Do not unlock or release buffers on the ERROR path here.
+        // PostgreSQL has already started ownership cleanup for the failing operation,
+        // so calling UnlockReleaseBuffer()/ReleaseBuffer() again can double-release.
+        if let Some(page) = leaf.take() {
+            page.abandon();
+        }
+        writer.abandon();
+        for cursor in cursors {
+            cursor.abandon();
+        }
+        root.abandon();
     }
-    let mut segment = Segment {
-        block: crate::storage::encode::build_segment_root(rel, &leaf_pointers, tracker_ptr)?,
-        size: byte_count,
-        extent_head: pg_sys::InvalidBlockNumber,
-        extent_count: 0,
-    };
+    let mut segment = result?;
     if track_extents {
         let extents = tracker.take();
         segment_attach_extents(rel, &mut segment, &extents)?;

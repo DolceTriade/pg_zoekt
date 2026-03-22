@@ -342,6 +342,7 @@ pub(super) unsafe fn build_parallel(
         // Append all segments at once, potentially triggering compaction if needed
         crate::storage::segment_list_append(index_relation, rbl, &all_segments)
             .unwrap_or_else(|e| error!("failed to append segments: {e:#?}"));
+        root.close();
 
         let ntuples = (*parallel_shared)
             .build_state

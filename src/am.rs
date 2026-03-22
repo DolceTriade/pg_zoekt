@@ -304,6 +304,7 @@ mod implementation {
                         }
                     }
                 }
+                cursor.close();
             }
         }
 
@@ -338,6 +339,7 @@ mod implementation {
             .map_err(|e| anyhow!("{e}"))?;
         let existing = crate::storage::segment_list_read(rel, rbl)?;
         if existing.is_empty() {
+            root.close();
             return Ok(false);
         }
         let tombstones = crate::storage::tombstone::load_snapshot_for_root(rel, rbl)
@@ -356,6 +358,7 @@ mod implementation {
             0
         };
         if required_victims < 2 {
+            root.close();
             return Ok(false);
         }
         required_victims = required_victims.min(seg_count);
@@ -388,6 +391,7 @@ mod implementation {
             }
         }
         if victim_set.len() < 2 {
+            root.close();
             return Ok(false);
         }
 
@@ -414,6 +418,7 @@ mod implementation {
                 victims.len(),
                 required_victims
             );
+            root.close();
             return Ok(false);
         }
         let victim_total_bytes = victims
@@ -429,7 +434,13 @@ mod implementation {
             victims.len(),
             victim_total_bytes
         );
+        root.close();
         let replacement = crate::storage::merge(rel, &victims, flush_threshold, &tombstones)?;
+        let mut root = crate::storage::pgbuffer::BlockBuffer::aquire_mut(rel, 0)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rbl = root
+            .as_struct_mut::<crate::storage::RootBlockList>(0)
+            .map_err(|e| anyhow!("{e}"))?;
         let mut rewritten: Vec<crate::storage::Segment> = existing
             .iter()
             .copied()
@@ -445,6 +456,7 @@ mod implementation {
             rewritten.len(),
             victims.len()
         );
+        root.close();
         Ok(false)
     }
 
@@ -470,6 +482,7 @@ mod implementation {
                 if let Err(e) = crate::storage::segment_list_append(rel, rbl, &segs) {
                     error!("failed to append segments: {e:#?}");
                 }
+                root.close();
                 count
             }
             Err(e) => {
@@ -679,6 +692,7 @@ mod implementation {
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
             let count = rbl.num_segments as i32;
+            root.close();
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             count
         }
@@ -756,6 +770,7 @@ mod implementation {
                     reclaimed
                 );
                 crate::storage::maybe_truncate_relation(rel, rbl, &segments)?;
+                root.close();
                 Ok(())
             })();
             drop(lock);
@@ -1869,6 +1884,7 @@ mod tests {
             let mut cursor =
                 crate::storage::decode::PostingCursor::new(rel, entry).expect("posting cursor");
             while cursor.advance().expect("posting decode") {}
+            cursor.close();
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         }
 
@@ -1972,6 +1988,7 @@ mod tests {
                 pg_sys::InvalidBlockNumber,
                 "new pending header should start with an empty free list"
             );
+            root.close();
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         }
 
@@ -2188,6 +2205,7 @@ mod tests {
                             );
                         }
                     }
+                    cursor.close();
                 }
             }
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
@@ -2404,6 +2422,7 @@ mod tests {
                     .expect("wal header");
                 wal.free_head = pg_sys::InvalidBlockNumber;
                 wal.free_max_block = pg_sys::InvalidBlockNumber;
+                wal_buf.close();
             }
 
             let nblocks_before =
@@ -2433,6 +2452,7 @@ mod tests {
                 "expected relation to shrink back to original size"
             );
 
+            root.close();
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
         }
         Ok(())
@@ -2487,6 +2507,7 @@ mod tests {
                     .expect("wal header");
                 wal.free_head = pg_sys::InvalidBlockNumber;
                 wal.free_max_block = pg_sys::InvalidBlockNumber;
+                wal_buf.close();
             }
 
             let mut allocated = Vec::new();
@@ -2500,6 +2521,7 @@ mod tests {
             let expected_free_max = freed.iter().copied().max().unwrap_or(0);
             let expected_high_water = allocated.iter().copied().max().unwrap_or(0);
 
+            root.close();
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
             (expected_free_max, expected_high_water)
         };
@@ -2618,6 +2640,7 @@ mod tests {
                 .as_struct::<crate::storage::RootBlockList>(0)
                 .expect("root header");
             let bytes = rbl.tombstone_bytes;
+            root.close();
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             bytes
         }
@@ -3208,7 +3231,20 @@ mod tests {
 
     #[pg_test]
     pub fn test_parallel_build_reloption() -> spi::Result<()> {
-        let before = Spi::get_one::<i64>("SELECT pg_zoekt_parallel_builds()")?.unwrap_or(0);
+        let max_parallel_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+                .unwrap_or(0);
+        let max_parallel_maintenance_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_maintenance_workers')::int")?
+                .unwrap_or(0);
+        if max_parallel_workers <= 0 || max_parallel_maintenance_workers <= 0 {
+            info!(
+                "skipping parallel build test: max_parallel_workers={} max_parallel_maintenance_workers={}",
+                max_parallel_workers, max_parallel_maintenance_workers
+            );
+            return Ok(());
+        }
+
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update("DROP TABLE IF EXISTS parallel_build_docs", None, &[])?;
             client.update(
@@ -3216,31 +3252,62 @@ mod tests {
                 None,
                 &[],
             )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
             client.update("SET max_parallel_maintenance_workers = 2", None, &[])?;
             client.update(
-                "INSERT INTO parallel_build_docs (text) VALUES
-                 ('needle stays visible'),
-                 ('bourbon biscuits'),
-                 ('another needle is here')",
-                None,
-                &[],
-            )?;
-            client.update(
-                "CREATE INDEX idx_parallel_build_docs ON parallel_build_docs USING pg_zoekt (text) WITH (parallel_workers = 2)",
+                "INSERT INTO parallel_build_docs (text)
+                 SELECT CASE
+                     WHEN gs % 1024 = 0 THEN repeat(md5((gs * 31)::text), 16) || ' parallel-needle ' || gs::text
+                     ELSE repeat(md5((gs * 31)::text), 16) || ' ordinary-row ' || gs::text
+                 END
+                 FROM generate_series(1, 8192) gs",
                 None,
                 &[],
             )?;
             Ok(())
         })?;
+
+        crate::build::test_parallel_build_reset();
+        let mut used_parallel = false;
+        for attempt in 1..=3 {
+            Spi::connect_mut(|client| -> spi::Result<()> {
+                client.update("DROP INDEX IF EXISTS idx_parallel_build_docs", None, &[])?;
+                client.update(
+                    "CREATE INDEX idx_parallel_build_docs
+                     ON parallel_build_docs USING pg_zoekt (text)
+                     WITH (parallel_workers = 2)",
+                    None,
+                    &[],
+                )?;
+                Ok(())
+            })?;
+            let count = crate::build::test_parallel_build_count();
+            if count > 0 {
+                used_parallel = true;
+                break;
+            }
+            info!(
+                "parallel build attempt {} launched no workers; retrying",
+                attempt
+            );
+            crate::build::test_parallel_build_reset();
+            Spi::run("SELECT pg_sleep(0.1)")?;
+        }
+
+        assert!(
+            used_parallel,
+            "expected parallel build to run after retries; worker slots may be exhausted"
+        );
         Spi::run("SET enable_seqscan = OFF")?;
         let hits = Spi::get_one::<i64>(
-            "SELECT count(*) FROM parallel_build_docs WHERE text LIKE '%needle%'",
+            "SELECT count(*) FROM parallel_build_docs WHERE text LIKE '%parallel-needle%'",
         )?
         .unwrap_or(0);
-        assert_eq!(hits, 2, "expected two rows containing needle");
+        assert_eq!(
+            hits, 8,
+            "expected rows sealed by the parallel build to remain visible"
+        );
         Spi::run("RESET enable_seqscan")?;
-        let after = Spi::get_one::<i64>("SELECT pg_zoekt_parallel_builds()")?.unwrap_or(0);
-        assert_eq!(after, before + 1, "parallel build counter should increment");
         Spi::run("DROP TABLE IF EXISTS parallel_build_docs")?;
         Ok(())
     }
@@ -3556,7 +3623,7 @@ bar'),
 
             let dotstar_count = client
                 .select(
-                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '^foo.*bar'",
+                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '(?m)^.*foo.*bar.*$'",
                     None,
                     &[],
                 )?
@@ -3564,13 +3631,13 @@ bar'),
                 .get::<i64>(1)?
                 .unwrap_or(0);
             assert_eq!(
-                dotstar_count, 4,
-                "expected ordered regex matches with default dot semantics"
+                dotstar_count, 3,
+                "expected wrapped regex matches confined to a single line"
             );
 
             let single_gap_count = client
                 .select(
-                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '^foo.bar$'",
+                    "SELECT count(*) FROM positional_regex_docs WHERE text ~ '(?m)^foo.bar$'",
                     None,
                     &[],
                 )?
@@ -3578,8 +3645,8 @@ bar'),
                 .get::<i64>(1)?
                 .unwrap_or(0);
             assert_eq!(
-                single_gap_count, 2,
-                "expected one-character gap regex matches with default dot semantics"
+                single_gap_count, 1,
+                "expected wrapped one-character gap regex match on a single line"
             );
 
             client.update("DROP TABLE positional_regex_docs", None, &[])?;

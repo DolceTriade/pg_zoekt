@@ -120,11 +120,14 @@ pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::
         .as_struct::<crate::storage::RootBlockList>(0)
         .context("root header")?;
     if rbl.magic != crate::storage::ROOT_MAGIC {
+        root.close();
         anyhow::bail!("invalid root magic");
     }
 
     if rbl.version >= 2 {
-        return crate::storage::segment_list_read(rel, rbl);
+        let segments = crate::storage::segment_list_read(rel, rbl);
+        root.close();
+        return segments;
     }
 
     // Legacy v1: segments stored inline right after the root header.
@@ -137,7 +140,7 @@ pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::
             rbl1.num_segments as usize,
         )
         .context("segments")?;
-    Ok(segments
+    let out = segments
         .entries
         .iter()
         .map(|seg| crate::storage::Segment {
@@ -146,7 +149,9 @@ pub unsafe fn read_segments(rel: pg_sys::Relation) -> anyhow::Result<Vec<crate::
             extent_head: pg_sys::InvalidBlockNumber,
             extent_count: 0,
         })
-        .collect())
+        .collect();
+    root.close();
+    Ok(out)
 }
 
 unsafe fn find_entry_for_trigram(
@@ -158,26 +163,30 @@ unsafe fn find_entry_for_trigram(
         return Ok(None);
     };
     let buf = crate::storage::pgbuffer::BlockBuffer::acquire(rel, leaf_block)?;
-    let bh = buf
-        .as_struct::<crate::storage::BlockHeader>(0)
-        .context("block header")?;
-    if bh.magic != crate::storage::BLOCK_MAGIC {
-        anyhow::bail!("bad block magic");
-    }
-    let entries = buf
-        .as_struct_with_elems::<crate::storage::IndexList>(
-            std::mem::size_of::<crate::storage::BlockHeader>(),
-            bh.num_entries as usize,
-        )
-        .context("entry list")?;
-    let slice = &entries.entries;
-    let pos = slice
-        .binary_search_by(|e| {
-            let trig = e.trigram;
-            trig.cmp(&trigram)
-        })
-        .ok();
-    Ok(pos.map(|idx| slice[idx]))
+    let result = (|| -> anyhow::Result<Option<crate::storage::IndexEntry>> {
+        let bh = buf
+            .as_struct::<crate::storage::BlockHeader>(0)
+            .context("block header")?;
+        if bh.magic != crate::storage::BLOCK_MAGIC {
+            anyhow::bail!("bad block magic");
+        }
+        let entries = buf
+            .as_struct_with_elems::<crate::storage::IndexList>(
+                std::mem::size_of::<crate::storage::BlockHeader>(),
+                bh.num_entries as usize,
+            )
+            .context("entry list")?;
+        let slice = &entries.entries;
+        let pos = slice
+            .binary_search_by(|e| {
+                let trig = e.trigram;
+                trig.cmp(&trigram)
+            })
+            .ok();
+        Ok(pos.map(|idx| slice[idx]))
+    })();
+    buf.close();
+    result
 }
 
 fn is_case_sensitive(keys: pg_sys::ScanKey) -> bool {
@@ -671,6 +680,12 @@ fn stream_segment_occurrences_with_entries(
     }
 
     impl TrigramCursor {
+        fn close(self) {
+            for cursor in self.cursors {
+                cursor.close();
+            }
+        }
+
         fn current_tid(&self) -> Option<crate::storage::ItemPointer> {
             self.current.as_ref().map(|doc| doc.tid)
         }
@@ -713,132 +728,142 @@ fn stream_segment_occurrences_with_entries(
     }
 
     let mut cursors = Vec::with_capacity(trgm_entries.len());
-    for work in trgm_entries {
-        let mut per_seg = Vec::new();
-        for entry in &work.entries {
-            let mut cur = unsafe { PostingCursor::new(rel, entry)? };
-            // Start positioned at the first doc for this segment.
-            if !cur.advance()? {
-                continue;
+    let result = (|| -> anyhow::Result<Vec<(crate::storage::ItemPointer, Vec<u32>)>> {
+        for work in trgm_entries {
+            let mut per_seg = Vec::new();
+            for entry in &work.entries {
+                let mut cur = unsafe { PostingCursor::new(rel, entry)? };
+                if !cur.advance()? {
+                    cur.close();
+                    continue;
+                }
+                per_seg.push(cur);
             }
-            per_seg.push(cur);
-        }
-        if per_seg.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut heap: std::collections::BinaryHeap<
-            std::cmp::Reverse<(crate::storage::ItemPointer, usize)>,
-        > = std::collections::BinaryHeap::new();
-        for (idx, cur) in per_seg.iter().enumerate() {
-            if let Some(tid) = cur.current_tid() {
-                heap.push(std::cmp::Reverse((tid, idx)));
+            if per_seg.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-        if heap.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut trgm_cursor = TrigramCursor {
-            cursors: per_seg,
-            heap,
-            current: None,
-        };
-        if !trgm_cursor.advance()? {
-            return Ok(Vec::new());
-        }
-        cursors.push(trgm_cursor);
-    }
-
-    let mut occurrences: Vec<(crate::storage::ItemPointer, Vec<u32>)> = Vec::new();
-
-    'driver: loop {
-        let driver_tid = match cursors[0].current_tid() {
-            Some(t) => t,
-            None => break,
-        };
-
-        let mut mismatch = false;
-        for idx in 1..cursors.len() {
-            loop {
-                let tid: crate::storage::ItemPointer = match cursors[idx].current_tid() {
-                    Some(t) => t,
-                    None => break 'driver,
-                };
-                match tid.cmp(&driver_tid) {
-                    Ordering::Less => {
-                        if !cursors[idx].advance()? {
-                            break 'driver;
-                        }
-                        continue;
-                    }
-                    Ordering::Equal => break,
-                    Ordering::Greater => {
-                        mismatch = true;
-                        break;
-                    }
+            let mut heap: std::collections::BinaryHeap<
+                std::cmp::Reverse<(crate::storage::ItemPointer, usize)>,
+            > = std::collections::BinaryHeap::new();
+            for (idx, cur) in per_seg.iter().enumerate() {
+                if let Some(tid) = cur.current_tid() {
+                    heap.push(std::cmp::Reverse((tid, idx)));
                 }
             }
-            if mismatch {
-                break;
+            if heap.is_empty() {
+                for cursor in per_seg {
+                    cursor.close();
+                }
+                return Ok(Vec::new());
             }
+            let mut trgm_cursor = TrigramCursor {
+                cursors: per_seg,
+                heap,
+                current: None,
+            };
+            if !trgm_cursor.advance()? {
+                trgm_cursor.close();
+                return Ok(Vec::new());
+            }
+            cursors.push(trgm_cursor);
         }
 
-        if mismatch {
-            if !cursors[0].advance()? {
-                break;
-            }
-            continue 'driver;
-        }
+        let mut occurrences: Vec<(crate::storage::ItemPointer, Vec<u32>)> = Vec::new();
 
-        let anchor_pattern_idx = trgm_entries[0].pat_idx;
-        let anchor_pt = &seg_pattern.trigrams[anchor_pattern_idx];
-        let anchor_doc = cursors[0].current().expect("cursor populated");
+        'driver: loop {
+            let driver_tid = match cursors[0].current_tid() {
+                Some(t) => t,
+                None => break,
+            };
 
-        let mut starts: Vec<u32> = Vec::new();
-        for (pos, flag) in &anchor_doc.positions {
-            if *pos < anchor_pt.pos || !flags_match(*flag, anchor_pt.flags, case_sensitive) {
-                continue;
-            }
-            let mut ok = true;
-            for cur_idx in 1..cursors.len() {
-                let pat_idx = trgm_entries[cur_idx].pat_idx;
-                let pt = &seg_pattern.trigrams[pat_idx];
-                let delta = pt.pos as i64 - anchor_pt.pos as i64;
-                let target = if delta.is_negative() {
-                    let delta = (-delta) as u32;
-                    if *pos < delta {
-                        ok = false;
-                        break;
+            let mut mismatch = false;
+            for idx in 1..cursors.len() {
+                loop {
+                    let tid: crate::storage::ItemPointer = match cursors[idx].current_tid() {
+                        Some(t) => t,
+                        None => break 'driver,
+                    };
+                    match tid.cmp(&driver_tid) {
+                        Ordering::Less => {
+                            if !cursors[idx].advance()? {
+                                break 'driver;
+                            }
+                            continue;
+                        }
+                        Ordering::Equal => break,
+                        Ordering::Greater => {
+                            mismatch = true;
+                            break;
+                        }
                     }
-                    *pos - delta
-                } else {
-                    *pos + delta as u32
-                };
-                let doc = cursors[cur_idx].current().expect("aligned cursor");
-                if !doc
-                    .positions
-                    .iter()
-                    .any(|(p, f)| *p == target && flags_match(*f, pt.flags, case_sensitive))
-                {
-                    ok = false;
+                }
+                if mismatch {
                     break;
                 }
             }
-            if ok {
-                let start = *pos - anchor_pt.pos;
-                starts.push(start);
+
+            if mismatch {
+                if !cursors[0].advance()? {
+                    break;
+                }
+                continue 'driver;
+            }
+
+            let anchor_pattern_idx = trgm_entries[0].pat_idx;
+            let anchor_pt = &seg_pattern.trigrams[anchor_pattern_idx];
+            let anchor_doc = cursors[0].current().expect("cursor populated");
+
+            let mut starts: Vec<u32> = Vec::new();
+            for (pos, flag) in &anchor_doc.positions {
+                if *pos < anchor_pt.pos || !flags_match(*flag, anchor_pt.flags, case_sensitive) {
+                    continue;
+                }
+                let mut ok = true;
+                for cur_idx in 1..cursors.len() {
+                    let pat_idx = trgm_entries[cur_idx].pat_idx;
+                    let pt = &seg_pattern.trigrams[pat_idx];
+                    let delta = pt.pos as i64 - anchor_pt.pos as i64;
+                    let target = if delta.is_negative() {
+                        let delta = (-delta) as u32;
+                        if *pos < delta {
+                            ok = false;
+                            break;
+                        }
+                        *pos - delta
+                    } else {
+                        *pos + delta as u32
+                    };
+                    let doc = cursors[cur_idx].current().expect("aligned cursor");
+                    if !doc
+                        .positions
+                        .iter()
+                        .any(|(p, f)| *p == target && flags_match(*f, pt.flags, case_sensitive))
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    let start = *pos - anchor_pt.pos;
+                    starts.push(start);
+                }
+            }
+
+            if !starts.is_empty() {
+                occurrences.push((driver_tid, starts));
+            }
+
+            if !cursors[0].advance()? {
+                break;
             }
         }
 
-        if !starts.is_empty() {
-            occurrences.push((driver_tid, starts));
-        }
-
-        if !cursors[0].advance()? {
-            break;
-        }
+        Ok(occurrences)
+    })();
+    for cursor in cursors {
+        cursor.close();
     }
-
-    Ok(occurrences)
+    result
 }
 
 fn stream_segment_occurrences_adaptive(
@@ -901,14 +926,27 @@ fn add_matches_from_segment_occurrences(
     }
     let first = &segment_occurrences[0];
     'tid_loop: for (tid, starts) in first {
+        let newline_positions = newlines.get(tid).map(|v| v.as_slice()).unwrap_or(&[]);
         let start_candidates: Vec<u32> = if !branch.leading_anchor {
             starts.clone()
-        } else if starts.contains(&0) {
-            vec![0]
         } else {
-            continue;
+            starts
+                .iter()
+                .copied()
+                .filter(|start| {
+                    if *start == 0 {
+                        return true;
+                    }
+                    branch.line_oriented
+                        && newline_positions
+                            .binary_search(&start.saturating_sub(1))
+                            .is_ok()
+                })
+                .collect()
         };
-        let newline_positions = newlines.get(tid).map(|v| v.as_slice()).unwrap_or(&[]);
+        if start_candidates.is_empty() {
+            continue;
+        }
 
         for start in start_candidates {
             let mut prev_end = start.saturating_add(segment_lengths[0]);
@@ -957,6 +995,9 @@ fn add_matches_from_segment_occurrences(
                 };
                 prev_end = next_start.saturating_add(segment_lengths[seg_idx]);
             }
+            if ok && branch.trailing_anchor {
+                ok = newline_positions.binary_search(&prev_end).is_ok();
+            }
             if ok {
                 state.push_match(*tid, !branch.exact);
                 continue 'tid_loop;
@@ -1001,6 +1042,7 @@ fn collect_newline_positions(
                 slot.push(*pos);
             }
         }
+        cursor.close();
     }
     for positions in out.values_mut() {
         positions.sort_unstable();
@@ -1019,6 +1061,7 @@ enum RegexGap {
 #[derive(Debug, Clone)]
 struct RegexBranchPattern {
     leading_anchor: bool,
+    trailing_anchor: bool,
     exact: bool,
     line_oriented: bool,
     segments: Vec<SegmentPattern>,
@@ -1028,6 +1071,24 @@ struct RegexBranchPattern {
 
 fn regex_has_inline_flags(pattern: &str) -> bool {
     pattern.contains("(?")
+}
+
+fn split_preprocessed_line_regex(pattern: &str) -> Option<(&str, bool, bool)> {
+    let wrapped = pattern.strip_prefix("(?m)^")?.strip_suffix('$')?;
+    let (wrapped, leading_anchor) = if let Some(rest) = wrapped.strip_prefix(".*") {
+        (rest, false)
+    } else {
+        (wrapped, true)
+    };
+    let (wrapped, trailing_anchor) = if let Some(rest) = wrapped.strip_suffix(".*") {
+        (rest, false)
+    } else {
+        (wrapped, true)
+    };
+    if wrapped.is_empty() {
+        return None;
+    }
+    Some((wrapped, leading_anchor, trailing_anchor))
 }
 
 fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<RegexBranchPattern> {
@@ -1171,6 +1232,7 @@ fn parse_ordered_regex_branch(pattern: &str, _case_sensitive: bool) -> Option<Re
 
     Some(RegexBranchPattern {
         leading_anchor,
+        trailing_anchor,
         exact,
         line_oriented,
         segments,
@@ -1184,6 +1246,18 @@ fn build_regex_branch_patterns(
     case_sensitive: bool,
     collation: pg_sys::Oid,
 ) -> anyhow::Result<Option<Vec<RegexBranchPattern>>> {
+    if let Some((inner, leading_anchor, trailing_anchor)) = split_preprocessed_line_regex(pattern) {
+        if let Some(mut branch) = parse_ordered_regex_branch(inner, case_sensitive) {
+            branch.line_oriented = true;
+            branch.leading_anchor = leading_anchor;
+            branch.trailing_anchor = trailing_anchor;
+            if trailing_anchor {
+                branch.exact = false;
+            }
+            return Ok(Some(vec![branch]));
+        }
+    }
+
     if let Some(branch) = parse_ordered_regex_branch(pattern, case_sensitive) {
         return Ok(Some(vec![branch]));
     }
@@ -1207,6 +1281,7 @@ fn build_regex_branch_patterns(
             } else {
                 Some(RegexBranchPattern {
                     leading_anchor: branch.leading_anchor,
+                    trailing_anchor: false,
                     exact: false,
                     line_oriented: false,
                     segment_lengths: segments.iter().map(|seg| seg.len).collect(),
@@ -1253,10 +1328,12 @@ fn add_matches_from_regex_branches(
         }
 
         let needs_newlines = branch.line_oriented
-            && branch
-                .gaps
-                .iter()
-                .any(|gap| !matches!(gap, RegexGap::Adjacent));
+            && (branch.leading_anchor
+                || branch.trailing_anchor
+                || branch
+                    .gaps
+                    .iter()
+                    .any(|gap| !matches!(gap, RegexGap::Adjacent)));
         let newlines = if needs_newlines {
             let mut candidates = std::collections::BTreeSet::new();
             for (tid, _) in &segment_occurrences[0] {
@@ -1360,20 +1437,23 @@ unsafe fn build_scan_state(
             let entries = entry_for_trigram(index_relation, &index_segments, pt.trigram);
             for entry in &entries {
                 match unsafe { PostingCursor::new(index_relation, entry) } {
-                    Ok(mut cur) => loop {
-                        match cur.advance_check_position(pt.pos, pt.flags, case_sensitive) {
-                            Ok(Some((tid, ok))) => {
-                                if ok {
-                                    state.push_match(tid, false);
+                    Ok(mut cur) => {
+                        loop {
+                            match cur.advance_check_position(pt.pos, pt.flags, case_sensitive) {
+                                Ok(Some((tid, ok))) => {
+                                    if ok {
+                                        state.push_match(tid, false);
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warning!("failed to stream postings: {e:#}");
+                                    break;
                                 }
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                warning!("failed to stream postings: {e:#}");
-                                break;
-                            }
                         }
-                    },
+                        cur.close();
+                    }
                     Err(e) => warning!("failed to stream postings: {e:#}"),
                 }
             }
@@ -1419,6 +1499,7 @@ unsafe fn build_scan_state(
 
         let branch = RegexBranchPattern {
             leading_anchor: !leading_wildcard,
+            trailing_anchor: false,
             exact: !nonregex_recheck,
             line_oriented: false,
             segment_lengths: segments.iter().map(|seg| seg.len).collect(),
@@ -1483,6 +1564,7 @@ fn build_full_regex_scan_state(index_relation: pg_sys::Relation) -> ScanState {
                     }
                 }
             }
+            cur.close();
         }
     }
     state.sort_dedup();

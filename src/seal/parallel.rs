@@ -225,7 +225,7 @@ pub(crate) unsafe fn seal_parallel(
             error!("failed to append segments: {e:#?}");
         }
 
-        drop(root);
+        root.close();
         crate::storage::pending::free_blocks(index_rel, &blocks)
             .unwrap_or_else(|e| error!("failed to free pending blocks: {e:#?}"));
 

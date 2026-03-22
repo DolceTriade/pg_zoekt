@@ -62,6 +62,10 @@ struct PostingReader {
 }
 
 impl PostingReader {
+    fn close(self) {
+        self.buf.close();
+    }
+
     unsafe fn new(rel: pg_sys::Relation, entry: &IndexEntry) -> anyhow::Result<Self> {
         let (block, offset, data_length) = entry_fields(entry);
         let nblocks = unsafe {
@@ -156,7 +160,8 @@ impl PostingReader {
         if header_copy.magic != super::POSTING_PAGE_MAGIC {
             anyhow::bail!("invalid posting page magic");
         }
-        self.buf = next_buf;
+        let old_buf = std::mem::replace(&mut self.buf, next_buf);
+        old_buf.close();
         self.header = header_copy;
         self.cursor = header_copy.next_offset as usize;
         self.page_free = header_copy.free as usize;
@@ -211,6 +216,7 @@ where
         let payload = reader.take_slice(payload_len)?;
         out.write_all(payload).context("write posting payload")?;
     }
+    reader.close();
     Ok(first_loc)
 }
 
@@ -242,6 +248,11 @@ mod tests {
 }
 
 impl PostingCursor {
+    #[allow(dead_code)]
+    pub fn close(self) {
+        self.reader.close();
+    }
+
     #[inline]
     fn decode_var_u64(buf: &[u8], offset: &mut usize) -> anyhow::Result<u64> {
         let mut val = 0u64;

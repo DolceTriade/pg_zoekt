@@ -42,6 +42,7 @@ impl Encoder {
         } else {
             None
         };
+        root.close();
         let mut p = PageWriter::new(rel, super::pgbuffer::SPECIAL_SIZE, tracker_ptr);
         let mut interrupt_counter: u32 = 0;
 
@@ -166,6 +167,7 @@ impl Encoder {
                 min_trigram,
                 block: leaf_block,
             });
+            leaf.close();
 
             // Start with leaf node.
             // Write until full.
@@ -179,6 +181,7 @@ impl Encoder {
             // Start writing compressed blocks of 128 entries
         }
         info!("Encoded {doc_count} docs, {occ_count} occs and {byte_count} bytes");
+        p.flush().context("flush page writer")?;
         segment.size = byte_count as u64;
         segment.block = build_segment_root(rel, &leaf_pointers, tracker_ptr)?;
         segment.extent_head = pg_sys::InvalidBlockNumber;
@@ -233,6 +236,7 @@ pub(crate) fn build_segment_root(
                 min_trigram: chunk[0].min_trigram,
                 block: block_no,
             });
+            page.close();
         }
         current = next;
         level = level.saturating_add(1);
@@ -570,6 +574,7 @@ impl PageWriter {
             header.next_block = next_block;
             header.next_offset = POSTING_PAGE_HEADER_SIZE as u16;
             header.free = self.pos as u16;
+            old.close();
         }
         let header = next_page
             .as_struct_mut::<super::PostingPageHeader>(0)
@@ -592,6 +597,13 @@ impl PageWriter {
     pub fn start_chunk(&mut self, size: usize) -> super::ItemPointer {
         self.ensure_page_available_for(size);
         self.location().expect("location should exist")
+    }
+
+    pub fn abandon(&mut self) {
+        if let Some(page) = self.buff.take() {
+            page.abandon();
+        }
+        self.pos = 0;
     }
 }
 
@@ -624,7 +636,9 @@ impl Write for PageWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        _ = self.buff.take();
+        if let Some(page) = self.buff.take() {
+            page.close();
+        }
         self.pos = 0;
         Ok(())
     }
