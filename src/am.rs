@@ -3628,6 +3628,29 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_regex_branch_patterns_support_alternation_without_ordering() -> spi::Result<()> {
+        let lengths = crate::query::regex_branch_segment_lengths_for_test(
+            "shadow|gameplay|allocation|opensearch|vectorstore",
+            true,
+            pg_sys::DEFAULT_COLLATION_OID,
+        )
+        .expect("plan result")
+        .expect("branch patterns");
+
+        assert_eq!(
+            lengths,
+            vec![
+                vec![10],
+                vec![8],
+                vec![10],
+                vec![6],
+                vec![11]
+            ]
+        );
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_adaptive_trigram_regex_matches() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(

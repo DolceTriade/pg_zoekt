@@ -1460,6 +1460,16 @@ fn build_regex_branch_patterns(
     Ok(Some(compiled))
 }
 
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn regex_branch_segment_lengths_for_test(
+    pattern: &str,
+    case_sensitive: bool,
+    collation: pg_sys::Oid,
+) -> anyhow::Result<Option<Vec<Vec<u32>>>> {
+    Ok(build_regex_branch_patterns(pattern, case_sensitive, collation)?
+        .map(|branches| branches.into_iter().map(|branch| branch.segment_lengths).collect()))
+}
+
 fn add_matches_from_regex_branches(
     state: &mut ScanState,
     rel: pg_sys::Relation,
@@ -1560,11 +1570,6 @@ unsafe fn build_scan_state(
             });
 
         if is_regex {
-            let can_order = regex_safe_for_ordering(&pattern_str);
-            if !can_order {
-                return build_full_regex_scan_state(index_relation);
-            }
-
             let branch_patterns =
                 match build_regex_branch_patterns(&pattern_str, case_sensitive, collation) {
                     Ok(Some(patterns)) => patterns,
@@ -2222,4 +2227,5 @@ mod tests {
         assert!(!branch.leading_anchor);
         assert!(!branch.exact);
     }
+
 }
