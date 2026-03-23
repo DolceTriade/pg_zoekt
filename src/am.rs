@@ -3228,6 +3228,39 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_planner_avoids_index_for_unindexable_regex() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE planner_regex_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO planner_regex_docs (text)
+                 VALUES ('foo bar'), ('foobar'), ('bar foo'), ('no match')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_planner_regex_docs_text_zoekt ON planner_regex_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+        Spi::run("SELECT pg_zoekt_seal('idx_planner_regex_docs_text_zoekt'::regclass)")?;
+        let explain = Spi::get_one::<String>(
+            "EXPLAIN SELECT text FROM planner_regex_docs WHERE text ~ 'foo\\bbar';",
+        )?
+        .unwrap_or_default();
+        assert!(
+            !explain.contains("zoekt"),
+            "planner unexpectedly chose pg_zoekt for unsupported regex: {explain}"
+        );
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_parallel_build_reloption() -> spi::Result<()> {
         let max_parallel_workers =
             Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?

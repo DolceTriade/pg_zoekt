@@ -293,6 +293,7 @@ fn try_consume_braced_quantifier(
     None
 }
 
+#[cfg(test)]
 fn regex_to_wildcard_pattern(pattern: &str) -> String {
     let mut out = String::new();
     let mut current = String::new();
@@ -683,13 +684,6 @@ fn build_literal_segment_pattern(seg: &str) -> Option<SegmentPattern> {
 
 fn pattern_has_trigram(pattern: &str) -> bool {
     extract_pattern_segments(pattern)
-        .into_iter()
-        .any(|segment| !segment.trigrams.is_empty())
-}
-
-fn regex_has_trigram(pattern: &str) -> bool {
-    let wildcard = regex_to_wildcard_pattern(pattern);
-    extract_pattern_segments(&wildcard)
         .into_iter()
         .any(|segment| !segment.trigrams.is_empty())
 }
@@ -1968,7 +1962,7 @@ unsafe fn index_path_constant_trigram(path: *mut pg_sys::IndexPath) -> Option<bo
         if let Some(pattern) = unsafe { const_pattern_from_op(op) } {
             saw_constant = true;
             let has_trigram = if unsafe { op_is_regex(op) } {
-                regex_has_trigram(&pattern)
+                unsafe { regex_clause_indexable(op, &pattern) }
             } else {
                 pattern_has_trigram(&pattern)
             };
@@ -1991,6 +1985,43 @@ unsafe fn op_is_regex(op: *mut pg_sys::OpExpr) -> bool {
     }
     let cname = unsafe { std::ffi::CStr::from_ptr(name) };
     matches!(cname.to_bytes(), b"~" | b"~*")
+}
+
+unsafe fn op_is_case_sensitive(op: *mut pg_sys::OpExpr) -> bool {
+    if op.is_null() {
+        return true;
+    }
+    let opno = unsafe { (*op).opno };
+    let name = unsafe { pg_sys::get_opname(opno) };
+    if name.is_null() {
+        return true;
+    }
+    let cname = unsafe { std::ffi::CStr::from_ptr(name) };
+    !matches!(cname.to_bytes(), b"~~*" | b"~*")
+}
+
+unsafe fn regex_clause_indexable(op: *mut pg_sys::OpExpr, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let case_sensitive = unsafe { op_is_case_sensitive(op) };
+    let collation = if op.is_null() {
+        pg_sys::DEFAULT_COLLATION_OID
+    } else {
+        let oid = unsafe { (*op).inputcollid };
+        if oid == pg_sys::InvalidOid {
+            pg_sys::DEFAULT_COLLATION_OID
+        } else {
+            oid
+        }
+    };
+
+    match build_regex_branch_patterns(pattern, case_sensitive, collation) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
