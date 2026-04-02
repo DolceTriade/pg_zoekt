@@ -980,6 +980,11 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         root.close();
         return Ok(());
     }
+    let nblocks =
+        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
+    let mut seen: HashSet<u32> = collect_free_list_blocks(rel, rbl.wal_block)?
+        .into_iter()
+        .collect();
 
     let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
     let wal = wal_buf
@@ -997,6 +1002,8 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
             || *block == rbl.wal_block
             || *block == rbl.pending_block
             || *block == rbl.tombstone_block
+            || *block >= nblocks
+            || !seen.insert(*block)
         {
             continue;
         }
