@@ -81,6 +81,41 @@ impl ScanState {
     }
 }
 
+fn tid_cmp(a: &pg_sys::ItemPointerData, b: &pg_sys::ItemPointerData) -> Ordering {
+    let a_blk = (a.ip_blkid.bi_hi as u32) << 16 | a.ip_blkid.bi_lo as u32;
+    let b_blk = (b.ip_blkid.bi_hi as u32) << 16 | b.ip_blkid.bi_lo as u32;
+    match a_blk.cmp(&b_blk) {
+        Ordering::Equal => a.ip_posid.cmp(&b.ip_posid),
+        other => other,
+    }
+}
+
+fn intersect_scan_states(mut left: ScanState, right: ScanState) -> ScanState {
+    let mut matches = Vec::with_capacity(left.matches.len().min(right.matches.len()));
+    let mut lidx = 0usize;
+    let mut ridx = 0usize;
+
+    while lidx < left.matches.len() && ridx < right.matches.len() {
+        match tid_cmp(&left.matches[lidx].tid, &right.matches[ridx].tid) {
+            Ordering::Less => lidx += 1,
+            Ordering::Greater => ridx += 1,
+            Ordering::Equal => {
+                matches.push(MatchEntry {
+                    tid: left.matches[lidx].tid,
+                    // Every clause must hold, so any lossy clause forces a heap recheck.
+                    recheck: left.matches[lidx].recheck || right.matches[ridx].recheck,
+                });
+                lidx += 1;
+                ridx += 1;
+            }
+        }
+    }
+
+    left.matches = matches;
+    left.cursor = 0;
+    left
+}
+
 fn scan_keys_to_pattern(keys: pg_sys::ScanKey, nkeys: i32) -> Option<String> {
     if keys.is_null() || nkeys <= 0 {
         return None;
@@ -1527,12 +1562,11 @@ fn add_matches_from_regex_branches(
     Ok(())
 }
 
-unsafe fn build_scan_state(
+unsafe fn build_scan_state_for_key(
     index_relation: pg_sys::Relation,
     keys: pg_sys::ScanKey,
-    nkeys: std::os::raw::c_int,
 ) -> ScanState {
-    let pattern = scan_keys_to_pattern(keys, nkeys);
+    let pattern = scan_keys_to_pattern(keys, 1);
     let pattern_str = if let Some(p) = pattern {
         p
     } else {
@@ -1686,6 +1720,34 @@ unsafe fn build_scan_state(
     } else {
         ScanState::default()
     }
+}
+
+unsafe fn build_scan_state(
+    index_relation: pg_sys::Relation,
+    keys: pg_sys::ScanKey,
+    nkeys: std::os::raw::c_int,
+) -> ScanState {
+    if keys.is_null() || nkeys <= 0 {
+        return ScanState::default();
+    }
+
+    let mut combined: Option<ScanState> = None;
+    for idx in 0..(nkeys as usize) {
+        let key = unsafe { keys.add(idx) };
+        let state = unsafe { build_scan_state_for_key(index_relation, key) };
+        combined = Some(match combined.take() {
+            Some(existing) => intersect_scan_states(existing, state),
+            None => state,
+        });
+        if combined
+            .as_ref()
+            .is_some_and(|state| state.matches.is_empty())
+        {
+            break;
+        }
+    }
+
+    combined.unwrap_or_default()
 }
 
 fn build_full_regex_scan_state(index_relation: pg_sys::Relation) -> ScanState {

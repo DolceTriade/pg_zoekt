@@ -1757,6 +1757,65 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_multiple_ilike_scan_keys_are_intersected() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE and_key_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO and_key_docs (text) VALUES
+                 ('Must call util.foo from here'),
+                 ('MUST route through UTIL.bar'),
+                 ('Must call helper.foo instead'),
+                 ('see util.foo only'),
+                 ('irrelevant row')",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_and_key_docs_text_zoekt ON and_key_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        Spi::run("SELECT pg_zoekt_seal('idx_and_key_docs_text_zoekt'::regclass)")?;
+
+        let seq_count: i64 = Spi::get_one(
+            "SET enable_seqscan = on; \
+             SET enable_indexscan = off; \
+             SET enable_bitmapscan = off; \
+             SELECT count(*) FROM and_key_docs
+             WHERE text ILIKE '%Must%' AND text ILIKE '%util.%';",
+        )?
+        .unwrap_or(0);
+
+        let idx_count: i64 = Spi::get_one(
+            "SET enable_seqscan = off; \
+             SET enable_indexscan = on; \
+             SET enable_bitmapscan = on; \
+             SELECT count(*) FROM and_key_docs
+             WHERE text ILIKE '%Must%' AND text ILIKE '%util.%';",
+        )?
+        .unwrap_or(0);
+
+        assert_eq!(
+            seq_count, 2,
+            "test fixture should produce two exact matches"
+        );
+        assert_eq!(
+            idx_count, seq_count,
+            "index scan should intersect multiple scan keys"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS and_key_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_wildcard_segments_respect_multiple_starts() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
