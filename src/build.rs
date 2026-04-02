@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pgrx::prelude::*;
 
-use crate::storage::pgbuffer::{ExclusiveBuffer, MutableBufferPage};
+use crate::storage::pgbuffer::{BufferPage, ExclusiveBuffer, MutableBufferPage, PinnedBuffer};
 
 mod parallel;
 
@@ -348,6 +348,7 @@ fn finalize_segment_list(
         .expect("root header");
     crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
         .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    root_buffer.close();
     if merged != existing {
         let cleanup_start = std::time::Instant::now();
         info!(
@@ -357,14 +358,25 @@ fn finalize_segment_list(
         );
         crate::storage::free_segments(index_relation, &existing)
             .unwrap_or_else(|e| error!("failed to free segments: {e:#?}"));
+        let root_buffer = match PinnedBuffer::read(index_relation, root_block) {
+            Ok(root_buffer) => root_buffer,
+            Err(e) => {
+                error!("failed to reacquire root buffer: {e:#?}");
+            }
+        };
+        let rbl = root_buffer
+            .as_struct::<crate::storage::RootBlockList>(0)
+            .expect("root header");
+        crate::storage::reclaim_orphan_blocks(index_relation, rbl, &merged)
+            .unwrap_or_else(|e| error!("failed to reclaim orphan blocks: {e:#?}"));
         crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
             .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
+        root_buffer.close();
         info!(
             "Final merge cleanup done: elapsed_ms={}",
             cleanup_start.elapsed().as_millis()
         );
     }
-    root_buffer.close();
 }
 
 fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> Option<i32> {

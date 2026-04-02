@@ -450,10 +450,19 @@ mod implementation {
         }
 
         crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
+        root.close();
+        crate::storage::free_segments(rel, &victims)?;
+        let root = PinnedBuffer::read(rel, 0).map_err(|e| anyhow!("{e}"))?;
+        let rbl = root
+            .as_struct::<crate::storage::RootBlockList>(0)
+            .map_err(|e| anyhow!("{e}"))?;
+        let reclaimed_orphans = crate::storage::reclaim_orphan_blocks(rel, rbl, &rewritten)?;
+        crate::storage::maybe_truncate_relation(rel, rbl, &rewritten)?;
         info!(
-            "merge_segments publish: kept_segments={} deferred_reclaim_segments={}",
+            "merge_segments publish: kept_segments={} reclaimed_segments={} reclaimed_orphan_blocks={}",
             rewritten.len(),
-            victims.len()
+            victims.len(),
+            reclaimed_orphans
         );
         root.close();
         Ok(false)
@@ -1169,6 +1178,26 @@ mod tests {
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             nblocks
         }
+    }
+
+    fn index_relation_size(index_oid: pg_sys::Oid) -> i64 {
+        let sql = format!("SELECT pg_relation_size({index_oid}::regclass)");
+        Spi::get_one::<i64>(&sql)
+            .expect("failed to read relation size")
+            .expect("relation size not found")
+    }
+
+    fn index_orphan_blocks(index_oid: pg_sys::Oid) -> i64 {
+        let sql = format!(
+            "SELECT COALESCE((
+                 SELECT blocks
+                 FROM pg_zoekt_index_waste({index_oid}::regclass)
+                 WHERE category = 'orphan'
+             ), 0)"
+        );
+        Spi::get_one::<i64>(&sql)
+            .expect("failed to read orphan blocks")
+            .unwrap_or(0)
     }
 
     #[pg_test]
@@ -2402,9 +2431,16 @@ mod tests {
             Ok(row.get::<pg_sys::Oid>(1)?.expect("index oid not null"))
         })?;
 
+        let bytes_before = index_relation_size(index_oid);
+        let nblocks_before = unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let nblocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            nblocks
+        };
         unsafe {
             let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
-            let segments = crate::query::read_segments(rel).expect("failed to read segments");
             let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("root buffer");
             let rbl = root
                 .as_struct::<crate::storage::RootBlockList>(0)
@@ -2423,9 +2459,6 @@ mod tests {
                 wal_buf.close();
             }
 
-            let nblocks_before =
-                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-
             let mut extra = Vec::new();
             for _ in 0..8 {
                 let page = crate::storage::allocate_block(rel);
@@ -2441,19 +2474,108 @@ mod tests {
             );
 
             crate::storage::free_blocks(rel, &extra).expect("failed to free extra blocks");
-            crate::storage::maybe_truncate_relation(rel, rbl, &segments)
-                .expect("failed to truncate relation");
-
-            let nblocks_after_truncate =
-                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-            assert_eq!(
-                nblocks_after_truncate, nblocks_before,
-                "expected relation to shrink back to original size"
-            );
-
             root.close();
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
         }
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_reclaim_docs_text_zoekt'::regclass, 'truncate', true)",
+        )?;
+        let nblocks_after_truncate = index_nblocks(index_oid);
+        let bytes_after_truncate = index_relation_size(index_oid);
+        assert_eq!(
+            nblocks_after_truncate, nblocks_before,
+            "expected truncate maintenance to shrink relation back to original block count"
+        );
+        assert_eq!(
+            bytes_after_truncate, bytes_before,
+            "expected truncate maintenance to shrink relation back to original size"
+        );
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_allocate_reuses_freed_blocks_without_growth() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE reuse_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO reuse_docs (text) SELECT repeat(md5(i::text), 8) FROM generate_series(1, 256) s(i)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_reuse_docs_text_zoekt ON reuse_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid = lookup_index_oid("idx_reuse_docs_text_zoekt")?;
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let root = crate::storage::pgbuffer::PinnedBuffer::read(rel, 0).expect("root buffer");
+            let rbl = root
+                .as_struct::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+
+            if rbl.wal_block != pg_sys::InvalidBlockNumber {
+                let mut wal_buf =
+                    crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, rbl.wal_block)
+                        .expect("wal buffer");
+                let wal = wal_buf
+                    .as_struct_mut::<crate::storage::WALHeader>(0)
+                    .expect("wal header");
+                wal.free_head = pg_sys::InvalidBlockNumber;
+                wal.free_max_block = pg_sys::InvalidBlockNumber;
+                wal_buf.close();
+            }
+
+            let nblocks_before =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let mut freed = Vec::new();
+            for _ in 0..6 {
+                let page = crate::storage::allocate_block(rel);
+                freed.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
+            }
+            let nblocks_after_extend =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            assert!(
+                nblocks_after_extend > nblocks_before,
+                "expected relation growth while creating reusable blocks"
+            );
+
+            crate::storage::free_blocks(rel, &freed).expect("failed to free blocks");
+
+            let mut reused = Vec::new();
+            for _ in 0..freed.len() {
+                let page = crate::storage::allocate_block(rel);
+                reused.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
+            }
+            let nblocks_after_reuse =
+                pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+            root.close();
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+
+            assert_eq!(
+                nblocks_after_reuse, nblocks_after_extend,
+                "reallocating from the free list should not extend the relation"
+            );
+            let freed_set: std::collections::HashSet<u32> = freed.into_iter().collect();
+            let reused_set: std::collections::HashSet<u32> = reused.into_iter().collect();
+            assert_eq!(
+                reused_set, freed_set,
+                "expected allocation to reuse the exact freed blocks"
+            );
+        }
+
+        Spi::run("DROP TABLE IF EXISTS reuse_docs")?;
         Ok(())
     }
 
@@ -2892,6 +3014,83 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_maintain_merge_reclaims_orphans() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_merge_orphan_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_maintain_merge_orphan_docs_text_zoekt ON maintain_merge_orphan_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=18i32 {
+            let insert_sql = format!(
+                "INSERT INTO maintain_merge_orphan_docs (text) VALUES (repeat(md5(({} * 43)::text), 16) || ' orphan-marker ' || {}::text)",
+                i, i
+            );
+            Spi::run(&insert_sql)?;
+            Spi::run(
+                "SELECT pg_zoekt_maintain('idx_maintain_merge_orphan_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+
+        let index_oid = lookup_index_oid("idx_maintain_merge_orphan_docs_text_zoekt")?;
+        let segments_before = read_segments(index_oid);
+        assert!(
+            segments_before.len() > crate::storage::TARGET_SEGMENTS,
+            "expected merge pressure before orphan-reclaim test (got {})",
+            segments_before.len()
+        );
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let mut root =
+                crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, 0).expect("root buffer");
+            let rbl = root
+                .as_struct_mut::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+            let mut rewritten = segments_before.clone();
+            let orphaned = rewritten.pop().expect("segment to orphan");
+            let orphaned_block = std::ptr::read_unaligned(std::ptr::addr_of!(orphaned.block));
+            crate::storage::segment_list_rewrite(rel, rbl, &rewritten)
+                .expect("failed to orphan segment");
+            root.close();
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+            assert_ne!(
+                orphaned_block,
+                pg_sys::InvalidBlockNumber,
+                "expected a valid orphaned segment block"
+            );
+        }
+
+        let orphan_blocks_before_merge = index_orphan_blocks(index_oid);
+        assert!(
+            orphan_blocks_before_merge > 0,
+            "expected orphan blocks before merge reclaim test (got {orphan_blocks_before_merge})"
+        );
+
+        Spi::run(
+            "SELECT pg_zoekt_maintain('idx_maintain_merge_orphan_docs_text_zoekt'::regclass, 'merge', true)",
+        )?;
+
+        let orphan_blocks_after_merge = index_orphan_blocks(index_oid);
+        assert_eq!(
+            orphan_blocks_after_merge, 0,
+            "merge should reclaim orphan blocks (before={orphan_blocks_before_merge}, after={orphan_blocks_after_merge})"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_merge_orphan_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_maintain_seal_only_no_forced_merge() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
@@ -3037,6 +3236,7 @@ mod tests {
                 None,
                 &[],
             )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
             client.update(
                 "CREATE INDEX idx_maintain_truncate_docs_text_zoekt ON maintain_truncate_docs USING pg_zoekt (text)",
                 None,
@@ -3066,14 +3266,25 @@ mod tests {
             "SELECT pg_zoekt_maintain('idx_maintain_truncate_docs_text_zoekt'::regclass, 'merge', true)",
         )?;
         let blocks_after_merge = index_nblocks(index_oid);
+        let bytes_after_merge = index_relation_size(index_oid);
+        let orphan_blocks_after_merge = index_orphan_blocks(index_oid);
+        assert!(
+            orphan_blocks_after_merge <= 1,
+            "merge should not leave substantial orphaned storage behind (orphan_blocks_after_merge={orphan_blocks_after_merge}, blocks_after_merge={blocks_after_merge})"
+        );
 
         Spi::run(
             "SELECT pg_zoekt_maintain('idx_maintain_truncate_docs_text_zoekt'::regclass, 'truncate', true)",
         )?;
         let blocks_after_truncate = index_nblocks(index_oid);
+        let bytes_after_truncate = index_relation_size(index_oid);
         assert!(
             blocks_after_truncate <= blocks_after_merge,
             "truncate mode should not grow relation (after_merge={blocks_after_merge}, after_truncate={blocks_after_truncate})"
+        );
+        assert!(
+            bytes_after_truncate <= bytes_after_merge,
+            "truncate mode should not grow relation bytes (after_merge={bytes_after_merge}, after_truncate={bytes_after_truncate})"
         );
 
         Spi::run("DROP TABLE IF EXISTS maintain_truncate_docs")?;
@@ -3672,13 +3883,7 @@ mod tests {
 
         assert_eq!(
             lengths,
-            vec![
-                vec![10],
-                vec![8],
-                vec![10],
-                vec![6],
-                vec![11]
-            ]
+            vec![vec![10], vec![8], vec![10], vec![6], vec![11]]
         );
         Ok(())
     }

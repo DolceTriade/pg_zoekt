@@ -1460,8 +1460,14 @@ pub(crate) fn regex_branch_segment_lengths_for_test(
     case_sensitive: bool,
     collation: pg_sys::Oid,
 ) -> anyhow::Result<Option<Vec<Vec<u32>>>> {
-    Ok(build_regex_branch_patterns(pattern, case_sensitive, collation)?
-        .map(|branches| branches.into_iter().map(|branch| branch.segment_lengths).collect()))
+    Ok(
+        build_regex_branch_patterns(pattern, case_sensitive, collation)?.map(|branches| {
+            branches
+                .into_iter()
+                .map(|branch| branch.segment_lengths)
+                .collect()
+        }),
+    )
 }
 
 fn add_matches_from_regex_branches(
@@ -2258,5 +2264,4 @@ mod tests {
         assert!(!branch.leading_anchor);
         assert!(!branch.exact);
     }
-
 }
