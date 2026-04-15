@@ -449,8 +449,10 @@ mod implementation {
             rewritten.push(replacement);
         }
 
-        crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
+        let retired_segment_list_pages =
+            crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
         root.close();
+        crate::storage::free_blocks(rel, &retired_segment_list_pages)?;
         crate::storage::free_segments(rel, &victims)?;
         let root = PinnedBuffer::read(rel, 0).map_err(|e| anyhow!("{e}"))?;
         let rbl = root
@@ -771,12 +773,7 @@ mod implementation {
                     .as_struct::<crate::storage::RootBlockList>(0)
                     .map_err(|e| anyhow!("failed to read root header: {e:#?}"))?;
                 let segments = crate::storage::segment_list_read(rel, rbl)?;
-                let reclaimed = crate::storage::reclaim_orphan_blocks(rel, rbl, &segments)?;
-                info!(
-                    "truncate_index reclaim phase: orphan_segments={} reclaimed_blocks={}",
-                    segments.len(),
-                    reclaimed
-                );
+                crate::storage::reclaim_orphan_blocks(rel, rbl, &segments)?;
                 crate::storage::maybe_truncate_relation(rel, rbl, &segments)?;
                 root.close();
                 Ok(())
@@ -3118,9 +3115,12 @@ mod tests {
             let mut rewritten = segments_before.clone();
             let orphaned = rewritten.pop().expect("segment to orphan");
             let orphaned_block = std::ptr::read_unaligned(std::ptr::addr_of!(orphaned.block));
-            crate::storage::segment_list_rewrite(rel, rbl, &rewritten)
-                .expect("failed to orphan segment");
+            let retired_segment_list_pages =
+                crate::storage::segment_list_rewrite(rel, rbl, &rewritten)
+                    .expect("failed to orphan segment");
             root.close();
+            crate::storage::free_blocks(rel, &retired_segment_list_pages)
+                .expect("failed to free retired segment-list pages");
             pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
             assert_ne!(
                 orphaned_block,

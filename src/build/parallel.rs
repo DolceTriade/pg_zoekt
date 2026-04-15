@@ -33,6 +33,7 @@ struct ParallelBuildState {
     worker_slot: AtomicUsize,
     ntuples: AtomicUsize,
     global_used_bytes: AtomicUsize,
+    next_progress_pct: AtomicUsize,
 }
 
 /// Status data for parallel index builds, shared among all parallel workers.
@@ -153,9 +154,10 @@ pub(super) unsafe fn build_parallel(
     global_budget: usize,
 ) -> Option<usize> {
     let workers = unsafe { (*index_info).ii_ParallelWorkers as usize };
+    let scan_start = std::time::Instant::now();
     info!(
-        "Building with {workers} parallel workers (flush_threshold={}, per_worker_budget={}, global_budget={}).",
-        flush_threshold, per_worker_budget, global_budget
+        "pg_zoekt build scan start: mode=parallel workers={} flush_threshold={} per_worker_budget={} global_budget={}",
+        workers, flush_threshold, per_worker_budget, global_budget
     );
     if workers == 0 {
         return None;
@@ -229,6 +231,7 @@ pub(super) unsafe fn build_parallel(
                 worker_slot: AtomicUsize::new(0),
                 ntuples: AtomicUsize::new(0),
                 global_used_bytes: AtomicUsize::new(0),
+                next_progress_pct: AtomicUsize::new(10),
             },
         });
 
@@ -272,10 +275,10 @@ pub(super) unsafe fn build_parallel(
         }
 
         pg_sys::LaunchParallelWorkers(pcxt);
+        let launched_workers = (*pcxt).nworkers_launched;
         info!(
-            "Launched {} parallel workers (requested {}).",
-            (*pcxt).nworkers_launched,
-            workers
+            "pg_zoekt build workers launched: launched={} requested={}",
+            launched_workers, workers
         );
         if (*pcxt).nworkers_launched == 0 {
             cleanup_parallel_context(pcxt, snapshot);
@@ -348,6 +351,12 @@ pub(super) unsafe fn build_parallel(
             .build_state
             .ntuples
             .load(Ordering::Relaxed);
+        info!(
+            "pg_zoekt build scan done: mode=parallel workers={} tuples={} elapsed_ms={}",
+            launched_workers,
+            ntuples,
+            scan_start.elapsed().as_millis()
+        );
 
         // Clean up fileset (requires shared pointer)
         // Note: pg_sys::SharedFileSetDeleteAll takes *mut pg_sys::SharedFileSet
@@ -388,6 +397,9 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
     let global_progress = unsafe {
         &(*parallel_shared).build_state.ntuples as *const AtomicUsize as *mut AtomicUsize
     };
+    let next_progress_pct = unsafe {
+        &(*parallel_shared).build_state.next_progress_pct as *const AtomicUsize as *mut AtomicUsize
+    };
 
     // Attach to the shared fileset to increment refcnt. This will also write
     // the 'segment' pointer into the shared struct.
@@ -425,10 +437,6 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
             .worker_slot
             .fetch_add(1, Ordering::Acquire)
     };
-    info!(
-        "pg_zoekt worker start: slot={} flush_threshold={} per_worker_budget={} global_budget={}",
-        slot, params.flush_threshold, params.per_worker_budget, params.global_budget
-    );
     let file_name = spill_file_name(slot);
 
     // Create the spill file using the local copy
@@ -454,6 +462,7 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
         params.per_worker_budget,
         params.total_est_tuples,
         global_progress,
+        next_progress_pct,
     );
     unsafe {
         IndexBuildHeapScanParallel(
@@ -473,10 +482,7 @@ pub extern "C-unwind" fn _pg_zoekt_build_main(
 
     unsafe {
         if callback_state.seen_pending > 0 {
-            (*parallel_shared)
-                .build_state
-                .ntuples
-                .fetch_add(callback_state.seen_pending as usize, Ordering::Release);
+            callback_state.publish_progress(callback_state.seen_pending as usize);
         }
         pg_sys::index_close(indexrel, index_lockmode);
         pg_sys::table_close(heaprel, heap_lockmode);
@@ -502,11 +508,10 @@ struct SpillState {
     index_relation: pg_sys::Relation,
     file: *mut pg_sys::BufFile,
     budget: BudgetTracker,
-    log_counter: u64,
-    log_every: u64,
     progress_every: u64,
     total_est_tuples: u64,
     global_progress: *mut AtomicUsize,
+    next_progress_pct: *mut AtomicUsize,
     // Keep the local fileset alive as long as the file is open
     _fileset: SharedFileSetComplete,
 }
@@ -584,13 +589,6 @@ impl BudgetTracker {
             }
         }
     }
-
-    fn current_global_used(&self) -> usize {
-        if self.global_used.is_null() {
-            return 0;
-        }
-        unsafe { (*self.global_used).load(Ordering::Acquire) }
-    }
 }
 
 impl SpillState {
@@ -605,6 +603,7 @@ impl SpillState {
         per_worker_budget: usize,
         total_est_tuples: u64,
         global_progress: *mut AtomicUsize,
+        next_progress_pct: *mut AtomicUsize,
     ) -> Self {
         Self {
             key_count,
@@ -614,47 +613,31 @@ impl SpillState {
             index_relation,
             file,
             budget: BudgetTracker::new(global_used, global_budget, per_worker_budget),
-            log_counter: 0,
-            log_every: 32768,
             progress_every: 8192,
             total_est_tuples,
             global_progress,
+            next_progress_pct,
             _fileset: fileset,
         }
     }
 
     fn flush_if_needed(&mut self) {
         let current = self.collector.memory_usage();
-        self.log_counter = self.log_counter.wrapping_add(1);
-        if self.log_counter % self.log_every == 0 {
-            self.log_status("periodic", current);
-        }
         if current >= self.flush_threshold {
-            self.log_status("threshold", current);
             self.flush();
             return;
         }
         if !self.budget.update(current) {
-            self.log_status("budget", current);
             self.flush();
         }
     }
 
     fn flush(&mut self) {
-        let current = self.collector.memory_usage();
         let trgms = self.collector.take_trgms();
         self.budget.release_all();
         if trgms.is_empty() {
             return;
         }
-        info!(
-            "pg_zoekt build flush: mem_bytes={} trgms={} global_used={} per_worker_budget={} global_budget={}",
-            current,
-            trgms.len(),
-            self.budget.current_global_used(),
-            self.budget.local_budget,
-            self.budget.global_budget
-        );
 
         // Write the actual data pages to the index relation
         let segments = crate::storage::encode::Encoder::encode_trgms(self.index_relation, &trgms)
@@ -664,32 +647,33 @@ impl SpillState {
         write_segment_batch(self.file, &segments);
     }
 
-    fn log_status(&self, reason: &str, current: usize) {
-        if self.total_est_tuples > 0 {
-            let global_done = unsafe { (*self.global_progress).load(Ordering::Acquire) } as u64;
-            let pct = (global_done as f64 / self.total_est_tuples as f64) * 100.0;
-            info!(
-                "pg_zoekt build mem: reason={} mem_bytes={} flush_threshold={} per_worker_budget={} global_used={} global_budget={} accounted={} progress_pct={:.1}",
-                reason,
-                current,
-                self.flush_threshold,
-                self.budget.local_budget,
-                self.budget.current_global_used(),
-                self.budget.global_budget,
-                self.budget.accounted,
-                pct
-            );
-        } else {
-            info!(
-                "pg_zoekt build mem: reason={} mem_bytes={} flush_threshold={} per_worker_budget={} global_used={} global_budget={} accounted={}",
-                reason,
-                current,
-                self.flush_threshold,
-                self.budget.local_budget,
-                self.budget.current_global_used(),
-                self.budget.global_budget,
-                self.budget.accounted
-            );
+    fn publish_progress(&self, batch: usize) {
+        let global_done = unsafe { (*self.global_progress).fetch_add(batch, Ordering::AcqRel) }
+            .saturating_add(batch) as u64;
+        if self.total_est_tuples == 0 || self.next_progress_pct.is_null() {
+            return;
+        }
+        let pct = ((global_done as f64 / self.total_est_tuples as f64) * 100.0) as usize;
+        loop {
+            let next = unsafe { (*self.next_progress_pct).load(Ordering::Acquire) };
+            if next > 100 || pct < next {
+                return;
+            }
+            if unsafe {
+                (*self.next_progress_pct)
+                    .compare_exchange(
+                        next,
+                        next.saturating_add(10),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            } {
+                info!(
+                    "pg_zoekt build progress: mode=parallel tuples={} progress_pct={}",
+                    global_done, next
+                );
+            }
         }
     }
 }
@@ -756,7 +740,7 @@ unsafe extern "C-unwind" fn log_index_value_callback_spill(
         state.seen_pending += 1;
         if state.seen_pending >= state.progress_every {
             let batch = state.seen_pending as usize;
-            (*state.global_progress).fetch_add(batch, Ordering::Release);
+            state.publish_progress(batch);
             state.seen_pending = 0;
         }
         pg_sys::check_for_interrupts!();

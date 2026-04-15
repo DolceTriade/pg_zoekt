@@ -14,9 +14,8 @@ struct BuildCallbackState {
     seen: u64,
     collector: crate::trgm::Collector,
     flush_threshold: usize,
-    log_counter: u64,
-    log_every: u64,
     total_est_tuples: Option<u64>,
+    next_progress_pct: u8,
 }
 
 impl BuildCallbackState {
@@ -30,25 +29,17 @@ impl BuildCallbackState {
         flush_segments(rel, &mut self.collector, self.flush_threshold);
     }
 
-    fn log_status(&self, reason: &str) {
+    fn log_progress(&mut self) {
         if let Some(total) = self.total_est_tuples {
-            let pct = (self.seen as f64 / total.max(1) as f64) * 100.0;
-            info!(
-                "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={} progress_pct={:.1}",
-                reason,
-                self.collector.memory_usage(),
-                self.flush_threshold,
-                self.seen,
-                pct
-            );
-        } else {
-            info!(
-                "pg_zoekt build mem: mode=serial reason={} mem_bytes={} flush_threshold={} tuples={}",
-                reason,
-                self.collector.memory_usage(),
-                self.flush_threshold,
-                self.seen
-            );
+            let pct = ((self.seen as f64 / total.max(1) as f64) * 100.0) as u8;
+            while self.next_progress_pct <= 100 && pct >= self.next_progress_pct {
+                let milestone = self.next_progress_pct;
+                info!(
+                    "pg_zoekt build progress: mode=serial tuples={} progress_pct={}",
+                    self.seen, milestone
+                );
+                self.next_progress_pct = self.next_progress_pct.saturating_add(10);
+            }
         }
     }
 }
@@ -56,17 +47,12 @@ impl BuildCallbackState {
 fn flush_segments(
     rel: pg_sys::Relation,
     collector: &mut crate::trgm::Collector,
-    flush_threshold: usize,
+    _flush_threshold: usize,
 ) {
-    let collector_bytes = collector.memory_usage();
     let trgms = collector.take_trgms();
     if trgms.is_empty() {
         return;
     }
-    info!(
-        "flush_segments: collector_bytes={} flush_threshold={}",
-        collector_bytes, flush_threshold
-    );
     // Ensure large temporary maps are dropped promptly after encoding.
     let res = crate::storage::encode::Encoder::encode_trgms(rel, &trgms);
     drop(trgms);
@@ -222,10 +208,7 @@ unsafe extern "C-unwind" fn log_index_value_callback(
         },
     ) {
         state.seen += 1;
-        state.log_counter = state.log_counter.wrapping_add(1);
-        if state.log_counter % state.log_every == 0 {
-            state.log_status("periodic");
-        }
+        state.log_progress();
         pg_sys::check_for_interrupts!();
         state.flush_if_needed(index);
     }
@@ -261,11 +244,11 @@ fn run_serial_build(
         seen: 0,
         collector: crate::trgm::Collector::new(),
         flush_threshold,
-        log_counter: 0,
-        log_every: 32768,
         total_est_tuples,
+        next_progress_pct: 10,
     };
-    info!("Starting scan");
+    let scan_start = std::time::Instant::now();
+    info!("pg_zoekt build scan start: mode=serial");
     unsafe {
         pg_sys::IndexBuildHeapScan(
             heap_relation,
@@ -276,6 +259,12 @@ fn run_serial_build(
         );
     }
     callback_state.flush_segments(index_relation);
+    callback_state.log_progress();
+    info!(
+        "pg_zoekt build scan done: mode=serial tuples={} elapsed_ms={}",
+        callback_state.seen,
+        scan_start.elapsed().as_millis()
+    );
     callback_state.seen as f64
 }
 
@@ -346,9 +335,12 @@ fn finalize_segment_list(
     let rbl = root_buffer
         .as_struct_mut::<crate::storage::RootBlockList>(0)
         .expect("root header");
-    crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
-        .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
+    let retired_segment_list_pages =
+        crate::storage::segment_list_rewrite(index_relation, rbl, &merged)
+            .unwrap_or_else(|e| error!("failed to rewrite segment list: {e:#?}"));
     root_buffer.close();
+    crate::storage::free_blocks(index_relation, &retired_segment_list_pages)
+        .unwrap_or_else(|e| error!("failed to free retired segment-list pages: {e:#?}"));
     if merged != existing {
         let cleanup_start = std::time::Instant::now();
         info!(

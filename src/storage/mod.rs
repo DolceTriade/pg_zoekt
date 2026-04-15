@@ -734,17 +734,39 @@ pub fn segment_list_rewrite(
     rel: pg_sys::Relation,
     root: &mut RootBlockList,
     segments: &[Segment],
-) -> Result<()> {
+) -> Result<Vec<u32>> {
     let old_head = root.segment_list_head;
+    let old_pages = if old_head != pg_sys::InvalidBlockNumber {
+        collect_segment_list_pages(rel, old_head)?
+    } else {
+        Vec::new()
+    };
     root.num_segments = 0;
     root.segment_list_head = pg_sys::InvalidBlockNumber;
     root.segment_list_tail = pg_sys::InvalidBlockNumber;
     segment_list_append(rel, root, segments)?;
     if old_head != pg_sys::InvalidBlockNumber {
-        let old_pages = collect_segment_list_pages(rel, old_head)?;
-        free_blocks(rel, &old_pages)?;
+        let new_head = root.segment_list_head;
+        let new_pages = if new_head != pg_sys::InvalidBlockNumber {
+            collect_segment_list_pages(rel, new_head)?
+        } else {
+            Vec::new()
+        };
+        let old_page_set: HashSet<u32> = old_pages.iter().copied().collect();
+        let overlap: Vec<u32> = new_pages
+            .into_iter()
+            .filter(|blk| old_page_set.contains(blk))
+            .collect();
+        if !overlap.is_empty() {
+            anyhow::bail!(
+                "segment_list_rewrite reused old segment-list pages before retirement: overlap={:?} old_head={} new_head={}",
+                overlap,
+                old_head,
+                new_head
+            );
+        }
     }
-    Ok(())
+    Ok(old_pages)
 }
 
 pub fn reloption_parallel_workers(index_relation: pg_sys::Relation) -> usize {
@@ -1007,12 +1029,6 @@ pub fn free_blocks(rel: pg_sys::Relation, blocks: &[u32]) -> Result<()> {
         {
             continue;
         }
-        info!(
-            "free_blocks: reclaiming block={} live_buffer_owners={} high_water={}",
-            block,
-            pgbuffer::test_live_buffer_owners(),
-            pgbuffer::test_buffer_owner_high_water()
-        );
         let mut page = ExclusiveBuffer::read_mut(rel, *block)?;
         let header = page
             .as_struct_mut::<FreePageHeader>(0)
@@ -1195,7 +1211,6 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
         return Ok(());
     }
     let start = std::time::Instant::now();
-    info!("free_segments start: segments={}", segments.len());
     let mut blocks: HashSet<u32> = HashSet::new();
     for seg in segments {
         if seg.extent_head != pg_sys::InvalidBlockNumber && seg.extent_count > 0 {
@@ -1260,7 +1275,6 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
             warning!("free list cycle detected at block {}", blk);
             break;
         }
-        out.push(blk);
         let buf = PinnedBuffer::read(rel, blk)?;
         let hdr = buf
             .as_struct::<FreePageHeader>(0)
@@ -1276,6 +1290,7 @@ pub(crate) fn collect_free_list_blocks(rel: pg_sys::Relation, wal_block: u32) ->
             buf.close();
             break;
         }
+        out.push(blk);
         blk = hdr.next_block;
         buf.close();
     }
@@ -1398,7 +1413,6 @@ pub fn maybe_truncate_relation(
     _segments: &[Segment],
 ) -> Result<()> {
     let start = std::time::Instant::now();
-    info!("maybe_truncate_relation start");
     let nblocks =
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM) };
     if nblocks <= 1 {
@@ -1410,7 +1424,9 @@ pub fn maybe_truncate_relation(
         if wal.free_max_block == pg_sys::InvalidBlockNumber {
             wal_buf.close();
             info!(
-                "maybe_truncate_relation done: truncated=false elapsed_ms={}",
+                "maybe_truncate_relation done: truncated=false old_nblocks={} new_nblocks={} elapsed_ms={}",
+                nblocks,
+                nblocks,
                 start.elapsed().as_millis()
             );
             return Ok(());
@@ -1427,20 +1443,19 @@ pub fn maybe_truncate_relation(
     }
     if new_nblocks >= nblocks {
         info!(
-            "maybe_truncate_relation done: truncated=false elapsed_ms={}",
+            "maybe_truncate_relation done: truncated=false old_nblocks={} new_nblocks={} elapsed_ms={}",
+            nblocks,
+            nblocks,
             start.elapsed().as_millis()
         );
         return Ok(());
     }
 
-    let freelist_start = std::time::Instant::now();
     let keep = collect_free_list_blocks(rel, rbl.wal_block)?
         .into_iter()
         .filter(|b| *b < new_nblocks)
         .collect::<Vec<u32>>();
-    let freelist_collect_elapsed_ms = freelist_start.elapsed().as_millis();
 
-    let freelist_rewrite_start = std::time::Instant::now();
     if rbl.wal_block != pg_sys::InvalidBlockNumber {
         let mut wal_buf = ExclusiveBuffer::read_mut(rel, rbl.wal_block)?;
         let wal = wal_buf
@@ -1468,26 +1483,14 @@ pub fn maybe_truncate_relation(
         }
         wal_buf.close();
     }
-    let freelist_rewrite_elapsed_ms = freelist_rewrite_start.elapsed().as_millis();
-    info!(
-        "maybe_truncate_relation phase=free_list keep_blocks={} collect_elapsed_ms={} rewrite_elapsed_ms={}",
-        keep.len(),
-        freelist_collect_elapsed_ms,
-        freelist_rewrite_elapsed_ms
-    );
-
-    let truncate_start = std::time::Instant::now();
     unsafe {
         pg_sys::RelationTruncate(rel, new_nblocks);
     }
-    let truncate_elapsed_ms = truncate_start.elapsed().as_millis();
     info!(
-        "maybe_truncate_relation phase=truncate old_nblocks={} new_nblocks={} elapsed_ms={}",
-        nblocks, new_nblocks, truncate_elapsed_ms
-    );
-    info!(
-        "maybe_truncate_relation done: truncated=true new_nblocks={} elapsed_ms={}",
+        "maybe_truncate_relation done: truncated=true old_nblocks={} new_nblocks={} keep_blocks={} elapsed_ms={}",
+        nblocks,
         new_nblocks,
+        keep.len(),
         start.elapsed().as_millis()
     );
     Ok(())
