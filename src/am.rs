@@ -458,13 +458,11 @@ mod implementation {
         let rbl = root
             .as_struct::<crate::storage::RootBlockList>(0)
             .map_err(|e| anyhow!("{e}"))?;
-        let reclaimed_orphans = crate::storage::reclaim_orphan_blocks(rel, rbl, &rewritten)?;
         crate::storage::maybe_truncate_relation(rel, rbl, &rewritten)?;
         info!(
-            "merge_segments publish: kept_segments={} reclaimed_segments={} reclaimed_orphan_blocks={}",
+            "merge_segments publish: kept_segments={} reclaimed_segments={}",
             rewritten.len(),
-            victims.len(),
-            reclaimed_orphans
+            victims.len()
         );
         root.close();
         Ok(false)
@@ -773,7 +771,6 @@ mod implementation {
                     .as_struct::<crate::storage::RootBlockList>(0)
                     .map_err(|e| anyhow!("failed to read root header: {e:#?}"))?;
                 let segments = crate::storage::segment_list_read(rel, rbl)?;
-                crate::storage::reclaim_orphan_blocks(rel, rbl, &segments)?;
                 crate::storage::maybe_truncate_relation(rel, rbl, &segments)?;
                 root.close();
                 Ok(())
@@ -2636,6 +2633,172 @@ mod tests {
     }
 
     #[pg_test]
+    pub fn test_segment_list_retired_pages_are_reused_without_growth() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE segment_list_reuse_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_segment_list_reuse_docs_text_zoekt ON segment_list_reuse_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=18i32 {
+            let insert_sql = format!(
+                "INSERT INTO segment_list_reuse_docs (text) VALUES (repeat(md5(({} * 31)::text), 16) || ' segment-list-reuse ' || {}::text)",
+                i, i
+            );
+            Spi::run(&insert_sql)?;
+            Spi::run(
+                "SELECT pg_zoekt_maintain('idx_segment_list_reuse_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+
+        let index_oid = lookup_index_oid("idx_segment_list_reuse_docs_text_zoekt")?;
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let segments_before = read_segments(index_oid);
+            assert!(
+                segments_before.len() > 1,
+                "expected multiple segments before segment-list rewrite test"
+            );
+
+            let mut root =
+                crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, 0).expect("root buffer");
+            let rbl = root
+                .as_struct_mut::<crate::storage::RootBlockList>(0)
+                .expect("root header");
+            let rewritten = segments_before[..segments_before.len() - 1].to_vec();
+            let retired_segment_list_pages =
+                crate::storage::segment_list_rewrite(rel, rbl, &rewritten)
+                    .expect("segment list rewrite");
+            root.close();
+            assert!(
+                !retired_segment_list_pages.is_empty(),
+                "expected at least one retired segment-list page"
+            );
+            crate::storage::free_blocks(rel, &retired_segment_list_pages)
+                .expect("free retired segment-list pages");
+            let blocks_after_rewrite = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+
+            let mut reused = Vec::new();
+            for _ in 0..retired_segment_list_pages.len() {
+                let page = crate::storage::allocate_block(rel);
+                reused.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
+            }
+            let blocks_after = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+
+            let retired_set: std::collections::HashSet<u32> =
+                retired_segment_list_pages.into_iter().collect();
+            let reused_set: std::collections::HashSet<u32> = reused.into_iter().collect();
+            assert_eq!(
+                blocks_after, blocks_after_rewrite,
+                "reusing retired segment-list pages should not grow the relation after the rewrite retires them"
+            );
+            assert_eq!(
+                reused_set, retired_set,
+                "expected segment-list retirement to feed those exact blocks back through the free list"
+            );
+        }
+
+        Spi::run("DROP TABLE IF EXISTS segment_list_reuse_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_cleared_tombstone_pages_are_reused_without_growth() -> spi::Result<()> {
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE tombstone_reuse_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update(
+                "INSERT INTO tombstone_reuse_docs (text)
+                 SELECT repeat(md5(gs::text), 12) || ' tombstone-reuse ' || gs::text
+                 FROM generate_series(1, 20000) gs",
+                None,
+                &[],
+            )?;
+            client.update(
+                "CREATE INDEX idx_tombstone_reuse_docs_text_zoekt ON tombstone_reuse_docs USING pg_zoekt (text)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        let index_oid = lookup_index_oid("idx_tombstone_reuse_docs_text_zoekt")?;
+        Spi::run("SELECT pg_zoekt_seal('idx_tombstone_reuse_docs_text_zoekt'::regclass)")?;
+        Spi::run(
+            "SELECT pg_zoekt_tombstone(
+                'idx_tombstone_reuse_docs_text_zoekt'::regclass,
+                array(SELECT ctid FROM tombstone_reuse_docs)
+            )",
+        )?;
+
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
+            let tombstone_blocks =
+                crate::storage::tombstone::test_tombstone_chain_blocks(rel).expect("tombstone chain");
+            assert!(
+                !tombstone_blocks.is_empty(),
+                "expected tombstone pages after applying deletions"
+            );
+            let blocks_before = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            let retired =
+                crate::storage::tombstone::test_clear_tombstones(rel).expect("clear tombstones");
+            assert_eq!(
+                retired, tombstone_blocks,
+                "expected cleared tombstone pages to be retired explicitly"
+            );
+
+            let mut reused = Vec::new();
+            for _ in 0..retired.len() {
+                let page = crate::storage::allocate_block(rel);
+                reused.push(crate::storage::pgbuffer::BufferPage::block_number(&page));
+                page.close();
+            }
+            let blocks_after = pg_sys::RelationGetNumberOfBlocksInFork(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+            );
+            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
+
+            let retired_set: std::collections::HashSet<u32> = retired.into_iter().collect();
+            let reused_set: std::collections::HashSet<u32> = reused.into_iter().collect();
+            assert_eq!(
+                blocks_after, blocks_before,
+                "reusing cleared tombstone pages should not grow the relation"
+            );
+            assert_eq!(
+                reused_set, retired_set,
+                "expected tombstone retirement to feed those exact blocks back through the free list"
+            );
+        }
+
+        Spi::run("DROP TABLE IF EXISTS tombstone_reuse_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
     pub fn test_wal_stats_tracks_free_and_high_water() -> spi::Result<()> {
         Spi::connect_mut(|client| -> spi::Result<()> {
             client.update(
@@ -3066,86 +3229,6 @@ mod tests {
         );
 
         Spi::run("DROP TABLE IF EXISTS maintain_merge_min_docs")?;
-        Ok(())
-    }
-
-    #[pg_test]
-    pub fn test_maintain_merge_reclaims_orphans() -> spi::Result<()> {
-        Spi::connect_mut(|client| -> spi::Result<()> {
-            client.update(
-                "CREATE TABLE maintain_merge_orphan_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
-                None,
-                &[],
-            )?;
-            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
-            client.update(
-                "CREATE INDEX idx_maintain_merge_orphan_docs_text_zoekt ON maintain_merge_orphan_docs USING pg_zoekt (text)",
-                None,
-                &[],
-            )?;
-            Ok(())
-        })?;
-
-        for i in 1..=18i32 {
-            let insert_sql = format!(
-                "INSERT INTO maintain_merge_orphan_docs (text) VALUES (repeat(md5(({} * 43)::text), 16) || ' orphan-marker ' || {}::text)",
-                i, i
-            );
-            Spi::run(&insert_sql)?;
-            Spi::run(
-                "SELECT pg_zoekt_maintain('idx_maintain_merge_orphan_docs_text_zoekt'::regclass, 'seal', true)",
-            )?;
-        }
-
-        let index_oid = lookup_index_oid("idx_maintain_merge_orphan_docs_text_zoekt")?;
-        let segments_before = read_segments(index_oid);
-        assert!(
-            segments_before.len() > crate::storage::TARGET_SEGMENTS,
-            "expected merge pressure before orphan-reclaim test (got {})",
-            segments_before.len()
-        );
-
-        unsafe {
-            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessExclusiveLock as i32);
-            let mut root =
-                crate::storage::pgbuffer::ExclusiveBuffer::read_mut(rel, 0).expect("root buffer");
-            let rbl = root
-                .as_struct_mut::<crate::storage::RootBlockList>(0)
-                .expect("root header");
-            let mut rewritten = segments_before.clone();
-            let orphaned = rewritten.pop().expect("segment to orphan");
-            let orphaned_block = std::ptr::read_unaligned(std::ptr::addr_of!(orphaned.block));
-            let retired_segment_list_pages =
-                crate::storage::segment_list_rewrite(rel, rbl, &rewritten)
-                    .expect("failed to orphan segment");
-            root.close();
-            crate::storage::free_blocks(rel, &retired_segment_list_pages)
-                .expect("failed to free retired segment-list pages");
-            pg_sys::relation_close(rel, pg_sys::AccessExclusiveLock as i32);
-            assert_ne!(
-                orphaned_block,
-                pg_sys::InvalidBlockNumber,
-                "expected a valid orphaned segment block"
-            );
-        }
-
-        let orphan_blocks_before_merge = index_orphan_blocks(index_oid);
-        assert!(
-            orphan_blocks_before_merge > 0,
-            "expected orphan blocks before merge reclaim test (got {orphan_blocks_before_merge})"
-        );
-
-        Spi::run(
-            "SELECT pg_zoekt_maintain('idx_maintain_merge_orphan_docs_text_zoekt'::regclass, 'merge', true)",
-        )?;
-
-        let orphan_blocks_after_merge = index_orphan_blocks(index_oid);
-        assert_eq!(
-            orphan_blocks_after_merge, 0,
-            "merge should reclaim orphan blocks (before={orphan_blocks_before_merge}, after={orphan_blocks_after_merge})"
-        );
-
-        Spi::run("DROP TABLE IF EXISTS maintain_merge_orphan_docs")?;
         Ok(())
     }
 

@@ -359,8 +359,6 @@ fn finalize_segment_list(
         let rbl = root_buffer
             .as_struct::<crate::storage::RootBlockList>(0)
             .expect("root header");
-        crate::storage::reclaim_orphan_blocks(index_relation, rbl, &merged)
-            .unwrap_or_else(|e| error!("failed to reclaim orphan blocks: {e:#?}"));
         crate::storage::maybe_truncate_relation(index_relation, rbl, &merged)
             .unwrap_or_else(|e| error!("failed to truncate relation: {e:#?}"));
         root_buffer.close();

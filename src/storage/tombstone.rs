@@ -121,18 +121,21 @@ where
         .context("root header")?;
     let mut snapshot = load_internal(rel, rbl)?;
     let added = snapshot.extend(tids);
+    let mut retired_blocks = Vec::new();
     if added > 0 {
-        persist(rel, rbl, &snapshot)?;
+        retired_blocks = persist(rel, rbl, &snapshot)?;
     }
     root.close();
+    super::free_blocks(rel, &retired_blocks)?;
     Ok(added)
 }
 
-fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot) -> Result<()> {
+fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot) -> Result<Vec<u32>> {
+    let mut existing = collect_chain(rel, root.tombstone_block)?;
     if snapshot.is_empty() {
         root.tombstone_block = pg_sys::InvalidBlockNumber;
         root.tombstone_bytes = 0;
-        return Ok(());
+        return Ok(existing);
     }
 
     let mut data = Vec::new();
@@ -141,7 +144,6 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
         .serialize_into(&mut data)
         .context("serialize tombstones")?;
 
-    let mut existing = collect_chain(rel, root.tombstone_block)?;
     let mut used_blocks = Vec::new();
     let mut cursor = data.as_slice();
     let chunk_cap = payload_capacity();
@@ -188,7 +190,7 @@ fn persist(rel: pg_sys::Relation, root: &mut RootBlockList, snapshot: &Snapshot)
 
     root.tombstone_block = *used_blocks.first().unwrap();
     root.tombstone_bytes = data.len() as u32;
-    Ok(())
+    Ok(existing)
 }
 
 fn collect_chain(rel: pg_sys::Relation, start: u32) -> Result<Vec<u32>> {
@@ -212,4 +214,27 @@ fn collect_chain(rel: pg_sys::Relation, start: u32) -> Result<Vec<u32>> {
     }
     out.reverse();
     Ok(out)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn test_tombstone_chain_blocks(rel: pg_sys::Relation) -> Result<Vec<u32>> {
+    let root = PinnedBuffer::read(rel, 0).context("test_tombstone_chain_blocks: root")?;
+    let rbl = root
+        .as_struct::<RootBlockList>(0)
+        .context("test_tombstone_chain_blocks: root header")?;
+    let blocks = collect_chain(rel, rbl.tombstone_block)?;
+    root.close();
+    Ok(blocks)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn test_clear_tombstones(rel: pg_sys::Relation) -> Result<Vec<u32>> {
+    let mut root = ExclusiveBuffer::read_mut(rel, 0).context("test_clear_tombstones: root")?;
+    let rbl = root
+        .as_struct_mut::<RootBlockList>(0)
+        .context("test_clear_tombstones: root header")?;
+    let retired = persist(rel, rbl, &Snapshot::default())?;
+    root.close();
+    super::free_blocks(rel, &retired)?;
+    Ok(retired)
 }
