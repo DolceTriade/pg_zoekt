@@ -38,6 +38,13 @@ impl Snapshot {
     pub fn is_empty(&self) -> bool {
         self.bitmap.is_empty()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = ItemPointer> + '_ {
+        self.bitmap.iter().map(|raw| ItemPointer {
+            block_number: (raw >> 16) as u32,
+            offset: (raw & 0xffff) as u16,
+        })
+    }
 }
 
 #[derive(

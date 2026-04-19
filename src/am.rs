@@ -449,9 +449,9 @@ mod implementation {
             rewritten.push(replacement);
         }
 
-        let retired_segment_list_pages =
-            crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
+        let retired_segment_list_pages = crate::storage::segment_list_rewrite(rel, rbl, &rewritten)?;
         root.close();
+
         crate::storage::free_blocks(rel, &retired_segment_list_pages)?;
         crate::storage::free_segments(rel, &victims)?;
         let root = PinnedBuffer::read(rel, 0).map_err(|e| anyhow!("{e}"))?;
@@ -1161,6 +1161,18 @@ mod tests {
             let segments = crate::query::read_segments(rel).expect("failed to read segments");
             pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
             segments
+        }
+    }
+
+    fn validate_all_segments(index_oid: pg_sys::Oid) {
+        unsafe {
+            let rel = pg_sys::relation_open(index_oid, pg_sys::AccessShareLock as i32);
+            let segments = crate::query::read_segments(rel).expect("failed to read segments");
+            for segment in &segments {
+                crate::storage::validate_segment(rel, segment)
+                    .expect("segment should decode successfully");
+            }
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
         }
     }
 
@@ -3537,6 +3549,318 @@ mod tests {
         );
 
         Spi::run("DROP TABLE IF EXISTS maintain_parallel_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_parallel_full_validates_recent_segment() -> spi::Result<()> {
+        let max_parallel_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+                .unwrap_or(0);
+        if max_parallel_workers <= 0 {
+            info!("skipping parallel seal/merge validation test: max_parallel_workers=0");
+            return Ok(());
+        }
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE maintain_parallel_recent_docs (id SERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_maintain_parallel_recent_docs_text_zoekt
+                 ON maintain_parallel_recent_docs USING pg_zoekt (text)
+                 WITH (parallel_workers = 4)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=10i32 {
+            let insert_sql = format!(
+                "INSERT INTO maintain_parallel_recent_docs (text) VALUES (repeat(md5(({} * 17)::text), 16) || ' parallel-recent ' || {}::text)",
+                i, i
+            );
+            Spi::run(&insert_sql)?;
+            Spi::run(
+                "SELECT pg_zoekt_maintain('idx_maintain_parallel_recent_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+
+        let index_oid = lookup_index_oid("idx_maintain_parallel_recent_docs_text_zoekt")?;
+        assert_eq!(
+            segment_count(index_oid),
+            crate::storage::TARGET_SEGMENTS,
+            "expected 10 baseline segments before forcing parallel full maintenance"
+        );
+
+        Spi::run(
+            "INSERT INTO maintain_parallel_recent_docs (text)
+             SELECT repeat(md5((1000 + gs)::text), 24) || ' parallel-full ' || gs::text
+             FROM generate_series(1, 7) gs",
+        )?;
+
+        let sealed = Spi::get_one::<i64>(
+            "SELECT sealed_tuples
+             FROM pg_zoekt_maintain('idx_maintain_parallel_recent_docs_text_zoekt'::regclass, 'full', true)",
+        )?
+        .unwrap_or(0);
+        assert_eq!(
+            sealed, 7,
+            "expected full maintenance to seal the recent pending batch"
+        );
+
+        validate_all_segments(index_oid);
+        assert!(
+            segment_count(index_oid) <= crate::storage::TARGET_SEGMENTS,
+            "expected full maintenance to converge back to target segments"
+        );
+
+        Spi::run("DROP TABLE IF EXISTS maintain_parallel_recent_docs")?;
+        Ok(())
+    }
+
+    #[pg_test]
+    pub fn test_parallel_full_replays_seed_12345_regression() -> spi::Result<()> {
+        let max_parallel_workers =
+            Spi::get_one::<i32>("SELECT current_setting('max_parallel_workers')::int")?
+                .unwrap_or(0);
+        if max_parallel_workers <= 0 {
+            info!("skipping seed replay test: max_parallel_workers=0");
+            return Ok(());
+        }
+
+        Spi::connect_mut(|client| -> spi::Result<()> {
+            client.update(
+                "CREATE TABLE stress_replay_docs (id BIGSERIAL PRIMARY KEY, text TEXT NOT NULL)",
+                None,
+                &[],
+            )?;
+            client.update("SET maintenance_work_mem = '64kB'", None, &[])?;
+            client.update(
+                "CREATE INDEX idx_stress_replay_docs_text_zoekt
+                 ON stress_replay_docs USING pg_zoekt (text)
+                 WITH (parallel_workers = 4)",
+                None,
+                &[],
+            )?;
+            Ok(())
+        })?;
+
+        for i in 1..=10i32 {
+            let sql = format!(
+                "INSERT INTO stress_replay_docs (text)
+                 VALUES (repeat(md5(({} * 131)::text), 16) || ' bootstrap ' || {}::text)",
+                i, i
+            );
+            Spi::run(&sql)?;
+            Spi::run(
+                "SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'seal', true)",
+            )?;
+        }
+
+        let index_oid = lookup_index_oid("idx_stress_replay_docs_text_zoekt")?;
+        validate_all_segments(index_oid);
+
+        let cycles = [
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((1 * 100000 + gs)::text), 24) || ' cycle ' || 1::text || ' row ' || gs::text
+                FROM generate_series(1, 10) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 1::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 10) = 4
+                    ORDER BY id
+                    LIMIT 2
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((2 * 100000 + gs)::text), 24) || ' cycle ' || 2::text || ' row ' || gs::text
+                FROM generate_series(1, 9) gs;
+                SELECT pg_zoekt_tombstone(
+                    'idx_stress_replay_docs_text_zoekt'::regclass,
+                    ARRAY(
+                        SELECT ctid FROM stress_replay_docs
+                        WHERE (id % 7) = 5
+                        ORDER BY id
+                        LIMIT 4
+                    )
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((3 * 100000 + gs)::text), 24) || ' cycle ' || 3::text || ' row ' || gs::text
+                FROM generate_series(1, 5) gs;
+                DELETE FROM stress_replay_docs
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 6) = 1
+                    ORDER BY id
+                    LIMIT 1
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((4 * 100000 + gs)::text), 24) || ' cycle ' || 4::text || ' row ' || gs::text
+                FROM generate_series(1, 12) gs;
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((5 * 100000 + gs)::text), 24) || ' cycle ' || 5::text || ' row ' || gs::text
+                FROM generate_series(1, 6) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 5::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 4) = 1
+                    ORDER BY id
+                    LIMIT 3
+                );
+                DELETE FROM stress_replay_docs
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 5) = 0
+                    ORDER BY id
+                    LIMIT 1
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((6 * 100000 + gs)::text), 24) || ' cycle ' || 6::text || ' row ' || gs::text
+                FROM generate_series(1, 7) gs;
+                DELETE FROM stress_replay_docs
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 10) = 4
+                    ORDER BY id
+                    LIMIT 1
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((7 * 100000 + gs)::text), 24) || ' cycle ' || 7::text || ' row ' || gs::text
+                FROM generate_series(1, 9) gs;
+                SELECT pg_zoekt_tombstone(
+                    'idx_stress_replay_docs_text_zoekt'::regclass,
+                    ARRAY(
+                        SELECT ctid FROM stress_replay_docs
+                        WHERE (id % 14) = 12
+                        ORDER BY id
+                        LIMIT 4
+                    )
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((8 * 100000 + gs)::text), 24) || ' cycle ' || 8::text || ' row ' || gs::text
+                FROM generate_series(1, 11) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 8::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 11) = 9
+                    ORDER BY id
+                    LIMIT 1
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((9 * 100000 + gs)::text), 24) || ' cycle ' || 9::text || ' row ' || gs::text
+                FROM generate_series(1, 11) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 9::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 11) = 10
+                    ORDER BY id
+                    LIMIT 5
+                );
+                SELECT pg_zoekt_tombstone(
+                    'idx_stress_replay_docs_text_zoekt'::regclass,
+                    ARRAY(
+                        SELECT ctid FROM stress_replay_docs
+                        WHERE (id % 7) = 2
+                        ORDER BY id
+                        LIMIT 4
+                    )
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((10 * 100000 + gs)::text), 24) || ' cycle ' || 10::text || ' row ' || gs::text
+                FROM generate_series(1, 4) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 10::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 3) = 1
+                    ORDER BY id
+                    LIMIT 3
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+            r#"
+                INSERT INTO stress_replay_docs (text)
+                SELECT repeat(md5((11 * 100000 + gs)::text), 24) || ' cycle ' || 11::text || ' row ' || gs::text
+                FROM generate_series(1, 8) gs;
+                UPDATE stress_replay_docs
+                SET text = text || ' update-' || 11::text
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 4) = 3
+                    ORDER BY id
+                    LIMIT 6
+                );
+                DELETE FROM stress_replay_docs
+                WHERE id IN (
+                    SELECT id FROM stress_replay_docs
+                    WHERE (id % 2) = 1
+                    ORDER BY id
+                    LIMIT 3
+                );
+                SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+            "#,
+        ];
+
+        for sql in cycles {
+            Spi::run(sql)?;
+            validate_all_segments(index_oid);
+        }
+
+        let cycle_12 = r#"
+            INSERT INTO stress_replay_docs (text)
+            SELECT repeat(md5((12 * 100000 + gs)::text), 24) || ' cycle ' || 12::text || ' row ' || gs::text
+            FROM generate_series(1, 4) gs;
+            UPDATE stress_replay_docs
+            SET text = text || ' update-' || 12::text
+            WHERE id IN (
+                SELECT id FROM stress_replay_docs
+                WHERE (id % 8) = 6
+                ORDER BY id
+                LIMIT 5
+            );
+            SELECT * FROM pg_zoekt_maintain('idx_stress_replay_docs_text_zoekt'::regclass, 'full', true);
+        "#;
+
+        Spi::run(cycle_12)?;
+        validate_all_segments(index_oid);
+
+        Spi::run("DROP TABLE IF EXISTS stress_replay_docs")?;
         Ok(())
     }
 

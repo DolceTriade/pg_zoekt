@@ -390,13 +390,15 @@ pub struct SegmentExtents {
     pub entries: [SegmentExtent],
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct BlockExtentTracker {
     extents: Vec<SegmentExtent>,
+    seen_blocks: HashSet<u32>,
 }
 
 impl BlockExtentTracker {
     pub(crate) fn record(&mut self, block: u32) {
+        self.seen_blocks.insert(block);
         if let Some(last) = self.extents.last_mut() {
             let expected_next = last.start_block.saturating_add(last.len);
             if block == expected_next {
@@ -412,6 +414,15 @@ impl BlockExtentTracker {
 
     pub(crate) fn take(self) -> Vec<SegmentExtent> {
         self.extents
+    }
+}
+
+impl Default for BlockExtentTracker {
+    fn default() -> Self {
+        Self {
+            extents: Vec::new(),
+            seen_blocks: HashSet::new(),
+        }
     }
 }
 
@@ -1206,6 +1217,49 @@ pub(crate) fn collect_posting_blocks(
     Ok(())
 }
 
+pub(crate) fn collect_segment_blocks(
+    rel: pg_sys::Relation,
+    segment: &Segment,
+    out: &mut HashSet<u32>,
+) -> Result<()> {
+    if segment.extent_head != pg_sys::InvalidBlockNumber && segment.extent_count > 0 {
+        let (extents, extent_pages) = segment_extent_list_read(rel, segment.extent_head, segment.extent_count)?;
+        for blk in extent_pages {
+            out.insert(blk);
+        }
+        for extent in extents {
+            let end = extent.start_block.saturating_add(extent.len);
+            for blk in extent.start_block..end {
+                out.insert(blk);
+            }
+        }
+        return Ok(());
+    }
+
+    collect_segment_tree_blocks(rel, segment.block, out)?;
+    let leaf_blocks = collect_leaf_blocks(rel, segment.block)?;
+    for leaf in leaf_blocks {
+        let buf = PinnedBuffer::read(rel, leaf)?;
+        let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
+        if header.magic != BLOCK_MAGIC {
+            buf.close();
+            anyhow::bail!("invalid block magic while collecting segment blocks");
+        }
+        let entries = buf
+            .as_struct_with_elems::<IndexList>(
+                std::mem::size_of::<BlockHeader>(),
+                header.num_entries as usize,
+            )
+            .context("index entries")?;
+        let slice = &entries.entries[..header.num_entries as usize];
+        for entry in slice {
+            collect_posting_blocks(rel, entry, out)?;
+        }
+        buf.close();
+    }
+    Ok(())
+}
+
 pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> {
     if segments.is_empty() {
         return Ok(());
@@ -1213,41 +1267,7 @@ pub fn free_segments(rel: pg_sys::Relation, segments: &[Segment]) -> Result<()> 
     let start = std::time::Instant::now();
     let mut blocks: HashSet<u32> = HashSet::new();
     for seg in segments {
-        if seg.extent_head != pg_sys::InvalidBlockNumber && seg.extent_count > 0 {
-            let (extents, extent_pages) =
-                segment_extent_list_read(rel, seg.extent_head, seg.extent_count)?;
-            for blk in extent_pages {
-                blocks.insert(blk);
-            }
-            for extent in extents {
-                let end = extent.start_block.saturating_add(extent.len);
-                for blk in extent.start_block..end {
-                    blocks.insert(blk);
-                }
-            }
-            continue;
-        }
-        collect_segment_tree_blocks(rel, seg.block, &mut blocks)?;
-        let leaf_blocks = collect_leaf_blocks(rel, seg.block)?;
-        for leaf in leaf_blocks {
-            let buf = PinnedBuffer::read(rel, leaf)?;
-            let header = buf.as_struct::<BlockHeader>(0).context("block header")?;
-            if header.magic != BLOCK_MAGIC {
-                buf.close();
-                anyhow::bail!("invalid block magic while freeing segment");
-            }
-            let entries = buf
-                .as_struct_with_elems::<IndexList>(
-                    std::mem::size_of::<BlockHeader>(),
-                    header.num_entries as usize,
-                )
-                .context("index entries")?;
-            let slice = &entries.entries[..header.num_entries as usize];
-            for entry in slice {
-                collect_posting_blocks(rel, entry, &mut blocks)?;
-            }
-            buf.close();
-        }
+        collect_segment_blocks(rel, seg, &mut blocks)?;
     }
     let mut list: Vec<u32> = blocks.into_iter().collect();
     list.sort_unstable();
@@ -1698,6 +1718,35 @@ pub fn read_segment_entries(rel: pg_sys::Relation, segment: &Segment) -> Result<
     Ok(all_entries)
 }
 
+pub fn validate_segment(rel: pg_sys::Relation, segment: &Segment) -> Result<()> {
+    if segment.block == pg_sys::InvalidBlockNumber {
+        return Ok(());
+    }
+
+    let entries = read_segment_entries(rel, segment)?;
+    for entry in &entries {
+        let segment_root = segment.block;
+        let trigram = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(entry.trigram)) };
+        let (block, offset, data_length) = entry_fields(entry);
+        let mut cursor = unsafe { crate::storage::decode::PostingCursor::new(rel, entry) }
+            .with_context(|| {
+                format!(
+                    "validate_segment open posting cursor: segment_root={} trigram={} block={} offset={} data_length={}",
+                    segment_root, trigram, block, offset, data_length
+                )
+            })?;
+        while cursor.advance().with_context(|| {
+            format!(
+                "validate_segment advance posting cursor: segment_root={} trigram={} block={} offset={} data_length={}",
+                segment_root, trigram, block, offset, data_length
+            )
+        })? {}
+        cursor.close();
+    }
+
+    Ok(())
+}
+
 pub fn resolve_leaf_for_trigram(
     rel: pg_sys::Relation,
     root_block: u32,
@@ -2040,34 +2089,6 @@ pub fn merge(
                 )?;
             }
 
-            if leaf.is_none() {
-                start_leaf(
-                    rel,
-                    &mut leaf,
-                    &mut leaf_block,
-                    &mut leaf_entries_written,
-                    &mut leaf_min_trigram,
-                    tracker_ptr,
-                )?;
-            }
-            if leaf_entries_written >= leaf_entry_cap {
-                finalize_leaf(
-                    &mut leaf,
-                    leaf_entries_written,
-                    &leaf_min_trigram,
-                    leaf_block,
-                    &mut leaf_pointers,
-                )?;
-                start_leaf(
-                    rel,
-                    &mut leaf,
-                    &mut leaf_block,
-                    &mut leaf_entries_written,
-                    &mut leaf_min_trigram,
-                    tracker_ptr,
-                )?;
-            }
-
             // Encode postings for this trigram into posting pages.
             let mut idx_entry = IndexEntry {
                 trigram,
@@ -2123,20 +2144,9 @@ pub fn merge(
                 idx_entry.frequency = frequency;
                 if data_length > 0 {
                     unsafe {
-                        let result =
-                            crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer);
-                        if let Err(e) = result {
-                            let (block, offset, _len) = entry_fields(entry);
-                            warning!(
-                                "posting copy failed: trigram={} block={} offset={} length={} err={e:#}",
-                                trigram,
-                                block,
-                                offset,
-                                data_length
-                            );
-                            return Err(e);
-                        }
-                        if let Ok(Some(loc)) = result {
+                        if let Some(loc) =
+                            crate::storage::decode::copy_posting_chunks(rel, entry, &mut writer)?
+                        {
                             idx_entry.block = loc.block_number;
                             idx_entry.offset = loc.offset as u16;
                         }
@@ -2180,6 +2190,37 @@ pub fn merge(
                 })?;
                 flush_chunk(&mut builder, &mut idx_entry, &mut first_chunk)?;
                 idx_entry.frequency = trgm_docs;
+                if trgm_docs == 0 {
+                    continue;
+                }
+            }
+
+            if leaf.is_none() {
+                start_leaf(
+                    rel,
+                    &mut leaf,
+                    &mut leaf_block,
+                    &mut leaf_entries_written,
+                    &mut leaf_min_trigram,
+                    tracker_ptr,
+                )?;
+            }
+            if leaf_entries_written >= leaf_entry_cap {
+                finalize_leaf(
+                    &mut leaf,
+                    leaf_entries_written,
+                    &leaf_min_trigram,
+                    leaf_block,
+                    &mut leaf_pointers,
+                )?;
+                start_leaf(
+                    rel,
+                    &mut leaf,
+                    &mut leaf_block,
+                    &mut leaf_entries_written,
+                    &mut leaf_min_trigram,
+                    tracker_ptr,
+                )?;
             }
 
             let leaf_ref = leaf.as_mut().context("leaf buffer")?;

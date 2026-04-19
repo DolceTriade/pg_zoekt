@@ -372,6 +372,53 @@ pub fn pg_zoekt_posting_positions(
 }
 
 #[pg_extern]
+pub fn pg_zoekt_validate_segments(index: pg_sys::Oid) -> i64 {
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let segments = crate::query::read_segments(rel).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to read segments: {e:#?}");
+        });
+        for segment in &segments {
+            crate::storage::validate_segment(rel, segment).unwrap_or_else(|e| {
+                let block = segment.block;
+                let size = segment.size;
+                pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+                error!(
+                    "segment validation failed: block={} size={} error={e:#?}",
+                    block, size
+                );
+            });
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+        segments.len() as i64
+    }
+}
+
+#[pg_extern]
+pub fn pg_zoekt_tombstones(
+    index: pg_sys::Oid,
+) -> TableIterator<'static, (name!(ctid, pg_sys::ItemPointerData),)> {
+    let mut rows = Vec::new();
+    unsafe {
+        let rel = pg_sys::relation_open(index, pg_sys::AccessShareLock as i32);
+        let snapshot = crate::storage::tombstone::load_snapshot(rel).unwrap_or_else(|e| {
+            pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+            error!("failed to load tombstones: {e:#?}");
+        });
+        for tid in snapshot.iter() {
+            let mut item = pg_sys::ItemPointerData::default();
+            item.ip_blkid.bi_hi = (tid.block_number >> 16) as u16;
+            item.ip_blkid.bi_lo = (tid.block_number & 0xffff) as u16;
+            item.ip_posid = tid.offset;
+            rows.push((item,));
+        }
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as i32);
+    }
+    TableIterator::new(rows.into_iter())
+}
+
+#[pg_extern]
 pub fn pg_zoekt_wal_stats(
     index: pg_sys::Oid,
 ) -> TableIterator<
